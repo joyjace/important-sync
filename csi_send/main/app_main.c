@@ -66,6 +66,9 @@
 #define CONFIG_RATE_SWITCH_INTERVAL_SEC     10 // Used when TIME_BASED
 #define CONFIG_RATE_SWITCH_PACKET_COUNT     1000 // Used when PACKET_BASED
 #define CONFIG_ESP_NOW_PAYLOAD_LEN          128 // Bytes per ESP-NOW data frame (>= 4 to keep sequence ID) (16, 64, 128)
+// TX power in units of 0.25 dBm. Range [8, 84] => [2 dBm, 20 dBm].
+// Mapping: {set value range, actual value} = {{[8,19],8},{[20,27],20},{[28,33],28},{[34,43],34},{[44,51],44},{[52,55],52},{[56,59],56},{[60,65],60},{[66,71],66},{[72,79],72},{[80,84],80}}
+#define CONFIG_WIFI_TX_POWER                84
 
 #if CONFIG_ESP_NOW_PAYLOAD_LEN < 4
 #error "CONFIG_ESP_NOW_PAYLOAD_LEN must be at least 4 bytes"
@@ -234,7 +237,7 @@ static void wifi_init()
          {set value range, actual value} = {{[8, 19],8}, {[20, 27],20}, {[28, 33],28}, {[34, 43],34}, {[44, 51],44}, {[52, 55],52}, {[56, 59],56}, {[60, 65],60}, {[66, 71],66}, {[72, 79],72}, {[80, 84],80}}.
 
     */
-    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(84));
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(CONFIG_WIFI_TX_POWER));
 
 
 

@@ -31,6 +31,7 @@ DEFAULT_PROFILE = {
         "rate_switch_interval_sec": 10,
         "rate_switch_packet_count": 1000,
         "payload_len": 128,
+        "tx_power": 84,
     },
     "receiver": {
         "channel": 11,
@@ -122,6 +123,7 @@ def apply_profile_to_sources(profile: dict) -> None:
     sender_text = replace_define(sender_text, "CONFIG_RATE_SWITCH_INTERVAL_SEC", str(sender["rate_switch_interval_sec"]))
     sender_text = replace_define(sender_text, "CONFIG_RATE_SWITCH_PACKET_COUNT", str(sender["rate_switch_packet_count"]))
     sender_text = replace_define(sender_text, "CONFIG_ESP_NOW_PAYLOAD_LEN", str(sender["payload_len"]))
+    sender_text = replace_define(sender_text, "CONFIG_WIFI_TX_POWER", str(sender["tx_power"]))
     sender_text = replace_mac_array(sender_text, "CONFIG_CSI_SEND_MAC", shared["sender_mac"])
     sender_text = replace_mac_array(sender_text, "CONFIG_CSI_RECV_MAC", shared["receiver_mac"])
 
@@ -236,6 +238,7 @@ def edit_sender_full(profile: dict) -> None:
     sender["rate_switch_interval_sec"] = ask_int("Rate switch interval seconds", sender["rate_switch_interval_sec"], 1, 3600)
     sender["rate_switch_packet_count"] = ask_int("Rate switch packet count", sender["rate_switch_packet_count"], 1, 1000000)
     sender["payload_len"] = ask_int("ESP-NOW payload length", sender["payload_len"], 4, 250)
+    sender["tx_power"] = ask_int("TX power (0.25 dBm units, range 8-84)", sender["tx_power"], 8, 84)
 
 
 def edit_sender(profile: dict) -> None:
@@ -249,7 +252,8 @@ def edit_sender(profile: dict) -> None:
         print(f"5. rate_switch_interval_sec: {sender['rate_switch_interval_sec']}")
         print(f"6. rate_switch_packet_count: {sender['rate_switch_packet_count']}")
         print(f"7. payload_len: {sender['payload_len']}")
-        print("8. Edit all sender fields")
+        print(f"8. tx_power: {sender['tx_power']} (0.25 dBm units, {sender['tx_power'] * 0.25:.1f} dBm nominal)")
+        print("9. Edit all sender fields")
         print("0. Back")
         choice = input("Select sender field: ").strip()
 
@@ -275,6 +279,9 @@ def edit_sender(profile: dict) -> None:
             sender["payload_len"] = ask_int("ESP-NOW payload length", sender["payload_len"], 4, 250)
             save_profile(profile)
         elif choice == "8":
+            sender["tx_power"] = ask_int("TX power (0.25 dBm units, range 8-84)", sender["tx_power"], 8, 84)
+            save_profile(profile)
+        elif choice == "9":
             edit_sender_full(profile)
             save_profile(profile)
         elif choice == "0":

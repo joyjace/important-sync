@@ -26,7 +26,16 @@
 #include "esp_now.h"
 #include "esp_timer.h"
 
+/* ESP-IDF 6.0+ renamed WIFI_BW_HT20/HT40 to WIFI_BW20/BW40. */
+#ifndef WIFI_BW_HT20
+#define WIFI_BW_HT20 WIFI_BW20
+#endif
+#ifndef WIFI_BW_HT40
+#define WIFI_BW_HT40 WIFI_BW40
+#endif
+
 #define CONFIG_LESS_INTERFERENCE_CHANNEL   11
+
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61 || (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0))
 #define CONFIG_WIFI_BAND_MODE               WIFI_BAND_MODE_2G_ONLY
 #define CONFIG_WIFI_2G_BANDWIDTHS           WIFI_BW_HT40
@@ -34,11 +43,11 @@
 #define CONFIG_WIFI_2G_PROTOCOL             WIFI_PROTOCOL_11N
 #define CONFIG_WIFI_5G_PROTOCOL             WIFI_PROTOCOL_11N
 #else
-#define CONFIG_WIFI_BANDWIDTH           WIFI_BW_HT40
+#define CONFIG_WIFI_BANDWIDTH               WIFI_BW_HT40
 #endif
 
 #define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT40
-#define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS0_LGI
+#define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS0_LGI 
 /* Bitrate options (choose one for `CONFIG_ESP_NOW_RATE` - type `wifi_phy_rate_t`):
  *
  * Legacy (802.11b/g):

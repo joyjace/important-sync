@@ -123,6 +123,23 @@ static void ack_emit_status(uint32_t seq, int delivered)
     }
 }
 
+/* Reset ACK counters and print final PDR before MCS/rate switch */
+static void ack_reset_counters_for_rate_change(size_t new_mcs_index)
+{
+    uint32_t total = s_ack_success_count + s_ack_fail_count;
+    if (total > 0) {
+        float pdr = 100.0f * s_ack_success_count / total;
+        printf("ACK_PDR_FINAL,%lu,%lu,%.1f\n", (unsigned long)total,
+               (unsigned long)s_ack_success_count, pdr);
+        fflush(stdout);
+    }
+    /* Reset counters for next MCS/rate */
+    s_ack_success_count = 0;
+    s_ack_fail_count = 0;
+    printf("ACK_RESET_FOR_MCS%u\n", (unsigned int)new_mcs_index);
+    fflush(stdout);
+}
+
 static void ack_seq_enqueue(uint32_t seq)
 {
     uint16_t next = (uint16_t)((s_ack_seq_head + 1) % ACK_SEQ_QUEUE_SIZE);
@@ -328,7 +345,12 @@ void app_main()
     for (uint32_t count = 0; ; ++count) {
         int64_t now_us = esp_timer_get_time();
         if (now_us >= next_rate_switch_us) {
+            size_t prev_rate_index = rate_index;
             rate_index = (rate_index + 1) % (sizeof(s_esp_now_rate_cycle) / sizeof(s_esp_now_rate_cycle[0]));
+            
+            /* Reset counters and output final PDR for previous MCS before switching */
+            ack_reset_counters_for_rate_change(rate_index);
+            
             esp_now_set_peer_rate(peer.peer_addr, s_esp_now_rate_cycle[rate_index]);
             ESP_LOGI(TAG, "ESP-NOW rate set: WIFI_PHY_RATE_MCS%u_LGI", (unsigned int)rate_index);
 
@@ -370,7 +392,12 @@ void app_main()
 
     for (uint32_t count = 0; ; ++count) {
         if (packets_sent_in_current_rate >= CONFIG_RATE_SWITCH_PACKET_COUNT) {
+            size_t prev_rate_index = rate_index;
             rate_index = (rate_index + 1) % (sizeof(s_esp_now_rate_cycle) / sizeof(s_esp_now_rate_cycle[0]));
+            
+            /* Reset counters and output final PDR for previous MCS before switching */
+            ack_reset_counters_for_rate_change(rate_index);
+            
             esp_now_set_peer_rate(peer.peer_addr, s_esp_now_rate_cycle[rate_index]);
             ESP_LOGI(TAG, "ESP-NOW rate set: WIFI_PHY_RATE_MCS%u_LGI", (unsigned int)rate_index);
             packets_sent_in_current_rate = 0;

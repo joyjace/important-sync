@@ -471,6 +471,16 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                     f"[ACK_RESET] Resetting counters for MCS{record['mcs_index']}",
                     flush=True,
                 )
+                # Write a boundary marker so the CSV shows where each MCS starts
+                ack_pdr_writer.writerow({
+                    'host_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'source': 'MCS_RESET',
+                    'seq': record['mcs_index'],
+                    'sent': 0,
+                    'delivered': 0,
+                    'pdr_percent': '0.0000',
+                })
+                ack_pdr_file_fd.flush()
                 # Reset running counters for next MCS test
                 ack_total = 0
                 ack_delivered = 0
@@ -602,6 +612,41 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                         )
                         continue
 
+                    if ack_record['type'] == 'ACK_PDR_FINAL':
+                        if ack_pdr_writer is not None:
+                            ack_pdr_writer.writerow({
+                                'host_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                                'source': 'ACK_PDR_FINAL',
+                                'seq': '',
+                                'sent': ack_record['sent'],
+                                'delivered': ack_record['delivered'],
+                                'pdr_percent': f"{ack_record['pdr_percent']:.4f}",
+                            })
+                        print(
+                            f"[ACK_PDR_FINAL] sent={ack_record['sent']} delivered={ack_record['delivered']} "
+                            f"pdr={ack_record['pdr_percent']:.2f}% (MCS rate switch complete)",
+                            flush=True,
+                        )
+                        continue
+
+                    if ack_record['type'] == 'ACK_RESET':
+                        print(
+                            f"[ACK_RESET] Resetting counters for MCS{ack_record['mcs_index']}",
+                            flush=True,
+                        )
+                        if ack_pdr_writer is not None:
+                            ack_pdr_writer.writerow({
+                                'host_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                                'source': 'MCS_RESET',
+                                'seq': ack_record['mcs_index'],
+                                'sent': 0,
+                                'delivered': 0,
+                                'pdr_percent': '0.0000',
+                            })
+                        ack_total = 0
+                        ack_delivered = 0
+                        continue
+
                 # Neither CSI nor ACK: log as unknown serial line.
                 bad_count += 1
                 log_file_fd.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] unknown_line\n')
@@ -683,8 +728,8 @@ def main():
     parser.add_argument(
         '-sb', '--send-baud',
         type=int,
-        default=921600,
-        help='Sender serial baud rate for ACK metrics (default: 921600)'
+        default=115200,
+        help='Sender serial baud rate for ACK metrics (default: 115200 — matches IDF console baud)'
     )
     parser.add_argument(
         '-a', '--ack-store',

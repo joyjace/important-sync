@@ -14,8 +14,17 @@ import re
 import threading
 import argparse
 from io import StringIO
+from pathlib import Path
 
 import serial
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_CSI_FILE = SCRIPT_DIR / 'csi_data.csv'
+DEFAULT_LOG_FILE = SCRIPT_DIR / 'csi_data_log.txt'
+DEFAULT_ACK_FILE = SCRIPT_DIR / 'ack_data.csv'
+DEFAULT_ACK_PDR_FILE = SCRIPT_DIR / 'ack_pdr.csv'
+DEFAULT_SEND_LOG_FILE = SCRIPT_DIR / 'send_serial_log.txt'
 
 
 DATA_COLUMNS_NAMES_C5C6 = [
@@ -471,16 +480,6 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                     f"[ACK_RESET] Resetting counters for MCS{record['mcs_index']}",
                     flush=True,
                 )
-                # Write a boundary marker so the CSV shows where each MCS starts
-                ack_pdr_writer.writerow({
-                    'host_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-                    'source': 'MCS_RESET',
-                    'seq': record['mcs_index'],
-                    'sent': 0,
-                    'delivered': 0,
-                    'pdr_percent': '0.0000',
-                })
-                ack_pdr_file_fd.flush()
                 # Reset running counters for next MCS test
                 ack_total = 0
                 ack_delivered = 0
@@ -612,41 +611,6 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                         )
                         continue
 
-                    if ack_record['type'] == 'ACK_PDR_FINAL':
-                        if ack_pdr_writer is not None:
-                            ack_pdr_writer.writerow({
-                                'host_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-                                'source': 'ACK_PDR_FINAL',
-                                'seq': '',
-                                'sent': ack_record['sent'],
-                                'delivered': ack_record['delivered'],
-                                'pdr_percent': f"{ack_record['pdr_percent']:.4f}",
-                            })
-                        print(
-                            f"[ACK_PDR_FINAL] sent={ack_record['sent']} delivered={ack_record['delivered']} "
-                            f"pdr={ack_record['pdr_percent']:.2f}% (MCS rate switch complete)",
-                            flush=True,
-                        )
-                        continue
-
-                    if ack_record['type'] == 'ACK_RESET':
-                        print(
-                            f"[ACK_RESET] Resetting counters for MCS{ack_record['mcs_index']}",
-                            flush=True,
-                        )
-                        if ack_pdr_writer is not None:
-                            ack_pdr_writer.writerow({
-                                'host_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-                                'source': 'MCS_RESET',
-                                'seq': ack_record['mcs_index'],
-                                'sent': 0,
-                                'delivered': 0,
-                                'pdr_percent': '0.0000',
-                            })
-                        ack_total = 0
-                        ack_delivered = 0
-                        continue
-
                 # Neither CSI nor ACK: log as unknown serial line.
                 bad_count += 1
                 log_file_fd.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] unknown_line\n')
@@ -693,13 +657,13 @@ def main():
     parser.add_argument(
         '-s', '--store',
         dest='store_file',
-        default='./csi_data.csv',
+        default=str(DEFAULT_CSI_FILE),
         help='CSV file to save parsed CSI data'
     )
     parser.add_argument(
         '-l', '--log',
         dest='log_file',
-        default='./csi_data_log.txt',
+        default=str(DEFAULT_LOG_FILE),
         help='Log file for non-CSI and malformed lines'
     )
     parser.add_argument(
@@ -728,25 +692,25 @@ def main():
     parser.add_argument(
         '-sb', '--send-baud',
         type=int,
-        default=115200,
-        help='Sender serial baud rate for ACK metrics (default: 115200 — matches IDF console baud)'
+        default=921600,
+        help='Sender serial baud rate for ACK metrics (default: 921600)'
     )
     parser.add_argument(
         '-a', '--ack-store',
         dest='ack_store_file',
-        default='./ack_data.csv',
+        default=str(DEFAULT_ACK_FILE),
         help='CSV file to save ACK_STATUS running metrics from csi_send'
     )
     parser.add_argument(
         '-ap', '--ack-pdr-store',
         dest='ack_pdr_store_file',
-        default='./ack_pdr.csv',
+        default=str(DEFAULT_ACK_PDR_FILE),
         help='CSV file to save sender ACK PDR rows (ACK_STATUS-derived + ACK_PDR firmware rows)'
     )
     parser.add_argument(
         '--send-log',
         dest='send_log_file',
-        default='./send_serial_log.txt',
+        default=str(DEFAULT_SEND_LOG_FILE),
         help='Log file for sender non-ACK and malformed ACK lines'
     )
     parser.add_argument(
@@ -766,6 +730,22 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Normalize all output paths early so logs clearly show exactly where files are written.
+    args.store_file = str(Path(args.store_file).expanduser().resolve())
+    args.log_file = str(Path(args.log_file).expanduser().resolve())
+    args.ack_store_file = str(Path(args.ack_store_file).expanduser().resolve())
+    args.ack_pdr_store_file = str(Path(args.ack_pdr_store_file).expanduser().resolve())
+    args.send_log_file = str(Path(args.send_log_file).expanduser().resolve())
+
+    for output_path in (
+        args.store_file,
+        args.log_file,
+        args.ack_store_file,
+        args.ack_pdr_store_file,
+        args.send_log_file,
+    ):
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     if sys.version_info < (3, 6):
         print('Python version should be >= 3.6', file=sys.stderr)

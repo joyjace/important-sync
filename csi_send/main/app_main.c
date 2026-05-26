@@ -133,10 +133,6 @@ static void ack_reset_counters_for_rate_change(size_t new_mcs_index)
                (unsigned long)s_ack_success_count, pdr);
         fflush(stdout);
     }
-    /* Flush in-flight ACK seq queue so callbacks from the old MCS do not
-     * bleed into the new MCS counters.  Any pending esp_now_send_cb calls
-     * will find an empty queue and be silently dropped. */
-    s_ack_seq_head = s_ack_seq_tail = 0;
     /* Reset counters for next MCS/rate */
     s_ack_success_count = 0;
     s_ack_fail_count = 0;
@@ -349,7 +345,6 @@ void app_main()
     for (uint32_t count = 0; ; ++count) {
         int64_t now_us = esp_timer_get_time();
         if (now_us >= next_rate_switch_us) {
-            //size_t prev_rate_index = rate_index;
             rate_index = (rate_index + 1) % (sizeof(s_esp_now_rate_cycle) / sizeof(s_esp_now_rate_cycle[0]));
             
             /* Reset counters and output final PDR for previous MCS before switching */
@@ -396,7 +391,6 @@ void app_main()
 
     for (uint32_t count = 0; ; ++count) {
         if (packets_sent_in_current_rate >= CONFIG_RATE_SWITCH_PACKET_COUNT) {
-            //size_t prev_rate_index = rate_index;
             rate_index = (rate_index + 1) % (sizeof(s_esp_now_rate_cycle) / sizeof(s_esp_now_rate_cycle[0]));
             
             /* Reset counters and output final PDR for previous MCS before switching */

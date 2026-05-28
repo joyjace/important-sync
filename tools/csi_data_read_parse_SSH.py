@@ -13,6 +13,8 @@ import time
 import re
 import threading
 import argparse
+import os
+from collections import deque
 from io import StringIO
 from pathlib import Path
 
@@ -25,6 +27,21 @@ DEFAULT_LOG_FILE = SCRIPT_DIR / 'csi_data_log.txt'
 DEFAULT_ACK_FILE = SCRIPT_DIR / 'ack_data.csv'
 DEFAULT_ACK_PDR_FILE = SCRIPT_DIR / 'ack_pdr.csv'
 DEFAULT_SEND_LOG_FILE = SCRIPT_DIR / 'send_serial_log.txt'
+
+
+COLOR_STDOUT_ENABLED = False
+COLOR_STDERR_ENABLED = False
+ANSI_RESET = '\033[0m'
+ANSI_COLORS = {
+    'red': '\033[31m',
+    'green': '\033[32m',
+    'yellow': '\033[33m',
+    'blue': '\033[34m',
+    'magenta': '\033[35m',
+    'cyan': '\033[36m',
+    'white': '\033[37m',
+}
+ANSI_BOLD = '\033[1m'
 
 
 DATA_COLUMNS_NAMES_C5C6 = [
@@ -72,20 +89,30 @@ OUTPUT_COLUMNS = [
 
 ACK_DATA_COLUMNS = [
     'host_time',
+    'segment_id',
+    'mcs_index',
     'seq',
     'delivered',
     'running_sent',
     'running_delivered',
     'running_pdr_percent',
+    'rolling_window_size',
+    'rolling_delivered',
+    'rolling_pdr_percent',
 ]
 
 ACK_PDR_COLUMNS = [
     'host_time',
     'source',
+    'segment_id',
+    'mcs_index',
     'seq',
     'sent',
     'delivered',
     'pdr_percent',
+    'rolling_window_size',
+    'rolling_delivered',
+    'rolling_pdr_percent',
 ]
 
 
@@ -101,6 +128,98 @@ def safe_float(value, default=None):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def configure_terminal_colors(color_mode):
+    global COLOR_STDOUT_ENABLED, COLOR_STDERR_ENABLED
+
+    no_color = os.environ.get('NO_COLOR') is not None
+    if color_mode == 'always':
+        COLOR_STDOUT_ENABLED = True
+        COLOR_STDERR_ENABLED = True
+        return
+    if color_mode == 'never':
+        COLOR_STDOUT_ENABLED = False
+        COLOR_STDERR_ENABLED = False
+        return
+
+    # auto mode
+    COLOR_STDOUT_ENABLED = sys.stdout.isatty() and not no_color
+    COLOR_STDERR_ENABLED = sys.stderr.isatty() and not no_color
+
+
+def color_text(text, color=None, bold=False, stream='stdout'):
+    enabled = COLOR_STDOUT_ENABLED if stream == 'stdout' else COLOR_STDERR_ENABLED
+    if not enabled:
+        return text
+
+    parts = []
+    if bold:
+        parts.append(ANSI_BOLD)
+    if color in ANSI_COLORS:
+        parts.append(ANSI_COLORS[color])
+    if not parts:
+        return text
+    return ''.join(parts) + text + ANSI_RESET
+
+
+def pdr_color_name(pdr_percent):
+    if pdr_percent >= 80.0:
+        return 'green'
+    if pdr_percent >= 50.0:
+        return 'yellow'
+    return 'red'
+
+
+def color_pdr_percent(pdr_percent):
+    return color_text(f'{pdr_percent:.2f}%', color=pdr_color_name(pdr_percent), bold=True)
+
+
+def host_timestamp_ms():
+    now_ns = time.time_ns()
+    seconds = now_ns // 1_000_000_000
+    millis = (now_ns // 1_000_000) % 1000
+    return f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(seconds))}.{millis:03d}"
+
+
+def build_ack_status_rows(seq, delivered, ack_total, ack_delivered,
+                          rolling_window, segment_id, mcs_index):
+    rolling_sent = len(rolling_window)
+    rolling_delivered = sum(rolling_window)
+    rolling_pdr_percent = 100.0 * rolling_delivered / rolling_sent if rolling_sent > 0 else 0.0
+    running_pdr_percent = 100.0 * ack_delivered / ack_total if ack_total > 0 else 0.0
+    host_time = host_timestamp_ms()
+    mcs_value = '' if mcs_index is None else mcs_index
+
+    ack_row = {
+        'host_time': host_time,
+        'segment_id': segment_id,
+        'mcs_index': mcs_value,
+        'seq': seq,
+        'delivered': delivered,
+        'running_sent': ack_total,
+        'running_delivered': ack_delivered,
+        'running_pdr_percent': f'{running_pdr_percent:.4f}',
+        'rolling_window_size': rolling_sent,
+        'rolling_delivered': rolling_delivered,
+        'rolling_pdr_percent': f'{rolling_pdr_percent:.4f}',
+    }
+
+    ack_pdr_row = {
+        'host_time': host_time,
+        'source': 'ACK_STATUS',
+        'segment_id': segment_id,
+        'mcs_index': mcs_value,
+        'seq': seq,
+        'sent': ack_total,
+        'delivered': ack_delivered,
+        'pdr_percent': f'{running_pdr_percent:.4f}',
+        'rolling_window_size': rolling_sent,
+        'rolling_delivered': rolling_delivered,
+        'rolling_pdr_percent': f'{rolling_pdr_percent:.4f}',
+    }
+
+    return ack_row, ack_pdr_row, running_pdr_percent
 
 
 ACK_STATUS_PATTERN = re.compile(r'ACK_STATUS\s*,\s*(\d+)\s*,\s*([01])')
@@ -285,7 +404,7 @@ def compute_stats(raw_data, sample_count):
 
 def make_output_row(frame, stats):
     return {
-        'host_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'host_time': host_timestamp_ms(),
         'format': frame['format'],
         'seq_or_id': frame['seq_or_id'],
         'mac': frame['mac'],
@@ -331,9 +450,10 @@ def print_summary(frame_count, frame, stats):
 
 
 def print_ack_summary(ack_total, ack_delivered, pdr_percent, seq):
+    tag = color_text('[ACK]', color='cyan', bold=True)
     print(
-        f'[ACK] seq={seq} delivered_total={ack_delivered}/{ack_total} '
-        f'pdr={pdr_percent:.2f}%',
+        f'{tag} seq={seq} delivered_total={ack_delivered}/{ack_total} '
+        f'pdr={color_pdr_percent(pdr_percent)}',
         flush=True,
     )
 
@@ -348,9 +468,11 @@ def infer_single_port_mode(baudrate):
 
 def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                    ack_pdr_writer, ack_pdr_file_fd, send_log_fd,
-                   ack_summary_every, stop_event):
+                   ack_summary_every, ack_window_size, stop_event):
     if ack_summary_every < 0:
         ack_summary_every = 0
+    if ack_window_size <= 0:
+        ack_window_size = 100
 
     try:
         ser = serial.Serial(
@@ -375,6 +497,9 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
     ack_delivered = 0
     ack_non_ack_count = 0
     ack_bad_count = 0
+    segment_id = 0
+    current_mcs_index = 0
+    rolling_window = deque(maxlen=ack_window_size)
 
     try:
         while not stop_event.is_set():
@@ -390,21 +515,21 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
 
             if error == 'not_ack':
                 ack_non_ack_count += 1
-                send_log_fd.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] not_ack\n')
+                send_log_fd.write(f'[{host_timestamp_ms()}] not_ack\n')
                 send_log_fd.write(line + '\n')
                 send_log_fd.flush()
                 continue
 
             if error is not None:
                 ack_bad_count += 1
-                send_log_fd.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] {error}\n')
+                send_log_fd.write(f'[{host_timestamp_ms()}] {error}\n')
                 send_log_fd.write(line + '\n')
                 send_log_fd.flush()
                 continue
 
             if record is None:
                 ack_bad_count += 1
-                send_log_fd.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] parser_returned_none\n')
+                send_log_fd.write(f'[{host_timestamp_ms()}] parser_returned_none\n')
                 send_log_fd.write(line + '\n')
                 send_log_fd.flush()
                 continue
@@ -412,26 +537,21 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
             if record['type'] == 'ACK_STATUS':
                 ack_total += 1
                 ack_delivered += record['delivered']
-                pdr_percent = 100.0 * ack_delivered / ack_total
+                rolling_window.append(record['delivered'])
+                ack_row, ack_pdr_row, pdr_percent = build_ack_status_rows(
+                    seq=record['seq'],
+                    delivered=record['delivered'],
+                    ack_total=ack_total,
+                    ack_delivered=ack_delivered,
+                    rolling_window=rolling_window,
+                    segment_id=segment_id,
+                    mcs_index=current_mcs_index,
+                )
 
-                ack_writer.writerow({
-                    'host_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-                    'seq': record['seq'],
-                    'delivered': record['delivered'],
-                    'running_sent': ack_total,
-                    'running_delivered': ack_delivered,
-                    'running_pdr_percent': f'{pdr_percent:.4f}',
-                })
+                ack_writer.writerow(ack_row)
                 ack_file_fd.flush()
 
-                ack_pdr_writer.writerow({
-                    'host_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-                    'source': 'ACK_STATUS',
-                    'seq': record['seq'],
-                    'sent': ack_total,
-                    'delivered': ack_delivered,
-                    'pdr_percent': f'{pdr_percent:.4f}',
-                })
+                ack_pdr_writer.writerow(ack_pdr_row)
                 ack_pdr_file_fd.flush()
 
                 if ack_summary_every > 0 and ack_total % ack_summary_every == 0:
@@ -441,17 +561,23 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
 
             if record['type'] == 'ACK_PDR':
                 ack_pdr_writer.writerow({
-                    'host_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'host_time': host_timestamp_ms(),
                     'source': 'ACK_PDR',
+                    'segment_id': segment_id,
+                    'mcs_index': current_mcs_index,
                     'seq': '',
                     'sent': record['sent'],
                     'delivered': record['delivered'],
                     'pdr_percent': f"{record['pdr_percent']:.4f}",
+                    'rolling_window_size': '',
+                    'rolling_delivered': '',
+                    'rolling_pdr_percent': '',
                 })
                 ack_pdr_file_fd.flush()
+                ack_pdr_tag = color_text('[ACK_PDR]', color='magenta', bold=True)
                 print(
-                    f"[ACK_PDR] sent={record['sent']} delivered={record['delivered']} "
-                    f"pdr={record['pdr_percent']:.2f}%",
+                    f"{ack_pdr_tag} sent={record['sent']} delivered={record['delivered']} "
+                    f"pdr={color_pdr_percent(record['pdr_percent'])}",
                     flush=True,
                 )
 
@@ -459,30 +585,40 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
 
             if record['type'] == 'ACK_PDR_FINAL':
                 ack_pdr_writer.writerow({
-                    'host_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'host_time': host_timestamp_ms(),
                     'source': 'ACK_PDR_FINAL',
+                    'segment_id': segment_id,
+                    'mcs_index': current_mcs_index,
                     'seq': '',
                     'sent': record['sent'],
                     'delivered': record['delivered'],
                     'pdr_percent': f"{record['pdr_percent']:.4f}",
+                    'rolling_window_size': '',
+                    'rolling_delivered': '',
+                    'rolling_pdr_percent': '',
                 })
                 ack_pdr_file_fd.flush()
+                ack_pdr_final_tag = color_text('[ACK_PDR_FINAL]', color='green', bold=True)
                 print(
-                    f"[ACK_PDR_FINAL] sent={record['sent']} delivered={record['delivered']} "
-                    f"pdr={record['pdr_percent']:.2f}% (MCS rate switch complete)",
+                    f"{ack_pdr_final_tag} sent={record['sent']} delivered={record['delivered']} "
+                    f"pdr={color_pdr_percent(record['pdr_percent'])} (MCS rate switch complete)",
                     flush=True,
                 )
 
                 continue
 
             if record['type'] == 'ACK_RESET':
+                ack_reset_tag = color_text('[ACK_RESET]', color='yellow', bold=True)
                 print(
-                    f"[ACK_RESET] Resetting counters for MCS{record['mcs_index']}",
+                    f"{ack_reset_tag} Resetting counters for MCS{record['mcs_index']}",
                     flush=True,
                 )
                 # Reset running counters for next MCS test
+                segment_id += 1
+                current_mcs_index = record['mcs_index']
                 ack_total = 0
                 ack_delivered = 0
+                rolling_window.clear()
                 continue
 
     finally:
@@ -499,9 +635,12 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                         ack_writer=None, ack_file_fd=None,
                         ack_pdr_writer=None, ack_pdr_file_fd=None,
                         ack_summary_every=0,
+                        ack_window_size=100,
                         single_port_mode='auto'):
     if flush_every <= 0:
         flush_every = 1
+    if ack_window_size <= 0:
+        ack_window_size = 100
 
     try:
         ser = serial.Serial(
@@ -526,6 +665,9 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
     bad_count = 0
     ack_total = 0
     ack_delivered = 0
+    segment_id = 0
+    current_mcs_index = 0
+    rolling_window = deque(maxlen=ack_window_size)
 
     try:
         while True:
@@ -567,27 +709,26 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                     if ack_record['type'] == 'ACK_STATUS':
                         ack_total += 1
                         ack_delivered += ack_record['delivered']
-                        pdr_percent = 100.0 * ack_delivered / ack_total
+                        rolling_window.append(ack_record['delivered'])
+                        ack_row, ack_pdr_row, pdr_percent = build_ack_status_rows(
+                            seq=ack_record['seq'],
+                            delivered=ack_record['delivered'],
+                            ack_total=ack_total,
+                            ack_delivered=ack_delivered,
+                            rolling_window=rolling_window,
+                            segment_id=segment_id,
+                            mcs_index=current_mcs_index,
+                        )
 
                         if ack_writer is not None:
-                            ack_writer.writerow({
-                                'host_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-                                'seq': ack_record['seq'],
-                                'delivered': ack_record['delivered'],
-                                'running_sent': ack_total,
-                                'running_delivered': ack_delivered,
-                                'running_pdr_percent': f'{pdr_percent:.4f}',
-                            })
+                            ack_writer.writerow(ack_row)
+                            if ack_file_fd is not None:
+                                ack_file_fd.flush()
 
                         if ack_pdr_writer is not None:
-                            ack_pdr_writer.writerow({
-                                'host_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-                                'source': 'ACK_STATUS',
-                                'seq': ack_record['seq'],
-                                'sent': ack_total,
-                                'delivered': ack_delivered,
-                                'pdr_percent': f'{pdr_percent:.4f}',
-                            })
+                            ack_pdr_writer.writerow(ack_pdr_row)
+                            if ack_pdr_file_fd is not None:
+                                ack_pdr_file_fd.flush()
 
                         if ack_summary_every > 0 and ack_total % ack_summary_every == 0:
                             print_ack_summary(ack_total, ack_delivered, pdr_percent, ack_record['seq'])
@@ -597,30 +738,76 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                     if ack_record['type'] == 'ACK_PDR':
                         if ack_pdr_writer is not None:
                             ack_pdr_writer.writerow({
-                                'host_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                                'host_time': host_timestamp_ms(),
                                 'source': 'ACK_PDR',
+                                'segment_id': segment_id,
+                                'mcs_index': current_mcs_index,
                                 'seq': '',
                                 'sent': ack_record['sent'],
                                 'delivered': ack_record['delivered'],
                                 'pdr_percent': f"{ack_record['pdr_percent']:.4f}",
+                                'rolling_window_size': '',
+                                'rolling_delivered': '',
+                                'rolling_pdr_percent': '',
                             })
+                            if ack_pdr_file_fd is not None:
+                                ack_pdr_file_fd.flush()
+                        ack_pdr_tag = color_text('[ACK_PDR]', color='magenta', bold=True)
                         print(
-                            f"[ACK_PDR] sent={ack_record['sent']} delivered={ack_record['delivered']} "
-                            f"pdr={ack_record['pdr_percent']:.2f}%",
+                            f"{ack_pdr_tag} sent={ack_record['sent']} delivered={ack_record['delivered']} "
+                            f"pdr={color_pdr_percent(ack_record['pdr_percent'])}",
                             flush=True,
                         )
                         continue
 
+                    if ack_record['type'] == 'ACK_PDR_FINAL':
+                        if ack_pdr_writer is not None:
+                            ack_pdr_writer.writerow({
+                                'host_time': host_timestamp_ms(),
+                                'source': 'ACK_PDR_FINAL',
+                                'segment_id': segment_id,
+                                'mcs_index': current_mcs_index,
+                                'seq': '',
+                                'sent': ack_record['sent'],
+                                'delivered': ack_record['delivered'],
+                                'pdr_percent': f"{ack_record['pdr_percent']:.4f}",
+                                'rolling_window_size': '',
+                                'rolling_delivered': '',
+                                'rolling_pdr_percent': '',
+                            })
+                            if ack_pdr_file_fd is not None:
+                                ack_pdr_file_fd.flush()
+                        ack_pdr_final_tag = color_text('[ACK_PDR_FINAL]', color='green', bold=True)
+                        print(
+                            f"{ack_pdr_final_tag} sent={ack_record['sent']} delivered={ack_record['delivered']} "
+                            f"pdr={color_pdr_percent(ack_record['pdr_percent'])} (MCS rate switch complete)",
+                            flush=True,
+                        )
+                        continue
+
+                    if ack_record['type'] == 'ACK_RESET':
+                        ack_reset_tag = color_text('[ACK_RESET]', color='yellow', bold=True)
+                        print(
+                            f"{ack_reset_tag} Resetting counters for MCS{ack_record['mcs_index']}",
+                            flush=True,
+                        )
+                        segment_id += 1
+                        current_mcs_index = ack_record['mcs_index']
+                        ack_total = 0
+                        ack_delivered = 0
+                        rolling_window.clear()
+                        continue
+
                 # Neither CSI nor ACK: log as unknown serial line.
                 bad_count += 1
-                log_file_fd.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] unknown_line\n')
+                log_file_fd.write(f'[{host_timestamp_ms()}] unknown_line\n')
                 log_file_fd.write(line + '\n')
                 log_file_fd.flush()
                 continue
 
             # CSI-like line but malformed.
             bad_count += 1
-            log_file_fd.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] {error}\n')
+            log_file_fd.write(f'[{host_timestamp_ms()}] {error}\n')
             log_file_fd.write(line + '\n')
             log_file_fd.flush()
             continue
@@ -720,6 +907,12 @@ def main():
         help='Print ACK summary every N ACK_STATUS rows (default: 100, 0 disables)'
     )
     parser.add_argument(
+        '--ack-window-size',
+        type=int,
+        default=100,
+        help='Rolling ACK window size in packets for rolling PDR fields (default: 100)'
+    )
+    parser.add_argument(
         '--single-port-mode',
         choices=['auto', 'csi', 'ack'],
         default='auto',
@@ -728,8 +921,15 @@ def main():
             '(<=230400 -> ack, otherwise csi).'
         )
     )
+    parser.add_argument(
+        '--color',
+        choices=['auto', 'always', 'never'],
+        default='auto',
+        help='Terminal color mode for important ACK/PDR lines (default: auto)'
+    )
 
     args = parser.parse_args()
+    configure_terminal_colors(args.color)
 
     # Normalize all output paths early so logs clearly show exactly where files are written.
     args.store_file = str(Path(args.store_file).expanduser().resolve())
@@ -787,6 +987,7 @@ def main():
                         ack_pdr_fd,
                         send_log_fd,
                         args.ack_summary_every,
+                        args.ack_window_size,
                         stop_event,
                     ),
                     daemon=True,
@@ -808,6 +1009,7 @@ def main():
                         ack_pdr_writer=ack_pdr_writer,
                         ack_pdr_file_fd=ack_pdr_fd,
                         ack_summary_every=args.ack_summary_every,
+                        ack_window_size=args.ack_window_size,
                     )
                 finally:
                     stop_event.set()
@@ -838,6 +1040,7 @@ def main():
                 ack_pdr_writer=ack_pdr_writer,
                 ack_pdr_file_fd=ack_pdr_fd,
                 ack_summary_every=args.ack_summary_every,
+                ack_window_size=args.ack_window_size,
                 single_port_mode=selected_mode,
             )
 

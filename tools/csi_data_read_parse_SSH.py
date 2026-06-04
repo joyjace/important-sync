@@ -449,11 +449,14 @@ def print_summary(frame_count, frame, stats):
     print(msg, flush=True)
 
 
-def print_ack_summary(ack_total, ack_delivered, pdr_percent, seq):
+def print_ack_summary(ack_total, ack_delivered, running_pdr_percent, seq,
+                      rolling_sent, rolling_delivered, rolling_pdr_percent):
     tag = color_text('[ACK]', color='cyan', bold=True)
     print(
         f'{tag} seq={seq} delivered_total={ack_delivered}/{ack_total} '
-        f'pdr={color_pdr_percent(pdr_percent)}',
+        f'running_pdr={color_pdr_percent(running_pdr_percent)} '
+        f'window={rolling_delivered}/{rolling_sent} '
+        f'window_pdr={color_pdr_percent(rolling_pdr_percent)}',
         flush=True,
     )
 
@@ -468,7 +471,8 @@ def infer_single_port_mode(baudrate):
 
 def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                    ack_pdr_writer, ack_pdr_file_fd, send_log_fd,
-                   ack_summary_every, ack_window_size, stop_event):
+                   ack_summary_every, ack_window_size,
+                   stop_event):
     if ack_summary_every < 0:
         ack_summary_every = 0
     if ack_window_size <= 0:
@@ -555,7 +559,18 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                 ack_pdr_file_fd.flush()
 
                 if ack_summary_every > 0 and ack_total % ack_summary_every == 0:
-                    print_ack_summary(ack_total, ack_delivered, pdr_percent, record['seq'])
+                    rolling_sent = len(rolling_window)
+                    rolling_delivered = sum(rolling_window)
+                    rolling_pdr_percent = 100.0 * rolling_delivered / rolling_sent if rolling_sent > 0 else 0.0
+                    print_ack_summary(
+                        ack_total=ack_total,
+                        ack_delivered=ack_delivered,
+                        running_pdr_percent=pdr_percent,
+                        seq=record['seq'],
+                        rolling_sent=rolling_sent,
+                        rolling_delivered=rolling_delivered,
+                        rolling_pdr_percent=rolling_pdr_percent,
+                    )
 
                 continue
 
@@ -731,7 +746,18 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                                 ack_pdr_file_fd.flush()
 
                         if ack_summary_every > 0 and ack_total % ack_summary_every == 0:
-                            print_ack_summary(ack_total, ack_delivered, pdr_percent, ack_record['seq'])
+                            rolling_sent = len(rolling_window)
+                            rolling_delivered = sum(rolling_window)
+                            rolling_pdr_percent = 100.0 * rolling_delivered / rolling_sent if rolling_sent > 0 else 0.0
+                            print_ack_summary(
+                                ack_total=ack_total,
+                                ack_delivered=ack_delivered,
+                                running_pdr_percent=pdr_percent,
+                                seq=ack_record['seq'],
+                                rolling_sent=rolling_sent,
+                                rolling_delivered=rolling_delivered,
+                                rolling_pdr_percent=rolling_pdr_percent,
+                            )
 
                         continue
 

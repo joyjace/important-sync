@@ -181,7 +181,7 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     /* ACK frames carry no ESP-NOW payload (sig_len < 40). Log their CSI metadata
      * and return early so the CSV parser is not fed an invalid row. */
     if (rx_ctrl->sig_len < 40) {
-        ESP_LOGI(TAG, "ACK_CSI mac=" MACSTR " rssi=%d sig_len=%d timestamp=%d",
+        ESP_LOGD(TAG, "ACK_CSI mac=" MACSTR " rssi=%d sig_len=%d timestamp=%d",
                  MAC2STR(info->mac), rx_ctrl->rssi, rx_ctrl->sig_len, rx_ctrl->timestamp);
         return;
     }
@@ -202,7 +202,7 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 #endif
     }
     esp_csi_gain_ctrl_get_gain_compensation(&compensate_gain, agc_gain, fft_gain);
-    ESP_LOGI(TAG, "compensate_gain %f, agc_gain %d, fft_gain %d", compensate_gain, agc_gain, fft_gain);
+    ESP_LOGD(TAG, "compensate_gain %f, agc_gain %d, fft_gain %d", compensate_gain, agc_gain, fft_gain);
 #endif
 
     uint32_t rx_id = *(uint32_t *)(info->payload + 15);

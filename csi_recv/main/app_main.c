@@ -218,7 +218,7 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     rate_for_csv = (rx_ctrl->sig_mode == 1) ? rx_ctrl->mcs : rx_ctrl->rate;
 #endif
     if (!s_count) {
-        ESP_LOGI(TAG, "================ CSI RECV ================");
+        ESP_LOGD(TAG, "================ CSI RECV ================");
         ets_printf("type,seq,mac,rssi,rate,noise_floor,fft_gain,agc_gain,channel,local_timestamp,sig_len,rx_state,len,first_word,data\n");
     }
 
@@ -228,7 +228,7 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
                rx_ctrl->timestamp, rx_ctrl->sig_len, rx_ctrl->rx_state);
 #else
     if (!s_count) {
-        ESP_LOGI(TAG, "================ CSI RECV ================");
+        ESP_LOGD(TAG, "================ CSI RECV ================");
         ets_printf("type,id,mac,rssi,rate,sig_mode,mcs,bandwidth,smoothing,not_sounding,aggregation,stbc,fec_coding,sgi,noise_floor,ampdu_cnt,channel,secondary_channel,local_timestamp,ant,sig_len,rx_state,len,first_word,data\n");
     }
 

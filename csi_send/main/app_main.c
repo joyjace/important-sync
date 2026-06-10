@@ -70,6 +70,7 @@
  *  - Choose legacy rates for robustness, MCS rates for higher throughput when link is good.
  */
 #define CONFIG_SEND_FREQUENCY               100
+#define CONFIG_PACKET_PACING_ENABLED        0  // 1 = paced by CONFIG_SEND_FREQUENCY, 0 = max-rate (no fixed sleep)
 #define CONFIG_RATE_SWITCH_MODE             1  // 0 = TIME_BASED, 1 = PACKET_BASED, 2 = STATIC (fixed rate, no switching)
 #define CONFIG_RATE_SWITCH_INTERVAL_SEC     10 // Used when TIME_BASED
 #define CONFIG_RATE_SWITCH_PACKET_COUNT     1000 // Used when PACKET_BASED
@@ -86,6 +87,12 @@
 #error "CONFIG_ESP_NOW_PAYLOAD_LEN exceeds ESP_NOW_MAX_DATA_LEN"
 #endif
 
+#if CONFIG_PACKET_PACING_ENABLED
+#if CONFIG_SEND_FREQUENCY <= 0
+#error "CONFIG_SEND_FREQUENCY must be > 0 when CONFIG_PACKET_PACING_ENABLED is 1"
+#endif
+#endif
+
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
 #define ESP_IF_WIFI_STA ESP_MAC_WIFI_STA
 #endif
@@ -93,6 +100,13 @@
 static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
 static const uint8_t CONFIG_CSI_RECV_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x01};
 static const char *TAG = "csi_send";
+
+static inline void tx_pacing_delay_us(void)
+{
+#if CONFIG_PACKET_PACING_ENABLED
+    usleep(1000 * 1000 / CONFIG_SEND_FREQUENCY);
+#endif
+}
 
 static uint32_t s_ack_success_count  = 0;
 static uint32_t s_ack_fail_count     = 0;
@@ -369,7 +383,7 @@ void app_main()
             ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
         }
 
-        usleep(1000 * 1000 / CONFIG_SEND_FREQUENCY);
+        tx_pacing_delay_us();
     }
 #elif CONFIG_RATE_SWITCH_MODE == 2
     /* STATIC rate — no switching, CONFIG_ESP_NOW_RATE is used for the entire run */
@@ -384,7 +398,7 @@ void app_main()
             ack_emit_status(count, 0);
             ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
         }
-        usleep(1000 * 1000 / CONFIG_SEND_FREQUENCY);
+        tx_pacing_delay_us();
     }
 #else
     /* PACKET_BASED rate switching */
@@ -413,7 +427,7 @@ void app_main()
             ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
         }
 
-        usleep(1000 * 1000 / CONFIG_SEND_FREQUENCY);
+        tx_pacing_delay_us();
     }
 #endif
 }

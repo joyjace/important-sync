@@ -179,7 +179,8 @@ def host_timestamp_ms():
     now_ns = time.time_ns()
     seconds = now_ns // 1_000_000_000
     millis = (now_ns // 1_000_000) % 1000
-    return f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(seconds))}.{millis:03d}"
+    micros = (now_ns // 1_000) % 1000
+    return f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(seconds))}.{millis:03d}{micros:03d}"
 
 
 def build_ack_status_rows(seq, delivered, ack_total, ack_delivered,

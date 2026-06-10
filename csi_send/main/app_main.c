@@ -119,7 +119,8 @@ static volatile uint16_t s_ack_seq_tail = 0;
 
 static void ack_emit_status(uint32_t seq, int delivered)
 {
-    printf("ACK_STATUS,%lu,%d\n", (unsigned long)seq, delivered);
+    printf("ACK_STATUS,%lu,%d,%lld\n", (unsigned long)seq, delivered,
+           (long long)esp_timer_get_time());
     fflush(stdout);
 
     if (delivered) {
@@ -130,9 +131,10 @@ static void ack_emit_status(uint32_t seq, int delivered)
 
     uint32_t total = s_ack_success_count + s_ack_fail_count;
     if (total > 0 && total % 100 == 0) {
-        printf("ACK_PDR,%lu,%lu,%.1f\n", (unsigned long)total,
+        printf("ACK_PDR,%lu,%lu,%.1f,%lld\n", (unsigned long)total,
                (unsigned long)s_ack_success_count,
-               100.0f * s_ack_success_count / total);
+               100.0f * s_ack_success_count / total,
+               (long long)esp_timer_get_time());
         fflush(stdout);
     }
 }
@@ -144,8 +146,9 @@ static void ack_reset_counters_for_rate_change(size_t new_mcs_index)
     uint32_t total = s_ack_success_count + s_ack_fail_count;
     if (total > 0) {
         float pdr = 100.0f * s_ack_success_count / total;
-        printf("ACK_PDR_FINAL,%lu,%lu,%.1f\n", (unsigned long)total,
-               (unsigned long)s_ack_success_count, pdr);
+        printf("ACK_PDR_FINAL,%lu,%lu,%.1f,%lld\n", (unsigned long)total,
+               (unsigned long)s_ack_success_count, pdr,
+               (long long)esp_timer_get_time());
         fflush(stdout);
     }
     /* Reset counters for next MCS/rate */

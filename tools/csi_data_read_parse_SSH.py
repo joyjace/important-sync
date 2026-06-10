@@ -90,6 +90,7 @@ OUTPUT_COLUMNS = [
 
 ACK_DATA_COLUMNS = [
     'host_time',
+    'esp_time_us',
     'segment_id',
     'mcs_index',
     'seq',
@@ -104,6 +105,7 @@ ACK_DATA_COLUMNS = [
 
 ACK_PDR_COLUMNS = [
     'host_time',
+    'esp_time_us',
     'source',
     'segment_id',
     'mcs_index',
@@ -185,7 +187,8 @@ def host_timestamp_ms():
 
 
 def build_ack_status_rows(seq, delivered, ack_total, ack_delivered,
-                          rolling_window, segment_id, mcs_index):
+                          rolling_window, segment_id, mcs_index,
+                          esp_time_us=None):
     rolling_sent = len(rolling_window)
     rolling_delivered = sum(rolling_window)
     rolling_pdr_percent = 100.0 * rolling_delivered / rolling_sent if rolling_sent > 0 else 0.0
@@ -195,6 +198,7 @@ def build_ack_status_rows(seq, delivered, ack_total, ack_delivered,
 
     ack_row = {
         'host_time': host_time,
+        'esp_time_us': esp_time_us if esp_time_us is not None else '',
         'segment_id': segment_id,
         'mcs_index': mcs_value,
         'seq': seq,
@@ -209,6 +213,7 @@ def build_ack_status_rows(seq, delivered, ack_total, ack_delivered,
 
     ack_pdr_row = {
         'host_time': host_time,
+        'esp_time_us': esp_time_us if esp_time_us is not None else '',
         'source': 'ACK_STATUS',
         'segment_id': segment_id,
         'mcs_index': mcs_value,
@@ -224,9 +229,9 @@ def build_ack_status_rows(seq, delivered, ack_total, ack_delivered,
     return ack_row, ack_pdr_row, running_pdr_percent
 
 
-ACK_STATUS_PATTERN = re.compile(r'ACK_STATUS\s*,\s*(\d+)\s*,\s*([01])')
-ACK_PDR_PATTERN = re.compile(r'ACK_PDR\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9]+(?:\.[0-9]+)?)')
-ACK_PDR_FINAL_PATTERN = re.compile(r'ACK_PDR_FINAL\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9]+(?:\.[0-9]+)?)')
+ACK_STATUS_PATTERN = re.compile(r'^ACK_STATUS\s*,\s*(\d+)\s*,\s*([01])(?:\s*,\s*(\d+))?\s*$')
+ACK_PDR_PATTERN = re.compile(r'^ACK_PDR\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9]+(?:\.[0-9]+)?)(?:\s*,\s*(\d+))?\s*$')
+ACK_PDR_FINAL_PATTERN = re.compile(r'^ACK_PDR_FINAL\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9]+(?:\.[0-9]+)?)(?:\s*,\s*(\d+))?\s*$')
 ACK_RESET_PATTERN = re.compile(r'ACK_RESET_FOR_MCS(\d+)')
 
 
@@ -239,12 +244,14 @@ def parse_ack_line(line):
     if status_match:
         seq = safe_int(status_match.group(1))
         delivered = safe_int(status_match.group(2))
+        esp_time_us = safe_int(status_match.group(3))
         if seq is None or delivered not in (0, 1):
             return None, 'invalid_ack_status_fields'
         return {
             'type': 'ACK_STATUS',
             'seq': seq,
             'delivered': delivered,
+            'esp_time_us': esp_time_us,
         }, None
 
     pdr_match = ACK_PDR_PATTERN.search(line)
@@ -252,6 +259,7 @@ def parse_ack_line(line):
         sent = safe_int(pdr_match.group(1))
         delivered = safe_int(pdr_match.group(2))
         pdr = safe_float(pdr_match.group(3))
+        esp_time_us = safe_int(pdr_match.group(4))
         if sent is None or delivered is None or pdr is None:
             return None, 'invalid_ack_pdr_fields'
         return {
@@ -259,6 +267,7 @@ def parse_ack_line(line):
             'sent': sent,
             'delivered': delivered,
             'pdr_percent': pdr,
+            'esp_time_us': esp_time_us,
         }, None
 
     pdr_final_match = ACK_PDR_FINAL_PATTERN.search(line)
@@ -266,6 +275,7 @@ def parse_ack_line(line):
         sent = safe_int(pdr_final_match.group(1))
         delivered = safe_int(pdr_final_match.group(2))
         pdr = safe_float(pdr_final_match.group(3))
+        esp_time_us = safe_int(pdr_final_match.group(4))
         if sent is None or delivered is None or pdr is None:
             return None, 'invalid_ack_pdr_final_fields'
         return {
@@ -273,6 +283,7 @@ def parse_ack_line(line):
             'sent': sent,
             'delivered': delivered,
             'pdr_percent': pdr,
+            'esp_time_us': esp_time_us,
         }, None
 
     reset_match = ACK_RESET_PATTERN.search(line)
@@ -555,6 +566,7 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                     rolling_window=rolling_window,
                     segment_id=segment_id,
                     mcs_index=current_mcs_index,
+                    esp_time_us=record.get('esp_time_us'),
                 )
 
                 ack_writer.writerow(ack_row)
@@ -582,6 +594,7 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
             if record['type'] == 'ACK_PDR':
                 ack_pdr_writer.writerow({
                     'host_time': host_timestamp_ms(),
+                    'esp_time_us': record.get('esp_time_us', ''),
                     'source': 'ACK_PDR',
                     'segment_id': segment_id,
                     'mcs_index': current_mcs_index,
@@ -606,6 +619,7 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
             if record['type'] == 'ACK_PDR_FINAL':
                 ack_pdr_writer.writerow({
                     'host_time': host_timestamp_ms(),
+                    'esp_time_us': record.get('esp_time_us', ''),
                     'source': 'ACK_PDR_FINAL',
                     'segment_id': segment_id,
                     'mcs_index': current_mcs_index,
@@ -738,6 +752,7 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                             rolling_window=rolling_window,
                             segment_id=segment_id,
                             mcs_index=current_mcs_index,
+                            esp_time_us=ack_record.get('esp_time_us'),
                         )
 
                         if ack_writer is not None:
@@ -770,6 +785,7 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                         if ack_pdr_writer is not None:
                             ack_pdr_writer.writerow({
                                 'host_time': host_timestamp_ms(),
+                                'esp_time_us': ack_record.get('esp_time_us', ''),
                                 'source': 'ACK_PDR',
                                 'segment_id': segment_id,
                                 'mcs_index': current_mcs_index,
@@ -795,6 +811,7 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                         if ack_pdr_writer is not None:
                             ack_pdr_writer.writerow({
                                 'host_time': host_timestamp_ms(),
+                                'esp_time_us': ack_record.get('esp_time_us', ''),
                                 'source': 'ACK_PDR_FINAL',
                                 'segment_id': segment_id,
                                 'mcs_index': current_mcs_index,

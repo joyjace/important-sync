@@ -402,11 +402,11 @@ void app_main()
     }
 #else
     /* PACKET_BASED rate switching */
-    uint32_t packets_sent_in_current_rate = 0;
-    ESP_LOGI(TAG, "ESP-NOW rate set: WIFI_PHY_RATE_MCS0_LGI (switching every %d packets)", CONFIG_RATE_SWITCH_PACKET_COUNT);
+    uint32_t packets_attempted_in_current_rate = 0;
+    ESP_LOGI(TAG, "ESP-NOW rate set: WIFI_PHY_RATE_MCS0_LGI (switching every %d attempted packets)", CONFIG_RATE_SWITCH_PACKET_COUNT);
 
     for (uint32_t count = 0; ; ++count) {
-        if (packets_sent_in_current_rate >= CONFIG_RATE_SWITCH_PACKET_COUNT) {
+        if (packets_attempted_in_current_rate >= CONFIG_RATE_SWITCH_PACKET_COUNT) {
             rate_index = (rate_index + 1) % (sizeof(s_esp_now_rate_cycle) / sizeof(s_esp_now_rate_cycle[0]));
             
             /* Reset counters and output final PDR for previous MCS before switching */
@@ -414,13 +414,13 @@ void app_main()
             
             esp_now_set_peer_rate(peer.peer_addr, s_esp_now_rate_cycle[rate_index]);
             ESP_LOGI(TAG, "ESP-NOW rate set: WIFI_PHY_RATE_MCS%u_LGI", (unsigned int)rate_index);
-            packets_sent_in_current_rate = 0;
+            packets_attempted_in_current_rate = 0;
         }
 
+        packets_attempted_in_current_rate++;
         esp_err_t ret = esp_now_send_with_seq(peer.peer_addr, count);
         if (ret == ESP_OK) {
             ack_seq_enqueue(count);
-            packets_sent_in_current_rate++;
         } else {
             /* Immediate enqueue/send failure: no callback expected, mark as lost now. */
             ack_emit_status(count, 0);

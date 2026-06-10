@@ -64,6 +64,7 @@ DATA_COLUMNS_NAMES_NEW = [
 
 OUTPUT_COLUMNS = [
     'host_time',
+    'esp_time_us',
     'format',
     'seq_or_id',
     'mac',
@@ -404,8 +405,11 @@ def compute_stats(raw_data, sample_count):
 
 
 def make_output_row(frame, stats):
+    # Prefer the ESP-side timestamp for packet timing accuracy.
+    esp_time_us = frame['local_timestamp'] if frame['local_timestamp'] is not None else ''
     return {
         'host_time': host_timestamp_ms(),
+        'esp_time_us': esp_time_us,
         'format': frame['format'],
         'seq_or_id': frame['seq_or_id'],
         'mac': frame['mac'],

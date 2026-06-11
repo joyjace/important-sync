@@ -25,6 +25,8 @@
 #include "esp_netif.h"
 #include "esp_now.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 /* ESP-IDF 6.0+ renamed WIFI_BW_HT20/HT40 to WIFI_BW20/BW40. */
 #ifndef WIFI_BW_HT20
@@ -70,14 +72,15 @@
  *  - Choose legacy rates for robustness, MCS rates for higher throughput when link is good.
  */
 #define CONFIG_SEND_FREQUENCY               100
-#define CONFIG_PACKET_PACING_ENABLED        0  // 1 = paced by CONFIG_SEND_FREQUENCY, 0 = max-rate (no fixed sleep)
+#define CONFIG_PACKET_PACING_ENABLED        1  // 1 = paced by CONFIG_SEND_FREQUENCY, 0 = max-rate (no fixed sleep)
+#define CONFIG_ACK_TIMING_MODE              2  // 1 = async pipeline, 2 = stop-and-wait (one packet in flight)
 #define CONFIG_RATE_SWITCH_MODE             1  // 0 = TIME_BASED, 1 = PACKET_BASED, 2 = STATIC (fixed rate, no switching)
 #define CONFIG_RATE_SWITCH_INTERVAL_SEC     10 // Used when TIME_BASED
 #define CONFIG_RATE_SWITCH_PACKET_COUNT     10000 // Used when PACKET_BASED
 #define CONFIG_ESP_NOW_PAYLOAD_LEN          128 // Bytes per ESP-NOW data frame (>= 4 to keep sequence ID) (16, 64, 128)
 // TX power in units of 0.25 dBm. Range [8, 84] => [2 dBm, 20 dBm].
 // Mapping: {set value range, actual value} = {{[8,19],8},{[20,27],20},{[28,33],28},{[34,43],34},{[44,51],44},{[52,55],52},{[56,59],56},{[60,65],60},{[66,71],66},{[72,79],72},{[80,84],80}}
-#define CONFIG_WIFI_TX_POWER                8
+#define CONFIG_WIFI_TX_POWER                80
 
 #if CONFIG_ESP_NOW_PAYLOAD_LEN < 4
 #error "CONFIG_ESP_NOW_PAYLOAD_LEN must be at least 4 bytes"
@@ -112,15 +115,25 @@ static uint32_t s_ack_success_count  = 0;
 static uint32_t s_ack_fail_count     = 0;
 static uint8_t s_tx_payload[CONFIG_ESP_NOW_PAYLOAD_LEN] = {0};
 
+#if CONFIG_ACK_TIMING_MODE == 2
+static TaskHandle_t s_sender_task_handle = NULL;
+#endif
+
 #define ACK_SEQ_QUEUE_SIZE 2048
-static uint32_t s_ack_seq_queue[ACK_SEQ_QUEUE_SIZE];
+typedef struct {
+    uint32_t seq;
+    int64_t send_ts_us;
+} ack_seq_item_t;
+
+static ack_seq_item_t s_ack_seq_queue[ACK_SEQ_QUEUE_SIZE];
 static volatile uint16_t s_ack_seq_head = 0;
 static volatile uint16_t s_ack_seq_tail = 0;
 
-static void ack_emit_status(uint32_t seq, int delivered)
+static void ack_emit_status(uint32_t seq, int delivered, int64_t ack_ts_us, int64_t send_ts_us)
 {
-    printf("ACK_STATUS,%lu,%d,%lld\n", (unsigned long)seq, delivered,
-           (long long)esp_timer_get_time());
+    int64_t service_us = (send_ts_us >= 0) ? (ack_ts_us - send_ts_us) : -1;
+    printf("ACK_STATUS,%lu,%d,%lld,%lld,%lld\n", (unsigned long)seq, delivered,
+           (long long)ack_ts_us, (long long)send_ts_us, (long long)service_us);
     fflush(stdout);
 
     if (delivered) {
@@ -159,23 +172,25 @@ static void ack_reset_counters_for_rate_change(size_t new_mcs_index)
 }
 #endif
 
-static void ack_seq_enqueue(uint32_t seq)
+static void ack_seq_enqueue(uint32_t seq, int64_t send_ts_us)
 {
     uint16_t next = (uint16_t)((s_ack_seq_head + 1) % ACK_SEQ_QUEUE_SIZE);
     if (next == s_ack_seq_tail) {
         /* Queue overflow: drop oldest to keep callback mapping moving forward. */
         s_ack_seq_tail = (uint16_t)((s_ack_seq_tail + 1) % ACK_SEQ_QUEUE_SIZE);
     }
-    s_ack_seq_queue[s_ack_seq_head] = seq;
+    s_ack_seq_queue[s_ack_seq_head].seq = seq;
+    s_ack_seq_queue[s_ack_seq_head].send_ts_us = send_ts_us;
     s_ack_seq_head = next;
 }
 
-static bool ack_seq_dequeue(uint32_t *seq)
+static bool ack_seq_dequeue(uint32_t *seq, int64_t *send_ts_us)
 {
     if (s_ack_seq_tail == s_ack_seq_head) {
         return false;
     }
-    *seq = s_ack_seq_queue[s_ack_seq_tail];
+    *seq = s_ack_seq_queue[s_ack_seq_tail].seq;
+    *send_ts_us = s_ack_seq_queue[s_ack_seq_tail].send_ts_us;
     s_ack_seq_tail = (uint16_t)((s_ack_seq_tail + 1) % ACK_SEQ_QUEUE_SIZE);
     return true;
 }
@@ -184,12 +199,19 @@ static void esp_now_send_cb(const wifi_tx_info_t *tx_info, esp_now_send_status_t
 {
     (void)tx_info;
     uint32_t seq = 0;
+    int64_t send_ts_us = -1;
     int delivered = (status == ESP_NOW_SEND_SUCCESS) ? 1 : 0;
-    if (!ack_seq_dequeue(&seq)) {
+    int64_t ack_ts_us = esp_timer_get_time();
+    if (!ack_seq_dequeue(&seq, &send_ts_us)) {
         ESP_LOGW(TAG, "ACK callback arrived with empty seq queue");
         return;
     }
-    ack_emit_status(seq, delivered);
+    ack_emit_status(seq, delivered, ack_ts_us, send_ts_us);
+#if CONFIG_ACK_TIMING_MODE == 2
+    if (s_sender_task_handle != NULL) {
+        xTaskNotifyGive(s_sender_task_handle);
+    }
+#endif
 }
 
 #if CONFIG_RATE_SWITCH_MODE != 2
@@ -346,6 +368,10 @@ void app_main()
     };
     wifi_esp_now_init(peer);
 
+#if CONFIG_ACK_TIMING_MODE == 2
+    s_sender_task_handle = xTaskGetCurrentTaskHandle();
+#endif
+
     ESP_LOGI(TAG, "================ CSI SEND ================");
     ESP_LOGI(TAG, "wifi_channel: %d, send_frequency: %d, payload_len: %d, sender_mac: " MACSTR ", receiver_mac: " MACSTR,
              CONFIG_LESS_INTERFERENCE_CHANNEL, CONFIG_SEND_FREQUENCY, CONFIG_ESP_NOW_PAYLOAD_LEN,
@@ -377,14 +403,21 @@ void app_main()
             } while (next_rate_switch_us <= now_us);
         }
 
+        int64_t send_ts_us = esp_timer_get_time();
         esp_err_t ret = esp_now_send_with_seq(peer.peer_addr, count);
         if (ret == ESP_OK) {
-            ack_seq_enqueue(count);
+            ack_seq_enqueue(count, send_ts_us);
         } else {
             /* Immediate enqueue/send failure: no callback expected, mark as lost now. */
-            ack_emit_status(count, 0);
+            ack_emit_status(count, 0, esp_timer_get_time(), send_ts_us);
             ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
         }
+
+#if CONFIG_ACK_TIMING_MODE == 2
+        if (ret == ESP_OK) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        }
+#endif
 
         tx_pacing_delay_us();
     }
@@ -394,13 +427,19 @@ void app_main()
              (unsigned int)(CONFIG_ESP_NOW_RATE - WIFI_PHY_RATE_MCS0_LGI));
 
     for (uint32_t count = 0; ; ++count) {
+        int64_t send_ts_us = esp_timer_get_time();
         esp_err_t ret = esp_now_send_with_seq(peer.peer_addr, count);
         if (ret == ESP_OK) {
-            ack_seq_enqueue(count);
+            ack_seq_enqueue(count, send_ts_us);
         } else {
-            ack_emit_status(count, 0);
+            ack_emit_status(count, 0, esp_timer_get_time(), send_ts_us);
             ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
         }
+#if CONFIG_ACK_TIMING_MODE == 2
+        if (ret == ESP_OK) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        }
+#endif
         tx_pacing_delay_us();
     }
 #else
@@ -421,14 +460,21 @@ void app_main()
         }
 
         packets_attempted_in_current_rate++;
+        int64_t send_ts_us = esp_timer_get_time();
         esp_err_t ret = esp_now_send_with_seq(peer.peer_addr, count);
         if (ret == ESP_OK) {
-            ack_seq_enqueue(count);
+            ack_seq_enqueue(count, send_ts_us);
         } else {
             /* Immediate enqueue/send failure: no callback expected, mark as lost now. */
-            ack_emit_status(count, 0);
+            ack_emit_status(count, 0, esp_timer_get_time(), send_ts_us);
             ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
         }
+
+#if CONFIG_ACK_TIMING_MODE == 2
+        if (ret == ESP_OK) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        }
+#endif
 
         tx_pacing_delay_us();
     }

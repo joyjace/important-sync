@@ -64,7 +64,6 @@ DATA_COLUMNS_NAMES_NEW = [
 
 OUTPUT_COLUMNS = [
     'host_time',
-    'esp_time_us',
     'format',
     'seq_or_id',
     'mac',
@@ -91,6 +90,8 @@ OUTPUT_COLUMNS = [
 ACK_DATA_COLUMNS = [
     'host_time',
     'esp_time_us',
+    'send_time_us',
+    'service_us',
     'segment_id',
     'mcs_index',
     'seq',
@@ -188,7 +189,7 @@ def host_timestamp_ms():
 
 def build_ack_status_rows(seq, delivered, ack_total, ack_delivered,
                           rolling_window, segment_id, mcs_index,
-                          esp_time_us=None):
+                          esp_time_us=None, send_time_us=None, service_us=None):
     rolling_sent = len(rolling_window)
     rolling_delivered = sum(rolling_window)
     rolling_pdr_percent = 100.0 * rolling_delivered / rolling_sent if rolling_sent > 0 else 0.0
@@ -199,6 +200,8 @@ def build_ack_status_rows(seq, delivered, ack_total, ack_delivered,
     ack_row = {
         'host_time': host_time,
         'esp_time_us': esp_time_us if esp_time_us is not None else '',
+        'send_time_us': send_time_us if send_time_us is not None else '',
+        'service_us': service_us if service_us is not None else '',
         'segment_id': segment_id,
         'mcs_index': mcs_value,
         'seq': seq,
@@ -229,7 +232,12 @@ def build_ack_status_rows(seq, delivered, ack_total, ack_delivered,
     return ack_row, ack_pdr_row, running_pdr_percent
 
 
-ACK_STATUS_PATTERN = re.compile(r'^ACK_STATUS\s*,\s*(\d+)\s*,\s*([01])(?:\s*,\s*(\d+))?\s*$')
+ACK_STATUS_PATTERN = re.compile(
+    r'^ACK_STATUS\s*,\s*(\d+)\s*,\s*([01])'
+    r'(?:\s*,\s*(\d+))?'
+    r'(?:\s*,\s*(\d+))?'
+    r'(?:\s*,\s*(-?\d+))?\s*$'
+)
 ACK_PDR_PATTERN = re.compile(r'^ACK_PDR\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9]+(?:\.[0-9]+)?)(?:\s*,\s*(\d+))?\s*$')
 ACK_PDR_FINAL_PATTERN = re.compile(r'^ACK_PDR_FINAL\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9]+(?:\.[0-9]+)?)(?:\s*,\s*(\d+))?\s*$')
 ACK_RESET_PATTERN = re.compile(r'ACK_RESET_FOR_MCS(\d+)')
@@ -245,6 +253,8 @@ def parse_ack_line(line):
         seq = safe_int(status_match.group(1))
         delivered = safe_int(status_match.group(2))
         esp_time_us = safe_int(status_match.group(3))
+        send_time_us = safe_int(status_match.group(4))
+        service_us = safe_int(status_match.group(5))
         if seq is None or delivered not in (0, 1):
             return None, 'invalid_ack_status_fields'
         return {
@@ -252,6 +262,8 @@ def parse_ack_line(line):
             'seq': seq,
             'delivered': delivered,
             'esp_time_us': esp_time_us,
+            'send_time_us': send_time_us,
+            'service_us': service_us,
         }, None
 
     pdr_match = ACK_PDR_PATTERN.search(line)
@@ -416,11 +428,8 @@ def compute_stats(raw_data, sample_count):
 
 
 def make_output_row(frame, stats):
-    # Prefer the ESP-side timestamp for packet timing accuracy.
-    esp_time_us = frame['local_timestamp'] if frame['local_timestamp'] is not None else ''
     return {
         'host_time': host_timestamp_ms(),
-        'esp_time_us': esp_time_us,
         'format': frame['format'],
         'seq_or_id': frame['seq_or_id'],
         'mac': frame['mac'],
@@ -567,6 +576,8 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                     segment_id=segment_id,
                     mcs_index=current_mcs_index,
                     esp_time_us=record.get('esp_time_us'),
+                    send_time_us=record.get('send_time_us'),
+                    service_us=record.get('service_us'),
                 )
 
                 ack_writer.writerow(ack_row)
@@ -753,6 +764,8 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                             segment_id=segment_id,
                             mcs_index=current_mcs_index,
                             esp_time_us=ack_record.get('esp_time_us'),
+                            send_time_us=ack_record.get('send_time_us'),
+                            service_us=ack_record.get('service_us'),
                         )
 
                         if ack_writer is not None:

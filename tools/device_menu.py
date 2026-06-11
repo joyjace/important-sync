@@ -27,6 +27,7 @@ DEFAULT_PROFILE = {
         "channel": 11,
         "esp_now_rate": "WIFI_PHY_RATE_MCS0_LGI",
         "send_frequency": 100,
+        "packet_pacing_enabled": 1,
         "rate_switch_mode": 2,
         "rate_switch_interval_sec": 10,
         "rate_switch_packet_count": 1000,
@@ -119,6 +120,7 @@ def apply_profile_to_sources(profile: dict) -> None:
     sender_text = replace_define(sender_text, "CONFIG_LESS_INTERFERENCE_CHANNEL", str(sender["channel"]))
     sender_text = replace_define(sender_text, "CONFIG_ESP_NOW_RATE", sender["esp_now_rate"])
     sender_text = replace_define(sender_text, "CONFIG_SEND_FREQUENCY", str(sender["send_frequency"]))
+    sender_text = replace_define(sender_text, "CONFIG_PACKET_PACING_ENABLED", str(sender["packet_pacing_enabled"]))
     sender_text = replace_define(sender_text, "CONFIG_RATE_SWITCH_MODE", str(sender["rate_switch_mode"]))
     sender_text = replace_define(sender_text, "CONFIG_RATE_SWITCH_INTERVAL_SEC", str(sender["rate_switch_interval_sec"]))
     sender_text = replace_define(sender_text, "CONFIG_RATE_SWITCH_PACKET_COUNT", str(sender["rate_switch_packet_count"]))
@@ -234,6 +236,7 @@ def edit_sender_full(profile: dict) -> None:
     sender["channel"] = ask_int("Channel", sender["channel"], 1, 14)
     sender["esp_now_rate"] = ask_choice("ESP-NOW PHY rate", RATE_CHOICES, sender["esp_now_rate"])
     sender["send_frequency"] = ask_int("Send frequency (packets/sec)", sender["send_frequency"], 1, 5000)
+    sender["packet_pacing_enabled"] = 1 if ask_yes_no("Enable packet pacing", sender["packet_pacing_enabled"] == 1) else 0
     sender["rate_switch_mode"] = ask_int("Rate switch mode (0=time, 1=packet, 2=static)", sender["rate_switch_mode"], 0, 2)
     sender["rate_switch_interval_sec"] = ask_int("Rate switch interval seconds", sender["rate_switch_interval_sec"], 1, 3600)
     sender["rate_switch_packet_count"] = ask_int("Rate switch packet count", sender["rate_switch_packet_count"], 1, 1000000)
@@ -248,12 +251,13 @@ def edit_sender(profile: dict) -> None:
         print(f"1. channel: {sender['channel']}")
         print(f"2. esp_now_rate: {sender['esp_now_rate']}")
         print(f"3. send_frequency: {sender['send_frequency']}")
-        print(f"4. rate_switch_mode: {sender['rate_switch_mode']}")
-        print(f"5. rate_switch_interval_sec: {sender['rate_switch_interval_sec']}")
-        print(f"6. rate_switch_packet_count: {sender['rate_switch_packet_count']}")
-        print(f"7. payload_len: {sender['payload_len']}")
-        print(f"8. tx_power: {sender['tx_power']} (0.25 dBm units, {sender['tx_power'] * 0.25:.1f} dBm nominal)")
-        print("9. Edit all sender fields")
+        print(f"4. packet_pacing_enabled: {sender['packet_pacing_enabled']}")
+        print(f"5. rate_switch_mode: {sender['rate_switch_mode']}")
+        print(f"6. rate_switch_interval_sec: {sender['rate_switch_interval_sec']}")
+        print(f"7. rate_switch_packet_count: {sender['rate_switch_packet_count']}")
+        print(f"8. payload_len: {sender['payload_len']}")
+        print(f"9. tx_power: {sender['tx_power']} (0.25 dBm units, {sender['tx_power'] * 0.25:.1f} dBm nominal)")
+        print("10. Edit all sender fields")
         print("0. Back")
         choice = input("Select sender field: ").strip()
 
@@ -267,21 +271,24 @@ def edit_sender(profile: dict) -> None:
             sender["send_frequency"] = ask_int("Send frequency (packets/sec)", sender["send_frequency"], 1, 5000)
             save_profile(profile)
         elif choice == "4":
-            sender["rate_switch_mode"] = ask_int("Rate switch mode (0=time, 1=packet, 2=static)", sender["rate_switch_mode"], 0, 2)
+            sender["packet_pacing_enabled"] = 1 if ask_yes_no("Enable packet pacing", sender["packet_pacing_enabled"] == 1) else 0
             save_profile(profile)
         elif choice == "5":
-            sender["rate_switch_interval_sec"] = ask_int("Rate switch interval seconds", sender["rate_switch_interval_sec"], 1, 3600)
+            sender["rate_switch_mode"] = ask_int("Rate switch mode (0=time, 1=packet, 2=static)", sender["rate_switch_mode"], 0, 2)
             save_profile(profile)
         elif choice == "6":
-            sender["rate_switch_packet_count"] = ask_int("Rate switch packet count", sender["rate_switch_packet_count"], 1, 1000000)
+            sender["rate_switch_interval_sec"] = ask_int("Rate switch interval seconds", sender["rate_switch_interval_sec"], 1, 3600)
             save_profile(profile)
         elif choice == "7":
-            sender["payload_len"] = ask_int("ESP-NOW payload length", sender["payload_len"], 4, 250)
+            sender["rate_switch_packet_count"] = ask_int("Rate switch packet count", sender["rate_switch_packet_count"], 1, 1000000)
             save_profile(profile)
         elif choice == "8":
-            sender["tx_power"] = ask_int("TX power (0.25 dBm units, range 8-84)", sender["tx_power"], 8, 84)
+            sender["payload_len"] = ask_int("ESP-NOW payload length", sender["payload_len"], 4, 250)
             save_profile(profile)
         elif choice == "9":
+            sender["tx_power"] = ask_int("TX power (0.25 dBm units, range 8-84)", sender["tx_power"], 8, 84)
+            save_profile(profile)
+        elif choice == "10":
             edit_sender_full(profile)
             save_profile(profile)
         elif choice == "0":

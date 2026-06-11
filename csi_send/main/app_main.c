@@ -27,6 +27,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 /* ESP-IDF 6.0+ renamed WIFI_BW_HT20/HT40 to WIFI_BW20/BW40. */
 #ifndef WIFI_BW_HT20
@@ -114,101 +115,327 @@ static inline void tx_pacing_delay_us(void)
 static uint32_t s_ack_success_count  = 0;
 static uint32_t s_ack_fail_count     = 0;
 static uint8_t s_tx_payload[CONFIG_ESP_NOW_PAYLOAD_LEN] = {0};
+static wifi_phy_rate_t s_current_configured_rate = CONFIG_ESP_NOW_RATE;
 
 #if CONFIG_ACK_TIMING_MODE == 2
 static TaskHandle_t s_sender_task_handle = NULL;
 #endif
 
-#define ACK_SEQ_QUEUE_SIZE 2048
+/*
+ * Keep all printf()/fflush() work out of the ESP-NOW send callback. The
+ * callback only captures timing/metadata, enqueues a compact record, wakes the
+ * sender in stop-and-wait mode, and returns.
+ */
+#define ACK_LOG_QUEUE_SIZE          256
+#define ACK_LOG_TASK_STACK_SIZE     4096
+#define ACK_LOG_TASK_PRIORITY       (tskIDLE_PRIORITY + 1)
+
+#define ACK_SEQ_QUEUE_SIZE          2048
+
 typedef struct {
     uint32_t seq;
     int64_t send_ts_us;
+    wifi_phy_rate_t configured_rate;
 } ack_seq_item_t;
 
+typedef enum {
+    ACK_LOG_EVENT_STATUS = 0,
+    ACK_LOG_EVENT_PDR_FINAL,
+    ACK_LOG_EVENT_RESET,
+    ACK_LOG_EVENT_CALLBACK_ERROR,
+    ACK_LOG_EVENT_TRACKING_ERROR,
+} ack_log_event_type_t;
+
+typedef struct {
+    ack_log_event_type_t type;
+    uint32_t seq;
+    uint32_t total;
+    uint32_t success_count;
+    uint32_t new_mcs_index;
+    int delivered;
+    int64_t event_ts_us;
+    int64_t send_ts_us;
+    int64_t service_us;
+    int configured_rate;
+    int actual_rate;
+    int tx_status;
+    int data_len;
+} ack_log_event_t;
+
 static ack_seq_item_t s_ack_seq_queue[ACK_SEQ_QUEUE_SIZE];
-static volatile uint16_t s_ack_seq_head = 0;
-static volatile uint16_t s_ack_seq_tail = 0;
+static uint16_t s_ack_seq_head = 0;
+static uint16_t s_ack_seq_tail = 0;
+static portMUX_TYPE s_ack_seq_mux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE s_ack_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 
-static void ack_emit_status(uint32_t seq, int delivered, const char *termination_event,
-                int64_t ack_ts_us, int64_t send_ts_us)
+static QueueHandle_t s_ack_log_queue = NULL;
+static volatile uint32_t s_ack_log_drop_count = 0;
+
+static bool ack_log_enqueue(const ack_log_event_t *event, TickType_t wait_ticks)
 {
-    int64_t service_us = (send_ts_us >= 0) ? (ack_ts_us - send_ts_us) : -1;
-    printf("ACK_STATUS,%lu,%d,%s,%lld,%lld,%lld\n", (unsigned long)seq, delivered,
-        termination_event, (long long)ack_ts_us, (long long)send_ts_us, (long long)service_us);
-    fflush(stdout);
+    if (s_ack_log_queue == NULL || xQueueSend(s_ack_log_queue, event, wait_ticks) != pdTRUE) {
+        __atomic_fetch_add(&s_ack_log_drop_count, 1U, __ATOMIC_RELAXED);
+        return false;
+    }
+    return true;
+}
 
+static void ack_logging_task(void *arg)
+{
+    (void)arg;
+    ack_log_event_t event;
+
+    for (;;) {
+        if (xQueueReceive(s_ack_log_queue, &event, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        switch (event.type) {
+        case ACK_LOG_EVENT_STATUS:
+            /*
+             * The first seven fields are unchanged from the original format.
+             * The final four fields expose the configured rate and the scalar
+             * tx_info metadata copied inside the callback.
+             */
+            printf("ACK_STATUS,%lu,%d,%s,%lld,%lld,%lld,%d,%d,%d,%d\n",
+                   (unsigned long)event.seq,
+                   event.delivered,
+                   event.delivered ? "final_ack" : "packet_drop",
+                   (long long)event.event_ts_us,
+                   (long long)event.send_ts_us,
+                   (long long)event.service_us,
+                   event.configured_rate,
+                   event.actual_rate,
+                   event.tx_status,
+                   event.data_len);
+
+            if (event.total > 0 && event.total % 100 == 0) {
+                printf("ACK_PDR,%lu,%lu,%.1f,%lld\n",
+                       (unsigned long)event.total,
+                       (unsigned long)event.success_count,
+                       100.0f * event.success_count / event.total,
+                       (long long)event.event_ts_us);
+            }
+            fflush(stdout);
+            break;
+
+        case ACK_LOG_EVENT_PDR_FINAL:
+            if (event.total > 0) {
+                printf("ACK_PDR_FINAL,%lu,%lu,%.1f,%lld\n",
+                       (unsigned long)event.total,
+                       (unsigned long)event.success_count,
+                       100.0f * event.success_count / event.total,
+                       (long long)event.event_ts_us);
+                fflush(stdout);
+            }
+            break;
+
+        case ACK_LOG_EVENT_RESET:
+            printf("ACK_RESET_FOR_MCS%u\n", (unsigned int)event.new_mcs_index);
+            fflush(stdout);
+            break;
+
+        case ACK_LOG_EVENT_CALLBACK_ERROR:
+            printf("ACK_CALLBACK_ERROR,empty_seq_queue,%d,%lld,%d,%d,%d\n",
+                   event.delivered,
+                   (long long)event.event_ts_us,
+                   event.actual_rate,
+                   event.tx_status,
+                   event.data_len);
+            fflush(stdout);
+            break;
+
+        case ACK_LOG_EVENT_TRACKING_ERROR:
+            printf("ACK_TRACKING_ERROR,%lu,%lld\n",
+                   (unsigned long)event.seq,
+                   (long long)event.event_ts_us);
+            fflush(stdout);
+            break;
+
+        default:
+            break;
+        }
+
+        uint32_t dropped = __atomic_exchange_n(&s_ack_log_drop_count, 0U, __ATOMIC_RELAXED);
+        if (dropped > 0) {
+            printf("ACK_LOG_DROPPED,%lu,%lld\n",
+                   (unsigned long)dropped,
+                   (long long)esp_timer_get_time());
+            fflush(stdout);
+        }
+    }
+}
+
+static void ack_logging_init(void)
+{
+    s_ack_log_queue = xQueueCreate(ACK_LOG_QUEUE_SIZE, sizeof(ack_log_event_t));
+    if (s_ack_log_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create ACK logging queue");
+        abort();
+    }
+
+    BaseType_t task_created = xTaskCreate(ack_logging_task,
+                                          "ack_logger",
+                                          ACK_LOG_TASK_STACK_SIZE,
+                                          NULL,
+                                          ACK_LOG_TASK_PRIORITY,
+                                          NULL);
+    if (task_created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create ACK logging task");
+        vQueueDelete(s_ack_log_queue);
+        s_ack_log_queue = NULL;
+        abort();
+    }
+}
+
+static void ack_record_status(uint32_t seq,
+                              int delivered,
+                              int64_t ack_ts_us,
+                              int64_t send_ts_us,
+                              wifi_phy_rate_t configured_rate,
+                              const wifi_tx_info_t *tx_info)
+{
+    uint32_t total;
+    uint32_t success_count;
+
+    portENTER_CRITICAL(&s_ack_stats_mux);
     if (delivered) {
         s_ack_success_count++;
     } else {
         s_ack_fail_count++;
     }
+    total = s_ack_success_count + s_ack_fail_count;
+    success_count = s_ack_success_count;
+    portEXIT_CRITICAL(&s_ack_stats_mux);
 
-    uint32_t total = s_ack_success_count + s_ack_fail_count;
-    if (total > 0 && total % 100 == 0) {
-        printf("ACK_PDR,%lu,%lu,%.1f,%lld\n", (unsigned long)total,
-               (unsigned long)s_ack_success_count,
-               100.0f * s_ack_success_count / total,
-               (long long)esp_timer_get_time());
-        fflush(stdout);
-    }
+    ack_log_event_t event = {
+        .type = ACK_LOG_EVENT_STATUS,
+        .seq = seq,
+        .total = total,
+        .success_count = success_count,
+        .delivered = delivered,
+        .event_ts_us = ack_ts_us,
+        .send_ts_us = send_ts_us,
+        .service_us = (send_ts_us >= 0) ? (ack_ts_us - send_ts_us) : -1,
+        .configured_rate = (int)configured_rate,
+        .actual_rate = tx_info != NULL ? (int)tx_info->rate : -1,
+        .tx_status = tx_info != NULL ? (int)tx_info->tx_status : -1,
+        .data_len = tx_info != NULL ? (int)tx_info->data_len : -1,
+    };
+
+    /* Never block the high-priority Wi-Fi callback on console output. */
+    (void)ack_log_enqueue(&event, 0);
 }
 
 #if CONFIG_RATE_SWITCH_MODE != 2
-/* Reset ACK counters and print final PDR before MCS/rate switch */
+/* Reset ACK counters and queue final PDR output before MCS/rate switch. */
 static void ack_reset_counters_for_rate_change(size_t new_mcs_index)
 {
-    uint32_t total = s_ack_success_count + s_ack_fail_count;
-    if (total > 0) {
-        float pdr = 100.0f * s_ack_success_count / total;
-        printf("ACK_PDR_FINAL,%lu,%lu,%.1f,%lld\n", (unsigned long)total,
-               (unsigned long)s_ack_success_count, pdr,
-               (long long)esp_timer_get_time());
-        fflush(stdout);
-    }
-    /* Reset counters for next MCS/rate */
+    uint32_t total;
+    uint32_t success_count;
+
+    portENTER_CRITICAL(&s_ack_stats_mux);
+    total = s_ack_success_count + s_ack_fail_count;
+    success_count = s_ack_success_count;
     s_ack_success_count = 0;
     s_ack_fail_count = 0;
-    printf("ACK_RESET_FOR_MCS%u\n", (unsigned int)new_mcs_index);
-    fflush(stdout);
+    portEXIT_CRITICAL(&s_ack_stats_mux);
+
+    if (total > 0) {
+        ack_log_event_t final_event = {
+            .type = ACK_LOG_EVENT_PDR_FINAL,
+            .total = total,
+            .success_count = success_count,
+            .event_ts_us = esp_timer_get_time(),
+        };
+        (void)ack_log_enqueue(&final_event, pdMS_TO_TICKS(100));
+    }
+
+    ack_log_event_t reset_event = {
+        .type = ACK_LOG_EVENT_RESET,
+        .new_mcs_index = (uint32_t)new_mcs_index,
+        .event_ts_us = esp_timer_get_time(),
+    };
+    (void)ack_log_enqueue(&reset_event, pdMS_TO_TICKS(100));
 }
 #endif
 
-static void ack_seq_enqueue(uint32_t seq, int64_t send_ts_us)
+static bool ack_seq_enqueue(uint32_t seq, int64_t send_ts_us, wifi_phy_rate_t configured_rate)
 {
+    bool queued = false;
+
+    portENTER_CRITICAL(&s_ack_seq_mux);
     uint16_t next = (uint16_t)((s_ack_seq_head + 1) % ACK_SEQ_QUEUE_SIZE);
-    if (next == s_ack_seq_tail) {
-        /* Queue overflow: drop oldest to keep callback mapping moving forward. */
-        s_ack_seq_tail = (uint16_t)((s_ack_seq_tail + 1) % ACK_SEQ_QUEUE_SIZE);
+    if (next != s_ack_seq_tail) {
+        s_ack_seq_queue[s_ack_seq_head].seq = seq;
+        s_ack_seq_queue[s_ack_seq_head].send_ts_us = send_ts_us;
+        s_ack_seq_queue[s_ack_seq_head].configured_rate = configured_rate;
+        s_ack_seq_head = next;
+        queued = true;
     }
-    s_ack_seq_queue[s_ack_seq_head].seq = seq;
-    s_ack_seq_queue[s_ack_seq_head].send_ts_us = send_ts_us;
-    s_ack_seq_head = next;
+    portEXIT_CRITICAL(&s_ack_seq_mux);
+
+    return queued;
 }
 
-static bool ack_seq_dequeue(uint32_t *seq, int64_t *send_ts_us)
+static bool ack_seq_cancel_last(uint32_t seq)
 {
-    if (s_ack_seq_tail == s_ack_seq_head) {
-        return false;
+    bool cancelled = false;
+
+    portENTER_CRITICAL(&s_ack_seq_mux);
+    if (s_ack_seq_head != s_ack_seq_tail) {
+        uint16_t previous_head = (uint16_t)((s_ack_seq_head + ACK_SEQ_QUEUE_SIZE - 1) % ACK_SEQ_QUEUE_SIZE);
+        if (s_ack_seq_queue[previous_head].seq == seq) {
+            s_ack_seq_head = previous_head;
+            cancelled = true;
+        }
     }
-    *seq = s_ack_seq_queue[s_ack_seq_tail].seq;
-    *send_ts_us = s_ack_seq_queue[s_ack_seq_tail].send_ts_us;
-    s_ack_seq_tail = (uint16_t)((s_ack_seq_tail + 1) % ACK_SEQ_QUEUE_SIZE);
-    return true;
+    portEXIT_CRITICAL(&s_ack_seq_mux);
+
+    return cancelled;
+}
+
+static bool ack_seq_dequeue(uint32_t *seq, int64_t *send_ts_us, wifi_phy_rate_t *configured_rate)
+{
+    bool dequeued = false;
+
+    portENTER_CRITICAL(&s_ack_seq_mux);
+    if (s_ack_seq_tail != s_ack_seq_head) {
+        *seq = s_ack_seq_queue[s_ack_seq_tail].seq;
+        *send_ts_us = s_ack_seq_queue[s_ack_seq_tail].send_ts_us;
+        *configured_rate = s_ack_seq_queue[s_ack_seq_tail].configured_rate;
+        s_ack_seq_tail = (uint16_t)((s_ack_seq_tail + 1) % ACK_SEQ_QUEUE_SIZE);
+        dequeued = true;
+    }
+    portEXIT_CRITICAL(&s_ack_seq_mux);
+
+    return dequeued;
 }
 
 static void esp_now_send_cb(const wifi_tx_info_t *tx_info, esp_now_send_status_t status)
 {
-    (void)tx_info;
+    const int64_t ack_ts_us = esp_timer_get_time();
+    const int delivered = (status == ESP_NOW_SEND_SUCCESS) ? 1 : 0;
     uint32_t seq = 0;
     int64_t send_ts_us = -1;
-    int delivered = (status == ESP_NOW_SEND_SUCCESS) ? 1 : 0;
-    int64_t ack_ts_us = esp_timer_get_time();
-    if (!ack_seq_dequeue(&seq, &send_ts_us)) {
-        ESP_LOGW(TAG, "ACK callback arrived with empty seq queue");
-        return;
+    wifi_phy_rate_t configured_rate = s_current_configured_rate;
+
+    if (ack_seq_dequeue(&seq, &send_ts_us, &configured_rate)) {
+        ack_record_status(seq, delivered, ack_ts_us, send_ts_us, configured_rate, tx_info);
+    } else {
+        ack_log_event_t event = {
+            .type = ACK_LOG_EVENT_CALLBACK_ERROR,
+            .delivered = delivered,
+            .event_ts_us = ack_ts_us,
+            .actual_rate = tx_info != NULL ? (int)tx_info->rate : -1,
+            .tx_status = tx_info != NULL ? (int)tx_info->tx_status : -1,
+            .data_len = tx_info != NULL ? (int)tx_info->data_len : -1,
+        };
+        (void)ack_log_enqueue(&event, 0);
     }
-    ack_emit_status(seq, delivered, delivered ? "final_ack" : "packet_drop", ack_ts_us, send_ts_us);
+
 #if CONFIG_ACK_TIMING_MODE == 2
+    /* Wake the sender immediately; logging happens independently. */
     if (s_sender_task_handle != NULL) {
         xTaskNotifyGive(s_sender_task_handle);
     }
@@ -237,12 +464,44 @@ static void esp_now_set_peer_rate(const uint8_t *peer_addr, wifi_phy_rate_t rate
         .dcm = false
     };
     ESP_ERROR_CHECK(esp_now_set_peer_rate_config(peer_addr, &rate_config));
+    s_current_configured_rate = rate;
 }
 
 static esp_err_t esp_now_send_with_seq(const uint8_t *peer_addr, uint32_t seq)
 {
     memcpy(s_tx_payload, &seq, sizeof(seq));
     return esp_now_send(peer_addr, s_tx_payload, sizeof(s_tx_payload));
+}
+
+static esp_err_t esp_now_send_tracked(const uint8_t *peer_addr, uint32_t seq)
+{
+    const int64_t send_ts_us = esp_timer_get_time();
+    const wifi_phy_rate_t configured_rate = s_current_configured_rate;
+
+    /*
+     * Register the packet before submitting it, so an unusually fast callback
+     * cannot arrive before the sequence/timestamp mapping exists.
+     */
+    if (!ack_seq_enqueue(seq, send_ts_us, configured_rate)) {
+        ack_record_status(seq, 0, esp_timer_get_time(), send_ts_us, configured_rate, NULL);
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t ret = esp_now_send_with_seq(peer_addr, seq);
+    if (ret != ESP_OK) {
+        /* No send callback is expected for an immediate API failure. */
+        if (!ack_seq_cancel_last(seq)) {
+            ack_log_event_t event = {
+                .type = ACK_LOG_EVENT_TRACKING_ERROR,
+                .seq = seq,
+                .event_ts_us = esp_timer_get_time(),
+            };
+            (void)ack_log_enqueue(&event, pdMS_TO_TICKS(10));
+        }
+        ack_record_status(seq, 0, esp_timer_get_time(), send_ts_us, configured_rate, NULL);
+    }
+
+    return ret;
 }
 
 static void wifi_init()
@@ -367,6 +626,7 @@ void app_main()
         .encrypt   = false,
         .peer_addr = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x01},
     };
+    ack_logging_init();
     wifi_esp_now_init(peer);
 
 #if CONFIG_ACK_TIMING_MODE == 2
@@ -377,6 +637,8 @@ void app_main()
     ESP_LOGI(TAG, "wifi_channel: %d, send_frequency: %d, payload_len: %d, sender_mac: " MACSTR ", receiver_mac: " MACSTR,
              CONFIG_LESS_INTERFERENCE_CHANNEL, CONFIG_SEND_FREQUENCY, CONFIG_ESP_NOW_PAYLOAD_LEN,
              MAC2STR(CONFIG_CSI_SEND_MAC), MAC2STR(CONFIG_CSI_RECV_MAC));
+    printf("ACK_STATUS_HEADER,seq,delivered,termination_event,ack_ts_us,send_ts_us,service_us,configured_rate,actual_rate,tx_status,data_len\n");
+    fflush(stdout);
 
 #if CONFIG_RATE_SWITCH_MODE != 2
     size_t rate_index = 0;
@@ -404,13 +666,8 @@ void app_main()
             } while (next_rate_switch_us <= now_us);
         }
 
-        int64_t send_ts_us = esp_timer_get_time();
-        esp_err_t ret = esp_now_send_with_seq(peer.peer_addr, count);
-        if (ret == ESP_OK) {
-            ack_seq_enqueue(count, send_ts_us);
-        } else {
-            /* Immediate enqueue/send failure: no callback expected, mark as lost now. */
-            ack_emit_status(count, 0, "packet_drop", esp_timer_get_time(), send_ts_us);
+        esp_err_t ret = esp_now_send_tracked(peer.peer_addr, count);
+        if (ret != ESP_OK) {
             ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
         }
 
@@ -428,12 +685,8 @@ void app_main()
              (unsigned int)(CONFIG_ESP_NOW_RATE - WIFI_PHY_RATE_MCS0_LGI));
 
     for (uint32_t count = 0; ; ++count) {
-        int64_t send_ts_us = esp_timer_get_time();
-        esp_err_t ret = esp_now_send_with_seq(peer.peer_addr, count);
-        if (ret == ESP_OK) {
-            ack_seq_enqueue(count, send_ts_us);
-        } else {
-            ack_emit_status(count, 0, "packet_drop", esp_timer_get_time(), send_ts_us);
+        esp_err_t ret = esp_now_send_tracked(peer.peer_addr, count);
+        if (ret != ESP_OK) {
             ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
         }
 #if CONFIG_ACK_TIMING_MODE == 2
@@ -461,13 +714,8 @@ void app_main()
         }
 
         packets_attempted_in_current_rate++;
-        int64_t send_ts_us = esp_timer_get_time();
-        esp_err_t ret = esp_now_send_with_seq(peer.peer_addr, count);
-        if (ret == ESP_OK) {
-            ack_seq_enqueue(count, send_ts_us);
-        } else {
-            /* Immediate enqueue/send failure: no callback expected, mark as lost now. */
-            ack_emit_status(count, 0, "packet_drop", esp_timer_get_time(), send_ts_us);
+        esp_err_t ret = esp_now_send_tracked(peer.peer_addr, count);
+        if (ret != ESP_OK) {
             ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
         }
 

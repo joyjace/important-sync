@@ -93,6 +93,7 @@ ACK_DATA_COLUMNS = [
     'esp_time_us',
     'send_time_us',
     'service_us',
+    'termination_event',
     'segment_id',
     'mcs_index',
     'seq',
@@ -201,7 +202,8 @@ def format_local_timestamp_us(local_timestamp_us):
 
 def build_ack_status_rows(seq, delivered, ack_total, ack_delivered,
                           rolling_window, segment_id, mcs_index,
-                          esp_time_us=None, send_time_us=None, service_us=None):
+                          esp_time_us=None, send_time_us=None, service_us=None,
+                          termination_event=None):
     rolling_sent = len(rolling_window)
     rolling_delivered = sum(rolling_window)
     rolling_pdr_percent = 100.0 * rolling_delivered / rolling_sent if rolling_sent > 0 else 0.0
@@ -214,6 +216,7 @@ def build_ack_status_rows(seq, delivered, ack_total, ack_delivered,
         'esp_time_us': esp_time_us if esp_time_us is not None else '',
         'send_time_us': send_time_us if send_time_us is not None else '',
         'service_us': service_us if service_us is not None else '',
+        'termination_event': termination_event if termination_event is not None else '',
         'segment_id': segment_id,
         'mcs_index': mcs_value,
         'seq': seq,
@@ -260,15 +263,38 @@ def parse_ack_line(line):
     Parse one sender serial line for ACK metrics.
     Returns: (ack_record_dict, error_string)
     """
-    status_match = ACK_STATUS_PATTERN.search(line)
-    if status_match:
-        seq = safe_int(status_match.group(1))
-        delivered = safe_int(status_match.group(2))
-        esp_time_us = safe_int(status_match.group(3))
-        send_time_us = safe_int(status_match.group(4))
-        service_us = safe_int(status_match.group(5))
+    if line.startswith('ACK_STATUS'):
+        fields = [f.strip() for f in line.split(',')]
+        if len(fields) < 3:
+            return None, 'invalid_ack_status_fields'
+
+        seq = safe_int(fields[1])
+        delivered = safe_int(fields[2])
+        termination_event = None
+        esp_time_us = None
+        send_time_us = None
+        service_us = None
+
+        idx = 3
+        if len(fields) > idx:
+            # New format inserts termination_event before timing fields.
+            if fields[idx] and not re.fullmatch(r'-?\d+', fields[idx]):
+                termination_event = fields[idx]
+                idx += 1
+
+        if len(fields) > idx:
+            esp_time_us = safe_int(fields[idx])
+        if len(fields) > idx + 1:
+            send_time_us = safe_int(fields[idx + 1])
+        if len(fields) > idx + 2:
+            service_us = safe_int(fields[idx + 2])
+
         if seq is None or delivered not in (0, 1):
             return None, 'invalid_ack_status_fields'
+
+        if not termination_event:
+            termination_event = 'final_ack' if delivered == 1 else 'packet_drop'
+
         return {
             'type': 'ACK_STATUS',
             'seq': seq,
@@ -276,6 +302,7 @@ def parse_ack_line(line):
             'esp_time_us': esp_time_us,
             'send_time_us': send_time_us,
             'service_us': service_us,
+            'termination_event': termination_event,
         }, None
 
     pdr_match = ACK_PDR_PATTERN.search(line)
@@ -592,6 +619,7 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                     esp_time_us=record.get('esp_time_us'),
                     send_time_us=record.get('send_time_us'),
                     service_us=record.get('service_us'),
+                    termination_event=record.get('termination_event'),
                 )
 
                 ack_writer.writerow(ack_row)
@@ -780,6 +808,7 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                             esp_time_us=ack_record.get('esp_time_us'),
                             send_time_us=ack_record.get('send_time_us'),
                             service_us=ack_record.get('service_us'),
+                            termination_event=ack_record.get('termination_event'),
                         )
 
                         if ack_writer is not None:

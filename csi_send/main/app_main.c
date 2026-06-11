@@ -129,11 +129,12 @@ static ack_seq_item_t s_ack_seq_queue[ACK_SEQ_QUEUE_SIZE];
 static volatile uint16_t s_ack_seq_head = 0;
 static volatile uint16_t s_ack_seq_tail = 0;
 
-static void ack_emit_status(uint32_t seq, int delivered, int64_t ack_ts_us, int64_t send_ts_us)
+static void ack_emit_status(uint32_t seq, int delivered, const char *termination_event,
+                int64_t ack_ts_us, int64_t send_ts_us)
 {
     int64_t service_us = (send_ts_us >= 0) ? (ack_ts_us - send_ts_us) : -1;
-    printf("ACK_STATUS,%lu,%d,%lld,%lld,%lld\n", (unsigned long)seq, delivered,
-           (long long)ack_ts_us, (long long)send_ts_us, (long long)service_us);
+    printf("ACK_STATUS,%lu,%d,%s,%lld,%lld,%lld\n", (unsigned long)seq, delivered,
+        termination_event, (long long)ack_ts_us, (long long)send_ts_us, (long long)service_us);
     fflush(stdout);
 
     if (delivered) {
@@ -206,7 +207,7 @@ static void esp_now_send_cb(const wifi_tx_info_t *tx_info, esp_now_send_status_t
         ESP_LOGW(TAG, "ACK callback arrived with empty seq queue");
         return;
     }
-    ack_emit_status(seq, delivered, ack_ts_us, send_ts_us);
+    ack_emit_status(seq, delivered, delivered ? "final_ack" : "packet_drop", ack_ts_us, send_ts_us);
 #if CONFIG_ACK_TIMING_MODE == 2
     if (s_sender_task_handle != NULL) {
         xTaskNotifyGive(s_sender_task_handle);
@@ -409,7 +410,7 @@ void app_main()
             ack_seq_enqueue(count, send_ts_us);
         } else {
             /* Immediate enqueue/send failure: no callback expected, mark as lost now. */
-            ack_emit_status(count, 0, esp_timer_get_time(), send_ts_us);
+            ack_emit_status(count, 0, "packet_drop", esp_timer_get_time(), send_ts_us);
             ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
         }
 
@@ -432,7 +433,7 @@ void app_main()
         if (ret == ESP_OK) {
             ack_seq_enqueue(count, send_ts_us);
         } else {
-            ack_emit_status(count, 0, esp_timer_get_time(), send_ts_us);
+            ack_emit_status(count, 0, "packet_drop", esp_timer_get_time(), send_ts_us);
             ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
         }
 #if CONFIG_ACK_TIMING_MODE == 2
@@ -466,7 +467,7 @@ void app_main()
             ack_seq_enqueue(count, send_ts_us);
         } else {
             /* Immediate enqueue/send failure: no callback expected, mark as lost now. */
-            ack_emit_status(count, 0, esp_timer_get_time(), send_ts_us);
+            ack_emit_status(count, 0, "packet_drop", esp_timer_get_time(), send_ts_us);
             ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
         }
 

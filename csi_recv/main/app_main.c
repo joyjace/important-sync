@@ -47,6 +47,7 @@
 
 #define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT40
 #define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS0_LGI
+#define CONFIG_MINIMIZE_CONSOLE_OUTPUT   1  // 1 = reduce non-CSI logs on UART, 0 = default logging
 /* Bitrate options (choose one for `CONFIG_ESP_NOW_RATE` - type `wifi_phy_rate_t`):                                                                             
  *
  * Legacy (802.11b/g):
@@ -85,6 +86,15 @@
 static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
 static const uint8_t CONFIG_CSI_RECV_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x01};
 static const char *TAG = "csi_recv";
+
+static void configure_console_log_verbosity(void)
+{
+#if CONFIG_MINIMIZE_CONSOLE_OUTPUT
+    /* Keep UART bandwidth for CSI_DATA lines emitted via ets_printf. */
+    esp_log_level_set("*", ESP_LOG_ERROR);
+    esp_log_level_set(TAG, ESP_LOG_NONE);
+#endif
+}
 
 static void wifi_init()
 {
@@ -312,6 +322,8 @@ static void wifi_csi_init()
 
 void app_main()
 {
+    configure_console_log_verbosity();
+
     /**
      * @brief Initialize NVS
      */

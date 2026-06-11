@@ -74,6 +74,7 @@ OUTPUT_COLUMNS = [
     'agc_gain',
     'channel',
     'local_timestamp',
+    'local_timestamp_fmt',
     'sig_len',
     'rx_state',
     'data_len',
@@ -185,6 +186,17 @@ def host_timestamp_ms():
     millis = (now_ns // 1_000_000) % 1000
     micros = (now_ns // 1_000) % 1000
     return f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(seconds))}.{millis:03d}{micros:03d}"
+
+
+def format_local_timestamp_us(local_timestamp_us):
+    if local_timestamp_us is None:
+        return ''
+
+    total_us = int(local_timestamp_us)
+    total_seconds, micros = divmod(total_us, 1_000_000)
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f'{hours:02d}:{minutes:02d}:{seconds:02d}.{micros:06d}'
 
 
 def build_ack_status_rows(seq, delivered, ack_total, ack_delivered,
@@ -428,6 +440,7 @@ def compute_stats(raw_data, sample_count):
 
 
 def make_output_row(frame, stats):
+    local_timestamp_us = frame['local_timestamp'] if frame['local_timestamp'] is not None else ''
     return {
         'host_time': host_timestamp_ms(),
         'format': frame['format'],
@@ -439,7 +452,8 @@ def make_output_row(frame, stats):
         'fft_gain': frame['fft_gain'] if frame['fft_gain'] is not None else '',
         'agc_gain': frame['agc_gain'] if frame['agc_gain'] is not None else '',
         'channel': frame['channel'] if frame['channel'] is not None else '',
-        'local_timestamp': frame['local_timestamp'] if frame['local_timestamp'] is not None else '',
+        'local_timestamp': local_timestamp_us,
+        'local_timestamp_fmt': format_local_timestamp_us(frame['local_timestamp']),
         'sig_len': frame['sig_len'] if frame['sig_len'] is not None else '',
         'rx_state': frame['rx_state'] if frame['rx_state'] is not None else '',
         'data_len': frame['data_len'],

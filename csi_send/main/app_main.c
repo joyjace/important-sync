@@ -81,7 +81,7 @@
 #define CONFIG_ESP_NOW_PAYLOAD_LEN          128 // Bytes per ESP-NOW data frame (>= 4 to keep sequence ID) (16, 64, 128)
 // TX power in units of 0.25 dBm. Range [8, 84] => [2 dBm, 20 dBm].
 // Mapping: {set value range, actual value} = {{[8,19],8},{[20,27],20},{[28,33],28},{[34,43],34},{[44,51],44},{[52,55],52},{[56,59],56},{[60,65],60},{[66,71],66},{[72,79],72},{[80,84],80}}
-#define CONFIG_WIFI_TX_POWER                80
+#define CONFIG_WIFI_TX_POWER                8
 
 #if CONFIG_ESP_NOW_PAYLOAD_LEN < 4
 #error "CONFIG_ESP_NOW_PAYLOAD_LEN must be at least 4 bytes"
@@ -180,10 +180,37 @@ static bool ack_log_enqueue(const ack_log_event_t *event, TickType_t wait_ticks)
     return true;
 }
 
+static void ack_print_service_summary(const char *tag,
+                                      uint32_t total,
+                                      uint32_t success_count,
+                                      uint64_t service_sum_us,
+                                      uint32_t service_sample_count,
+                                      uint64_t delivered_bytes,
+                                      int64_t event_ts_us)
+{
+    if (service_sample_count == 0 || service_sum_us == 0) {
+        return;
+    }
+
+    const double avg_service_us = (double)service_sum_us / (double)service_sample_count;
+    const double goodput_mbps = ((double)delivered_bytes * 8.0) / (double)service_sum_us;
+
+    printf("%s,%lu,%lu,%.1f,%.3f,%lld\n",
+           tag,
+           (unsigned long)total,
+           (unsigned long)success_count,
+           avg_service_us,
+           goodput_mbps,
+           (long long)event_ts_us);
+}
+
 static void ack_logging_task(void *arg)
 {
     (void)arg;
     ack_log_event_t event;
+    uint64_t service_sum_us = 0;
+    uint64_t delivered_bytes = 0;
+    uint32_t service_sample_count = 0;
 
     for (;;) {
         if (xQueueReceive(s_ack_log_queue, &event, portMAX_DELAY) != pdTRUE) {
@@ -197,6 +224,14 @@ static void ack_logging_task(void *arg)
              * The final four fields expose the configured rate and the scalar
              * tx_info metadata copied inside the callback.
              */
+            if (event.service_us > 0) {
+                service_sum_us += (uint64_t)event.service_us;
+                service_sample_count++;
+                if (event.delivered && event.data_len > 0) {
+                    delivered_bytes += (uint64_t)event.data_len;
+                }
+            }
+
             printf("ACK_STATUS,%lu,%d,%s,%lld,%lld,%lld,%d,%d,%d,%d\n",
                    (unsigned long)event.seq,
                    event.delivered,
@@ -215,6 +250,13 @@ static void ack_logging_task(void *arg)
                        (unsigned long)event.success_count,
                        100.0f * event.success_count / event.total,
                        (long long)event.event_ts_us);
+                ack_print_service_summary("ACK_SERVICE",
+                                          event.total,
+                                          event.success_count,
+                                          service_sum_us,
+                                          service_sample_count,
+                                          delivered_bytes,
+                                          event.event_ts_us);
             }
             fflush(stdout);
             break;
@@ -226,11 +268,24 @@ static void ack_logging_task(void *arg)
                        (unsigned long)event.success_count,
                        100.0f * event.success_count / event.total,
                        (long long)event.event_ts_us);
+                ack_print_service_summary("ACK_SERVICE_FINAL",
+                                          event.total,
+                                          event.success_count,
+                                          service_sum_us,
+                                          service_sample_count,
+                                          delivered_bytes,
+                                          event.event_ts_us);
+                service_sum_us = 0;
+                delivered_bytes = 0;
+                service_sample_count = 0;
                 fflush(stdout);
             }
             break;
 
         case ACK_LOG_EVENT_RESET:
+            service_sum_us = 0;
+            delivered_bytes = 0;
+            service_sample_count = 0;
             printf("ACK_RESET_FOR_MCS%u\n", (unsigned int)event.new_mcs_index);
             fflush(stdout);
             break;
@@ -517,7 +572,7 @@ static void wifi_init()
 
 #if CONFIG_IDF_TARGET_ESP32C5
     ESP_ERROR_CHECK(esp_wifi_start());
-    esp_wifi_set_band_mode(CONFIG_WIFI_BAND_MODE);
+    ESP_ERROR_CHECK(esp_wifi_set_band_mode(CONFIG_WIFI_BAND_MODE));
     wifi_protocols_t protocols = {
         .ghz_2g = CONFIG_WIFI_2G_PROTOCOL,
         .ghz_5g = CONFIG_WIFI_5G_PROTOCOL
@@ -530,7 +585,7 @@ static void wifi_init()
     ESP_ERROR_CHECK(esp_wifi_set_bandwidths(ESP_IF_WIFI_STA, &bandwidth));
 #elif (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)) || CONFIG_IDF_TARGET_ESP32C61
     ESP_ERROR_CHECK(esp_wifi_start());
-    esp_wifi_set_band_mode(CONFIG_WIFI_BAND_MODE);
+    ESP_ERROR_CHECK(esp_wifi_set_band_mode(CONFIG_WIFI_BAND_MODE));
     wifi_protocols_t protocols = {
         .ghz_2g = CONFIG_WIFI_2G_PROTOCOL,
     };
@@ -638,6 +693,7 @@ void app_main()
              CONFIG_LESS_INTERFERENCE_CHANNEL, CONFIG_SEND_FREQUENCY, CONFIG_ESP_NOW_PAYLOAD_LEN,
              MAC2STR(CONFIG_CSI_SEND_MAC), MAC2STR(CONFIG_CSI_RECV_MAC));
     printf("ACK_STATUS_HEADER,seq,delivered,termination_event,ack_ts_us,send_ts_us,service_us,configured_rate,actual_rate,tx_status,data_len\n");
+    printf("ACK_SERVICE_HEADER,total,delivered,avg_service_us,goodput_mbps,ts_us\n");
     fflush(stdout);
 
 #if CONFIG_RATE_SWITCH_MODE != 2

@@ -255,6 +255,8 @@ ACK_STATUS_PATTERN = re.compile(
 )
 ACK_PDR_PATTERN = re.compile(r'^ACK_PDR\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9]+(?:\.[0-9]+)?)(?:\s*,\s*(\d+))?\s*$')
 ACK_PDR_FINAL_PATTERN = re.compile(r'^ACK_PDR_FINAL\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9]+(?:\.[0-9]+)?)(?:\s*,\s*(\d+))?\s*$')
+ACK_SERVICE_PATTERN = re.compile(r'^ACK_SERVICE\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9]+(?:\.[0-9]+)?)\s*,\s*([0-9]+(?:\.[0-9]+)?)(?:\s*,\s*(\d+))?\s*$')
+ACK_SERVICE_FINAL_PATTERN = re.compile(r'^ACK_SERVICE_FINAL\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9]+(?:\.[0-9]+)?)\s*,\s*([0-9]+(?:\.[0-9]+)?)(?:\s*,\s*(\d+))?\s*$')
 ACK_RESET_PATTERN = re.compile(r'ACK_RESET_FOR_MCS(\d+)')
 
 
@@ -334,6 +336,42 @@ def parse_ack_line(line):
             'sent': sent,
             'delivered': delivered,
             'pdr_percent': pdr,
+            'esp_time_us': esp_time_us,
+        }, None
+
+    service_match = ACK_SERVICE_PATTERN.search(line)
+    if service_match:
+        total = safe_int(service_match.group(1))
+        delivered = safe_int(service_match.group(2))
+        avg_service_us = safe_float(service_match.group(3))
+        goodput_mbps = safe_float(service_match.group(4))
+        esp_time_us = safe_int(service_match.group(5))
+        if total is None or delivered is None or avg_service_us is None or goodput_mbps is None:
+            return None, 'invalid_ack_service_fields'
+        return {
+            'type': 'ACK_SERVICE',
+            'total': total,
+            'delivered': delivered,
+            'avg_service_us': avg_service_us,
+            'goodput_mbps': goodput_mbps,
+            'esp_time_us': esp_time_us,
+        }, None
+
+    service_final_match = ACK_SERVICE_FINAL_PATTERN.search(line)
+    if service_final_match:
+        total = safe_int(service_final_match.group(1))
+        delivered = safe_int(service_final_match.group(2))
+        avg_service_us = safe_float(service_final_match.group(3))
+        goodput_mbps = safe_float(service_final_match.group(4))
+        esp_time_us = safe_int(service_final_match.group(5))
+        if total is None or delivered is None or avg_service_us is None or goodput_mbps is None:
+            return None, 'invalid_ack_service_final_fields'
+        return {
+            'type': 'ACK_SERVICE_FINAL',
+            'total': total,
+            'delivered': delivered,
+            'avg_service_us': avg_service_us,
+            'goodput_mbps': goodput_mbps,
             'esp_time_us': esp_time_us,
         }, None
 
@@ -694,6 +732,27 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
 
                 continue
 
+            if record['type'] == 'ACK_SERVICE':
+                ack_service_tag = color_text('[ACK_SERVICE]', color='cyan', bold=True)
+                print(
+                    f"{ack_service_tag} total={record['total']} delivered={record['delivered']} "
+                    f"avg_service_us={record['avg_service_us']:.1f} goodput_mbps={record['goodput_mbps']:.3f}",
+                    flush=True,
+                )
+
+                continue
+
+            if record['type'] == 'ACK_SERVICE_FINAL':
+                ack_service_final_tag = color_text('[ACK_SERVICE_FINAL]', color='blue', bold=True)
+                print(
+                    f"{ack_service_final_tag} total={record['total']} delivered={record['delivered']} "
+                    f"avg_service_us={record['avg_service_us']:.1f} goodput_mbps={record['goodput_mbps']:.3f} "
+                    f"(MCS rate switch complete)",
+                    flush=True,
+                )
+
+                continue
+
             if record['type'] == 'ACK_RESET':
                 ack_reset_tag = color_text('[ACK_RESET]', color='yellow', bold=True)
                 print(
@@ -885,6 +944,25 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                         print(
                             f"{ack_pdr_final_tag} sent={ack_record['sent']} delivered={ack_record['delivered']} "
                             f"pdr={color_pdr_percent(ack_record['pdr_percent'])} (MCS rate switch complete)",
+                            flush=True,
+                        )
+                        continue
+
+                    if ack_record['type'] == 'ACK_SERVICE':
+                        ack_service_tag = color_text('[ACK_SERVICE]', color='cyan', bold=True)
+                        print(
+                            f"{ack_service_tag} total={ack_record['total']} delivered={ack_record['delivered']} "
+                            f"avg_service_us={ack_record['avg_service_us']:.1f} goodput_mbps={ack_record['goodput_mbps']:.3f}",
+                            flush=True,
+                        )
+                        continue
+
+                    if ack_record['type'] == 'ACK_SERVICE_FINAL':
+                        ack_service_final_tag = color_text('[ACK_SERVICE_FINAL]', color='blue', bold=True)
+                        print(
+                            f"{ack_service_final_tag} total={ack_record['total']} delivered={ack_record['delivered']} "
+                            f"avg_service_us={ack_record['avg_service_us']:.1f} goodput_mbps={ack_record['goodput_mbps']:.3f} "
+                            f"(MCS rate switch complete)",
                             flush=True,
                         )
                         continue

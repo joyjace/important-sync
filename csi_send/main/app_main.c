@@ -72,7 +72,7 @@
  *  - LGI vs SGI: SGI gives a small throughput boost (~10%) but can be less stable.
  *  - Choose legacy rates for robustness, MCS rates for higher throughput when link is good.
  */
-#define CONFIG_SEND_FREQUENCY               100
+#define CONFIG_SEND_FREQUENCY               200
 #define CONFIG_PACKET_PACING_ENABLED        1  // 1 = paced by CONFIG_SEND_FREQUENCY, 0 = max-rate (no fixed sleep)
 #define CONFIG_ACK_TIMING_MODE              2  // 1 = async pipeline, 2 = stop-and-wait (one packet in flight)
 #define CONFIG_RATE_SWITCH_MODE             1  // 0 = TIME_BASED, 1 = PACKET_BASED, 2 = STATIC (fixed rate, no switching)

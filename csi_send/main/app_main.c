@@ -15,6 +15,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <unistd.h>
 
 #include "nvs_flash.h"
@@ -145,6 +146,12 @@ static TaskHandle_t s_sender_task_handle = NULL;
 
 #define ACK_SEQ_QUEUE_SIZE          2048
 
+#if CONFIG_RATE_SWITCH_MODE == 0
+#define ACK_SERVICE_MEDIAN_MAX_SAMPLES  (CONFIG_SEND_FREQUENCY * CONFIG_RATE_SWITCH_INTERVAL_SEC * 2)
+#else
+#define ACK_SERVICE_MEDIAN_MAX_SAMPLES  CONFIG_RATE_SWITCH_PACKET_COUNT
+#endif
+
 typedef struct {
     uint32_t seq;
     int64_t send_ts_us;
@@ -183,6 +190,8 @@ static portMUX_TYPE s_ack_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static QueueHandle_t s_ack_log_queue = NULL;
 static volatile uint32_t s_ack_log_drop_count = 0;
+static uint32_t s_service_median_samples[ACK_SERVICE_MEDIAN_MAX_SAMPLES];
+static uint32_t s_service_median_sample_count = 0;
 
 static bool ack_log_enqueue(const ack_log_event_t *event, TickType_t wait_ticks)
 {
@@ -198,6 +207,7 @@ static void ack_print_service_summary(const char *tag,
                                       uint32_t success_count,
                                       uint64_t service_sum_us,
                                       uint32_t service_sample_count,
+                                      double median_service_us,
                                       uint64_t delivered_bytes,
                                       int64_t event_ts_us)
 {
@@ -208,13 +218,59 @@ static void ack_print_service_summary(const char *tag,
     const double avg_service_us = (double)service_sum_us / (double)service_sample_count;
     const double goodput_mbps = ((double)delivered_bytes * 8.0) / (double)service_sum_us;
 
-    printf("%s,%lu,%lu,%.1f,%.3f,%lld\n",
+    printf("%s,%lu,%lu,%.1f,%.1f,%.3f,%lld\n",
            tag,
            (unsigned long)total,
            (unsigned long)success_count,
            avg_service_us,
+           median_service_us,
            goodput_mbps,
            (long long)event_ts_us);
+}
+
+static void ack_service_median_reset(void)
+{
+    s_service_median_sample_count = 0;
+}
+
+static void ack_service_median_insert(uint32_t service_us)
+{
+    if (s_service_median_sample_count >= ACK_SERVICE_MEDIAN_MAX_SAMPLES) {
+        return;
+    }
+
+    uint32_t lo = 0;
+    uint32_t hi = s_service_median_sample_count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (s_service_median_samples[mid] <= service_us) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    if (lo < s_service_median_sample_count) {
+        memmove(&s_service_median_samples[lo + 1],
+                &s_service_median_samples[lo],
+                (s_service_median_sample_count - lo) * sizeof(s_service_median_samples[0]));
+    }
+    s_service_median_samples[lo] = service_us;
+    s_service_median_sample_count++;
+}
+
+static double ack_service_median_us(void)
+{
+    if (s_service_median_sample_count == 0) {
+        return 0.0;
+    }
+
+    uint32_t mid = s_service_median_sample_count / 2;
+    if ((s_service_median_sample_count % 2) != 0) {
+        return (double)s_service_median_samples[mid];
+    }
+
+    return ((double)s_service_median_samples[mid - 1] + (double)s_service_median_samples[mid]) / 2.0;
 }
 
 static void ack_logging_task(void *arg)
@@ -240,6 +296,9 @@ static void ack_logging_task(void *arg)
             if (event.service_us > 0) {
                 service_sum_us += (uint64_t)event.service_us;
                 service_sample_count++;
+                if (event.service_us <= UINT32_MAX) {
+                    ack_service_median_insert((uint32_t)event.service_us);
+                }
                 if (event.delivered && event.data_len > 0) {
                     delivered_bytes += (uint64_t)event.data_len;
                 }
@@ -268,6 +327,7 @@ static void ack_logging_task(void *arg)
                                           event.success_count,
                                           service_sum_us,
                                           service_sample_count,
+                                          ack_service_median_us(),
                                           delivered_bytes,
                                           event.event_ts_us);
             }
@@ -286,11 +346,13 @@ static void ack_logging_task(void *arg)
                                           event.success_count,
                                           service_sum_us,
                                           service_sample_count,
+                                          ack_service_median_us(),
                                           delivered_bytes,
                                           event.event_ts_us);
                 service_sum_us = 0;
                 delivered_bytes = 0;
                 service_sample_count = 0;
+                ack_service_median_reset();
                 fflush(stdout);
             }
             break;
@@ -299,6 +361,7 @@ static void ack_logging_task(void *arg)
             service_sum_us = 0;
             delivered_bytes = 0;
             service_sample_count = 0;
+            ack_service_median_reset();
             printf("ACK_RESET_FOR_MCS%u\n", (unsigned int)event.new_mcs_index);
             fflush(stdout);
             break;
@@ -709,7 +772,7 @@ void app_main()
              CONFIG_LESS_INTERFERENCE_CHANNEL, CONFIG_SEND_FREQUENCY, CONFIG_ESP_NOW_PAYLOAD_LEN,
              MAC2STR(CONFIG_CSI_SEND_MAC), MAC2STR(CONFIG_CSI_RECV_MAC));
     printf("ACK_STATUS_HEADER,seq,delivered,termination_event,ack_ts_us,send_ts_us,service_us,configured_rate,actual_rate,tx_status,data_len\n");
-    printf("ACK_SERVICE_HEADER,total,delivered,avg_service_us,goodput_mbps,ts_us\n");
+    printf("ACK_SERVICE_HEADER,total,delivered,avg_service_us,median_service_us,goodput_mbps,ts_us\n");
     fflush(stdout);
 
 #if CONFIG_RATE_SWITCH_MODE != 2

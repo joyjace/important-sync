@@ -93,6 +93,10 @@ ACK_DATA_COLUMNS = [
     'esp_time_us',
     'send_time_us',
     'service_us',
+    'configured_rate',
+    'actual_rate',
+    'tx_status',
+    'tx_data_len',
     'termination_event',
     'segment_id',
     'mcs_index',
@@ -203,6 +207,8 @@ def format_local_timestamp_us(local_timestamp_us):
 def build_ack_status_rows(seq, delivered, ack_total, ack_delivered,
                           rolling_window, segment_id, mcs_index,
                           esp_time_us=None, send_time_us=None, service_us=None,
+                          configured_rate=None, actual_rate=None,
+                          tx_status=None, tx_data_len=None,
                           termination_event=None):
     rolling_sent = len(rolling_window)
     rolling_delivered = sum(rolling_window)
@@ -216,6 +222,10 @@ def build_ack_status_rows(seq, delivered, ack_total, ack_delivered,
         'esp_time_us': esp_time_us if esp_time_us is not None else '',
         'send_time_us': send_time_us if send_time_us is not None else '',
         'service_us': service_us if service_us is not None else '',
+        'configured_rate': configured_rate if configured_rate is not None else '',
+        'actual_rate': actual_rate if actual_rate is not None else '',
+        'tx_status': tx_status if tx_status is not None else '',
+        'tx_data_len': tx_data_len if tx_data_len is not None else '',
         'termination_event': termination_event if termination_event is not None else '',
         'segment_id': segment_id,
         'mcs_index': mcs_value,
@@ -255,8 +265,6 @@ ACK_STATUS_PATTERN = re.compile(
 )
 ACK_PDR_PATTERN = re.compile(r'^ACK_PDR\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9]+(?:\.[0-9]+)?)(?:\s*,\s*(\d+))?\s*$')
 ACK_PDR_FINAL_PATTERN = re.compile(r'^ACK_PDR_FINAL\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9]+(?:\.[0-9]+)?)(?:\s*,\s*(\d+))?\s*$')
-ACK_SERVICE_PATTERN = re.compile(r'^ACK_SERVICE\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9]+(?:\.[0-9]+)?)\s*,\s*([0-9]+(?:\.[0-9]+)?)(?:\s*,\s*(\d+))?\s*$')
-ACK_SERVICE_FINAL_PATTERN = re.compile(r'^ACK_SERVICE_FINAL\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9]+(?:\.[0-9]+)?)\s*,\s*([0-9]+(?:\.[0-9]+)?)(?:\s*,\s*(\d+))?\s*$')
 ACK_RESET_PATTERN = re.compile(r'ACK_RESET_FOR_MCS(\d+)')
 
 
@@ -276,6 +284,10 @@ def parse_ack_line(line):
         esp_time_us = None
         send_time_us = None
         service_us = None
+        configured_rate = None
+        actual_rate = None
+        tx_status = None
+        tx_data_len = None
 
         idx = 3
         if len(fields) > idx:
@@ -290,6 +302,14 @@ def parse_ack_line(line):
             send_time_us = safe_int(fields[idx + 1])
         if len(fields) > idx + 2:
             service_us = safe_int(fields[idx + 2])
+        if len(fields) > idx + 3:
+            configured_rate = safe_int(fields[idx + 3])
+        if len(fields) > idx + 4:
+            actual_rate = safe_int(fields[idx + 4])
+        if len(fields) > idx + 5:
+            tx_status = safe_int(fields[idx + 5])
+        if len(fields) > idx + 6:
+            tx_data_len = safe_int(fields[idx + 6])
 
         if seq is None or delivered not in (0, 1):
             return None, 'invalid_ack_status_fields'
@@ -304,6 +324,10 @@ def parse_ack_line(line):
             'esp_time_us': esp_time_us,
             'send_time_us': send_time_us,
             'service_us': service_us,
+            'configured_rate': configured_rate,
+            'actual_rate': actual_rate,
+            'tx_status': tx_status,
+            'tx_data_len': tx_data_len,
             'termination_event': termination_event,
         }, None
 
@@ -339,13 +363,22 @@ def parse_ack_line(line):
             'esp_time_us': esp_time_us,
         }, None
 
-    service_match = ACK_SERVICE_PATTERN.search(line)
-    if service_match:
-        total = safe_int(service_match.group(1))
-        delivered = safe_int(service_match.group(2))
-        avg_service_us = safe_float(service_match.group(3))
-        goodput_mbps = safe_float(service_match.group(4))
-        esp_time_us = safe_int(service_match.group(5))
+    if line.startswith('ACK_SERVICE,'):
+        fields = [f.strip() for f in line.split(',')]
+        if len(fields) not in (5, 6, 7):
+            return None, 'invalid_ack_service_fields'
+
+        total = safe_int(fields[1])
+        delivered = safe_int(fields[2])
+        avg_service_us = safe_float(fields[3])
+        median_service_us = None
+        if len(fields) >= 7:
+            median_service_us = safe_float(fields[4])
+            goodput_mbps = safe_float(fields[5])
+            esp_time_us = safe_int(fields[6])
+        else:
+            goodput_mbps = safe_float(fields[4])
+            esp_time_us = safe_int(fields[5]) if len(fields) == 6 else None
         if total is None or delivered is None or avg_service_us is None or goodput_mbps is None:
             return None, 'invalid_ack_service_fields'
         return {
@@ -353,17 +386,27 @@ def parse_ack_line(line):
             'total': total,
             'delivered': delivered,
             'avg_service_us': avg_service_us,
+            'median_service_us': median_service_us,
             'goodput_mbps': goodput_mbps,
             'esp_time_us': esp_time_us,
         }, None
 
-    service_final_match = ACK_SERVICE_FINAL_PATTERN.search(line)
-    if service_final_match:
-        total = safe_int(service_final_match.group(1))
-        delivered = safe_int(service_final_match.group(2))
-        avg_service_us = safe_float(service_final_match.group(3))
-        goodput_mbps = safe_float(service_final_match.group(4))
-        esp_time_us = safe_int(service_final_match.group(5))
+    if line.startswith('ACK_SERVICE_FINAL,'):
+        fields = [f.strip() for f in line.split(',')]
+        if len(fields) not in (5, 6, 7):
+            return None, 'invalid_ack_service_final_fields'
+
+        total = safe_int(fields[1])
+        delivered = safe_int(fields[2])
+        avg_service_us = safe_float(fields[3])
+        median_service_us = None
+        if len(fields) >= 7:
+            median_service_us = safe_float(fields[4])
+            goodput_mbps = safe_float(fields[5])
+            esp_time_us = safe_int(fields[6])
+        else:
+            goodput_mbps = safe_float(fields[4])
+            esp_time_us = safe_int(fields[5]) if len(fields) == 6 else None
         if total is None or delivered is None or avg_service_us is None or goodput_mbps is None:
             return None, 'invalid_ack_service_final_fields'
         return {
@@ -371,6 +414,7 @@ def parse_ack_line(line):
             'total': total,
             'delivered': delivered,
             'avg_service_us': avg_service_us,
+            'median_service_us': median_service_us,
             'goodput_mbps': goodput_mbps,
             'esp_time_us': esp_time_us,
         }, None
@@ -657,6 +701,10 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                     esp_time_us=record.get('esp_time_us'),
                     send_time_us=record.get('send_time_us'),
                     service_us=record.get('service_us'),
+                    configured_rate=record.get('configured_rate'),
+                    actual_rate=record.get('actual_rate'),
+                    tx_status=record.get('tx_status'),
+                    tx_data_len=record.get('tx_data_len'),
                     termination_event=record.get('termination_event'),
                 )
 
@@ -734,9 +782,14 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
 
             if record['type'] == 'ACK_SERVICE':
                 ack_service_tag = color_text('[ACK_SERVICE]', color='cyan', bold=True)
+                median_text = (
+                    f" median_service_us={record['median_service_us']:.1f}"
+                    if record.get('median_service_us') is not None else ""
+                )
                 print(
                     f"{ack_service_tag} total={record['total']} delivered={record['delivered']} "
-                    f"avg_service_us={record['avg_service_us']:.1f} goodput_mbps={record['goodput_mbps']:.3f}",
+                    f"avg_service_us={record['avg_service_us']:.1f}{median_text} "
+                    f"goodput_mbps={record['goodput_mbps']:.3f}",
                     flush=True,
                 )
 
@@ -744,9 +797,14 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
 
             if record['type'] == 'ACK_SERVICE_FINAL':
                 ack_service_final_tag = color_text('[ACK_SERVICE_FINAL]', color='blue', bold=True)
+                median_text = (
+                    f" median_service_us={record['median_service_us']:.1f}"
+                    if record.get('median_service_us') is not None else ""
+                )
                 print(
                     f"{ack_service_final_tag} total={record['total']} delivered={record['delivered']} "
-                    f"avg_service_us={record['avg_service_us']:.1f} goodput_mbps={record['goodput_mbps']:.3f} "
+                    f"avg_service_us={record['avg_service_us']:.1f}{median_text} "
+                    f"goodput_mbps={record['goodput_mbps']:.3f} "
                     f"(MCS rate switch complete)",
                     flush=True,
                 )
@@ -867,6 +925,10 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                             esp_time_us=ack_record.get('esp_time_us'),
                             send_time_us=ack_record.get('send_time_us'),
                             service_us=ack_record.get('service_us'),
+                            configured_rate=ack_record.get('configured_rate'),
+                            actual_rate=ack_record.get('actual_rate'),
+                            tx_status=ack_record.get('tx_status'),
+                            tx_data_len=ack_record.get('tx_data_len'),
                             termination_event=ack_record.get('termination_event'),
                         )
 
@@ -950,18 +1012,28 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
 
                     if ack_record['type'] == 'ACK_SERVICE':
                         ack_service_tag = color_text('[ACK_SERVICE]', color='cyan', bold=True)
+                        median_text = (
+                            f" median_service_us={ack_record['median_service_us']:.1f}"
+                            if ack_record.get('median_service_us') is not None else ""
+                        )
                         print(
                             f"{ack_service_tag} total={ack_record['total']} delivered={ack_record['delivered']} "
-                            f"avg_service_us={ack_record['avg_service_us']:.1f} goodput_mbps={ack_record['goodput_mbps']:.3f}",
+                            f"avg_service_us={ack_record['avg_service_us']:.1f}{median_text} "
+                            f"goodput_mbps={ack_record['goodput_mbps']:.3f}",
                             flush=True,
                         )
                         continue
 
                     if ack_record['type'] == 'ACK_SERVICE_FINAL':
                         ack_service_final_tag = color_text('[ACK_SERVICE_FINAL]', color='blue', bold=True)
+                        median_text = (
+                            f" median_service_us={ack_record['median_service_us']:.1f}"
+                            if ack_record.get('median_service_us') is not None else ""
+                        )
                         print(
                             f"{ack_service_final_tag} total={ack_record['total']} delivered={ack_record['delivered']} "
-                            f"avg_service_us={ack_record['avg_service_us']:.1f} goodput_mbps={ack_record['goodput_mbps']:.3f} "
+                            f"avg_service_us={ack_record['avg_service_us']:.1f}{median_text} "
+                            f"goodput_mbps={ack_record['goodput_mbps']:.3f} "
                             f"(MCS rate switch complete)",
                             flush=True,
                         )

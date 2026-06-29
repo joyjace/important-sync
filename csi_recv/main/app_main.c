@@ -364,8 +364,8 @@ void app_main()
         .channel   = CONFIG_LESS_INTERFERENCE_CHANNEL,
         .ifidx     = WIFI_IF_STA,
         .encrypt   = false,
-        .peer_addr = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00},
     };
+    memcpy(peer.peer_addr, CONFIG_CSI_SEND_MAC, sizeof(peer.peer_addr));
 
     wifi_esp_now_init(peer);
 

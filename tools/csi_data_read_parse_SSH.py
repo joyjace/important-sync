@@ -43,6 +43,14 @@ ANSI_COLORS = {
 }
 ANSI_BOLD = '\033[1m'
 
+MCS0_LGI_RATE_VALUE = 16
+CURRENT_MCS_LOCK = threading.Lock()
+CURRENT_MCS_STATE = {
+    'mcs': None,
+    'reason': '',
+    'seq': None,
+}
+
 
 DATA_COLUMNS_NAMES_C5C6 = [
     'type', 'seq', 'mac', 'rssi', 'rate', 'noise_floor', 'fft_gain',
@@ -183,6 +191,31 @@ def pdr_color_name(pdr_percent):
 
 def color_pdr_percent(pdr_percent):
     return color_text(f'{pdr_percent:.2f}%', color=pdr_color_name(pdr_percent), bold=True)
+
+
+def rate_value_to_mcs(rate_value):
+    if rate_value is None:
+        return None
+    mcs = rate_value - MCS0_LGI_RATE_VALUE
+    if 0 <= mcs <= 7:
+        return mcs
+    return None
+
+
+def set_current_mcs(mcs, reason='', seq=None):
+    if mcs is None:
+        return
+    with CURRENT_MCS_LOCK:
+        if reason == 'ack_status' and CURRENT_MCS_STATE.get('mcs') == mcs:
+            return
+        CURRENT_MCS_STATE['mcs'] = mcs
+        CURRENT_MCS_STATE['reason'] = reason or ''
+        CURRENT_MCS_STATE['seq'] = seq
+
+
+def get_current_mcs_state():
+    with CURRENT_MCS_LOCK:
+        return dict(CURRENT_MCS_STATE)
 
 
 def host_timestamp_ms():
@@ -329,6 +362,33 @@ def parse_ack_line(line):
             'tx_status': tx_status,
             'tx_data_len': tx_data_len,
             'termination_event': termination_event,
+        }, None
+
+    if line.startswith('MCS_CHANGE,'):
+        fields = [f.strip() for f in line.split(',')]
+        if len(fields) < 7:
+            return None, 'invalid_mcs_change_fields'
+
+        seq = safe_int(fields[1])
+        old_mcs = safe_int(fields[2])
+        new_mcs = safe_int(fields[3])
+        old_rate = safe_int(fields[4])
+        new_rate = safe_int(fields[5])
+        reason = fields[6] if len(fields) > 6 else ''
+        esp_time_us = safe_int(fields[7]) if len(fields) > 7 else None
+
+        if seq is None or new_mcs is None:
+            return None, 'invalid_mcs_change_fields'
+
+        return {
+            'type': 'MCS_CHANGE',
+            'seq': seq,
+            'old_mcs': old_mcs,
+            'new_mcs': new_mcs,
+            'old_rate': old_rate,
+            'new_rate': new_rate,
+            'reason': reason,
+            'esp_time_us': esp_time_us,
         }, None
 
     pdr_match = ACK_PDR_PATTERN.search(line)
@@ -577,12 +637,28 @@ def make_output_row(frame, stats):
     }
 
 
+def format_mcs_text(mcs_state=None, prefix='tx_mcs'):
+    if mcs_state is None:
+        mcs_state = get_current_mcs_state()
+    mcs = mcs_state.get('mcs')
+    if mcs is None:
+        return f'{prefix}=unknown'
+    text = f'{prefix}=MCS{mcs}'
+    reason = mcs_state.get('reason')
+    if reason:
+        text += f' mcs_reason={reason}'
+    return text
+
+
 def print_summary(frame_count, frame, stats):
+    mcs_state = get_current_mcs_state()
     msg = (
         f"[{frame_count}] "
         f"fmt={frame['format']} "
         f"mac={frame['mac']} "
         f"rssi={frame['rssi']} "
+        f"{format_mcs_text(mcs_state)} "
+        f"rx_rate={frame['rate']} "
         f"ch={frame['channel']} "
         f"pairs={stats['iq_pairs']} "
         f"mean_amp={stats['mean_amp']} "
@@ -598,13 +674,28 @@ def print_summary(frame_count, frame, stats):
 
 
 def print_ack_summary(ack_total, ack_delivered, running_pdr_percent, seq,
-                      rolling_sent, rolling_delivered, rolling_pdr_percent):
+                      rolling_sent, rolling_delivered, rolling_pdr_percent,
+                      mcs_index=None):
     tag = color_text('[ACK]', color='cyan', bold=True)
+    mcs_text = f' mcs=MCS{mcs_index}' if mcs_index is not None else ''
     print(
         f'{tag} seq={seq} delivered_total={ack_delivered}/{ack_total} '
+        f'{mcs_text} '
         f'running_pdr={color_pdr_percent(running_pdr_percent)} '
         f'window={rolling_delivered}/{rolling_sent} '
         f'window_pdr={color_pdr_percent(rolling_pdr_percent)}',
+        flush=True,
+    )
+
+
+def print_mcs_change(record):
+    tag = color_text('[MCS]', color='yellow', bold=True)
+    old_text = f"MCS{record['old_mcs']}" if record.get('old_mcs') is not None and record.get('old_mcs') >= 0 else 'unknown'
+    new_text = f"MCS{record['new_mcs']}" if record.get('new_mcs') is not None and record.get('new_mcs') >= 0 else 'unknown'
+    print(
+        f"{tag} seq={record['seq']} {old_text}->{new_text} "
+        f"reason={record.get('reason', '')} "
+        f"old_rate={record.get('old_rate')} new_rate={record.get('new_rate')}",
         flush=True,
     )
 
@@ -690,6 +781,10 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                 ack_total += 1
                 ack_delivered += record['delivered']
                 rolling_window.append(record['delivered'])
+                status_mcs = rate_value_to_mcs(record.get('configured_rate'))
+                if status_mcs is not None:
+                    current_mcs_index = status_mcs
+                    set_current_mcs(status_mcs, 'ack_status', record['seq'])
                 ack_row, ack_pdr_row, pdr_percent = build_ack_status_rows(
                     seq=record['seq'],
                     delivered=record['delivered'],
@@ -726,8 +821,15 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                         rolling_sent=rolling_sent,
                         rolling_delivered=rolling_delivered,
                         rolling_pdr_percent=rolling_pdr_percent,
+                        mcs_index=current_mcs_index,
                     )
 
+                continue
+
+            if record['type'] == 'MCS_CHANGE':
+                current_mcs_index = record['new_mcs']
+                set_current_mcs(record['new_mcs'], record.get('reason', ''), record['seq'])
+                print_mcs_change(record)
                 continue
 
             if record['type'] == 'ACK_PDR':
@@ -747,9 +849,10 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                 })
                 ack_pdr_file_fd.flush()
                 ack_pdr_tag = color_text('[ACK_PDR]', color='magenta', bold=True)
+                mcs_text = f" mcs=MCS{current_mcs_index}" if current_mcs_index is not None else ""
                 print(
                     f"{ack_pdr_tag} sent={record['sent']} delivered={record['delivered']} "
-                    f"pdr={color_pdr_percent(record['pdr_percent'])}",
+                    f"{mcs_text} pdr={color_pdr_percent(record['pdr_percent'])}",
                     flush=True,
                 )
 
@@ -772,9 +875,10 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                 })
                 ack_pdr_file_fd.flush()
                 ack_pdr_final_tag = color_text('[ACK_PDR_FINAL]', color='green', bold=True)
+                mcs_text = f" mcs=MCS{current_mcs_index}" if current_mcs_index is not None else ""
                 print(
                     f"{ack_pdr_final_tag} sent={record['sent']} delivered={record['delivered']} "
-                    f"pdr={color_pdr_percent(record['pdr_percent'])} (MCS rate switch complete)",
+                    f"{mcs_text} pdr={color_pdr_percent(record['pdr_percent'])} (MCS rate switch complete)",
                     flush=True,
                 )
 
@@ -786,9 +890,10 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                     f" median_service_us={record['median_service_us']:.1f}"
                     if record.get('median_service_us') is not None else ""
                 )
+                mcs_text = f" mcs=MCS{current_mcs_index}" if current_mcs_index is not None else ""
                 print(
                     f"{ack_service_tag} total={record['total']} delivered={record['delivered']} "
-                    f"avg_service_us={record['avg_service_us']:.1f}{median_text} "
+                    f"{mcs_text} avg_service_us={record['avg_service_us']:.1f}{median_text} "
                     f"goodput_mbps={record['goodput_mbps']:.3f}",
                     flush=True,
                 )
@@ -801,9 +906,10 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                     f" median_service_us={record['median_service_us']:.1f}"
                     if record.get('median_service_us') is not None else ""
                 )
+                mcs_text = f" mcs=MCS{current_mcs_index}" if current_mcs_index is not None else ""
                 print(
                     f"{ack_service_final_tag} total={record['total']} delivered={record['delivered']} "
-                    f"avg_service_us={record['avg_service_us']:.1f}{median_text} "
+                    f"{mcs_text} avg_service_us={record['avg_service_us']:.1f}{median_text} "
                     f"goodput_mbps={record['goodput_mbps']:.3f} "
                     f"(MCS rate switch complete)",
                     flush=True,
@@ -820,6 +926,7 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                 # Reset running counters for next MCS test
                 segment_id += 1
                 current_mcs_index = record['mcs_index']
+                set_current_mcs(current_mcs_index, 'ack_reset', None)
                 ack_total = 0
                 ack_delivered = 0
                 rolling_window.clear()
@@ -914,6 +1021,10 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                         ack_total += 1
                         ack_delivered += ack_record['delivered']
                         rolling_window.append(ack_record['delivered'])
+                        status_mcs = rate_value_to_mcs(ack_record.get('configured_rate'))
+                        if status_mcs is not None:
+                            current_mcs_index = status_mcs
+                            set_current_mcs(status_mcs, 'ack_status', ack_record['seq'])
                         ack_row, ack_pdr_row, pdr_percent = build_ack_status_rows(
                             seq=ack_record['seq'],
                             delivered=ack_record['delivered'],
@@ -954,8 +1065,15 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                                 rolling_sent=rolling_sent,
                                 rolling_delivered=rolling_delivered,
                                 rolling_pdr_percent=rolling_pdr_percent,
+                                mcs_index=current_mcs_index,
                             )
 
+                        continue
+
+                    if ack_record['type'] == 'MCS_CHANGE':
+                        current_mcs_index = ack_record['new_mcs']
+                        set_current_mcs(ack_record['new_mcs'], ack_record.get('reason', ''), ack_record['seq'])
+                        print_mcs_change(ack_record)
                         continue
 
                     if ack_record['type'] == 'ACK_PDR':
@@ -977,9 +1095,10 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                             if ack_pdr_file_fd is not None:
                                 ack_pdr_file_fd.flush()
                         ack_pdr_tag = color_text('[ACK_PDR]', color='magenta', bold=True)
+                        mcs_text = f" mcs=MCS{current_mcs_index}" if current_mcs_index is not None else ""
                         print(
                             f"{ack_pdr_tag} sent={ack_record['sent']} delivered={ack_record['delivered']} "
-                            f"pdr={color_pdr_percent(ack_record['pdr_percent'])}",
+                            f"{mcs_text} pdr={color_pdr_percent(ack_record['pdr_percent'])}",
                             flush=True,
                         )
                         continue
@@ -1003,9 +1122,10 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                             if ack_pdr_file_fd is not None:
                                 ack_pdr_file_fd.flush()
                         ack_pdr_final_tag = color_text('[ACK_PDR_FINAL]', color='green', bold=True)
+                        mcs_text = f" mcs=MCS{current_mcs_index}" if current_mcs_index is not None else ""
                         print(
                             f"{ack_pdr_final_tag} sent={ack_record['sent']} delivered={ack_record['delivered']} "
-                            f"pdr={color_pdr_percent(ack_record['pdr_percent'])} (MCS rate switch complete)",
+                            f"{mcs_text} pdr={color_pdr_percent(ack_record['pdr_percent'])} (MCS rate switch complete)",
                             flush=True,
                         )
                         continue
@@ -1016,9 +1136,10 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                             f" median_service_us={ack_record['median_service_us']:.1f}"
                             if ack_record.get('median_service_us') is not None else ""
                         )
+                        mcs_text = f" mcs=MCS{current_mcs_index}" if current_mcs_index is not None else ""
                         print(
                             f"{ack_service_tag} total={ack_record['total']} delivered={ack_record['delivered']} "
-                            f"avg_service_us={ack_record['avg_service_us']:.1f}{median_text} "
+                            f"{mcs_text} avg_service_us={ack_record['avg_service_us']:.1f}{median_text} "
                             f"goodput_mbps={ack_record['goodput_mbps']:.3f}",
                             flush=True,
                         )
@@ -1030,9 +1151,10 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                             f" median_service_us={ack_record['median_service_us']:.1f}"
                             if ack_record.get('median_service_us') is not None else ""
                         )
+                        mcs_text = f" mcs=MCS{current_mcs_index}" if current_mcs_index is not None else ""
                         print(
                             f"{ack_service_final_tag} total={ack_record['total']} delivered={ack_record['delivered']} "
-                            f"avg_service_us={ack_record['avg_service_us']:.1f}{median_text} "
+                            f"{mcs_text} avg_service_us={ack_record['avg_service_us']:.1f}{median_text} "
                             f"goodput_mbps={ack_record['goodput_mbps']:.3f} "
                             f"(MCS rate switch complete)",
                             flush=True,
@@ -1047,6 +1169,7 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                         )
                         segment_id += 1
                         current_mcs_index = ack_record['mcs_index']
+                        set_current_mcs(current_mcs_index, 'ack_reset', None)
                         ack_total = 0
                         ack_delivered = 0
                         rolling_window.clear()

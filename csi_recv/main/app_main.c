@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 #include "nvs_flash.h"
 
@@ -25,6 +26,10 @@
 #include "esp_netif.h"
 #include "esp_now.h"
 #include "esp_csi_gain_ctrl.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "generated_reward_model_v2.h"
 
 /* ESP-IDF 6.0+ renamed WIFI_BW_HT20/HT40 to WIFI_BW20/BW40. */
 #ifndef WIFI_BW_HT20
@@ -34,7 +39,7 @@
 #define WIFI_BW_HT40 WIFI_BW40
 #endif
 
-#define CONFIG_LESS_INTERFERENCE_CHANNEL   11
+#define CONFIG_LESS_INTERFERENCE_CHANNEL   1
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61 || (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0))
 #define CONFIG_WIFI_BAND_MODE               WIFI_BAND_MODE_2G_ONLY
 #define CONFIG_WIFI_2G_BANDWIDTHS           WIFI_BW_HT20
@@ -48,6 +53,9 @@
 #define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT20
 #define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS0_LGI
 #define CONFIG_MINIMIZE_CONSOLE_OUTPUT   1  // 1 = reduce non-CSI logs on UART, 0 = default logging
+#define CONFIG_MCS_RECOMMENDATION_ENABLED 1 // 1 = enable MCS recommendation feature, 0 = disable
+#define CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS 20  // 1=every packet, N=every N data packets
+#define CONFIG_MCS_RECOMMENDATION_USE_MODEL 1  // 1=use ML model, 0=use RSSI-based heuristic
 /* Bitrate options (choose one for `CONFIG_ESP_NOW_RATE` - type `wifi_phy_rate_t`):                                                                             
  *
  * Legacy (802.11b/g):
@@ -75,6 +83,12 @@
 #error "CONFIG_LESS_INTERFERENCE_CHANNEL must be in [1, 13] for 2.4 GHz"
 #endif
 
+#if CONFIG_MCS_RECOMMENDATION_ENABLED
+#if CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS <= 0
+#error "CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS must be > 0"
+#endif
+#endif
+
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61
 #define CSI_FORCE_LLTF                      0
 #endif
@@ -87,9 +101,264 @@
 #define ESP_IF_WIFI_STA ESP_MAC_WIFI_STA
 #endif
 
-static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
-static const uint8_t CONFIG_CSI_RECV_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x01};
+static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x10};
+static const uint8_t CONFIG_CSI_RECV_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x11};
 static const char *TAG = "csi_recv";
+
+#define MCS_RECO_MAGIC 0xA5
+#define MCS_RECO_VERSION 1
+
+typedef struct __attribute__((packed)) {
+    uint8_t magic;
+    uint8_t version;
+    uint8_t recommended_mcs;
+    uint8_t confidence;
+    uint32_t seq;
+    int8_t rssi;
+    int8_t snr;
+    uint8_t reserved[2];
+} mcs_reco_msg_t;
+
+#if CONFIG_MCS_RECOMMENDATION_ENABLED
+#define MCS_RECO_QUEUE_SIZE 128
+#define MCS_RECO_TASK_STACK 3072
+#define MCS_RECO_TASK_PRIO (tskIDLE_PRIORITY + 1)
+
+static QueueHandle_t s_mcs_reco_queue = NULL;
+static volatile uint32_t s_mcs_reco_drop_count = 0;
+static uint32_t s_mcs_data_pkt_count = 0;
+
+static float quantile_from_sorted(const float *sorted, int n, float q)
+{
+    if (n <= 0) {
+        return 0.0f;
+    }
+    if (n == 1) {
+        return sorted[0];
+    }
+
+    float pos = q * (float)(n - 1);
+    int lo = (int)pos;
+    int hi = lo + 1;
+    if (hi >= n) {
+        hi = n - 1;
+    }
+    float t = pos - (float)lo;
+    return sorted[lo] * (1.0f - t) + sorted[hi] * t;
+}
+
+static void sort_small_array(float *arr, int n)
+{
+    for (int i = 1; i < n; ++i) {
+        float key = arr[i];
+        int j = i - 1;
+        while (j >= 0 && arr[j] > key) {
+            arr[j + 1] = arr[j];
+            --j;
+        }
+        arr[j + 1] = key;
+    }
+}
+
+static void build_model_state(const wifi_csi_info_t *info,
+                              const wifi_pkt_rx_ctrl_t *rx_ctrl,
+                              int8_t fft_gain,
+                              uint8_t agc_gain,
+                              float state[REWARD_MODEL_STATE_DIM])
+{
+    memset(state, 0, sizeof(float) * REWARD_MODEL_STATE_DIM);
+
+    float amps[117] = {0};
+    int amp_count = info->len / 2;
+    if (amp_count > 117) {
+        amp_count = 117;
+    }
+
+    for (int i = 0; i < amp_count; ++i) {
+        float i_val = (float)((int8_t)info->buf[2 * i]);
+        float q_val = (float)((int8_t)info->buf[2 * i + 1]);
+        float amp = sqrtf(i_val * i_val + q_val * q_val);
+        amps[i] = amp;
+        state[i] = amp;
+    }
+
+    float iq_mean = 0.0f;
+    float iq_std = 0.0f;
+    float iq_p10 = 0.0f;
+    float iq_p50 = 0.0f;
+    float iq_p90 = 0.0f;
+
+    if (amp_count > 0) {
+        float sum = 0.0f;
+        float sum_sq = 0.0f;
+        for (int i = 0; i < amp_count; ++i) {
+            sum += amps[i];
+            sum_sq += amps[i] * amps[i];
+        }
+        iq_mean = sum / (float)amp_count;
+        float variance = (sum_sq / (float)amp_count) - (iq_mean * iq_mean);
+        if (variance < 0.0f) {
+            variance = 0.0f;
+        }
+        iq_std = sqrtf(variance);
+
+        float sorted[117] = {0};
+        for (int i = 0; i < amp_count; ++i) {
+            sorted[i] = amps[i];
+        }
+        sort_small_array(sorted, amp_count);
+        iq_p10 = quantile_from_sorted(sorted, amp_count, 0.10f);
+        iq_p50 = quantile_from_sorted(sorted, amp_count, 0.50f);
+        iq_p90 = quantile_from_sorted(sorted, amp_count, 0.90f);
+    }
+
+    float snr = (float)((int)rx_ctrl->rssi - (int)rx_ctrl->noise_floor);
+    state[117] = (float)rx_ctrl->rssi;
+    state[118] = snr;
+    state[119] = (float)fft_gain;
+    state[120] = (float)agc_gain;
+    state[121] = (float)rx_ctrl->channel;
+    state[122] = (float)rx_ctrl->sig_len;
+    state[123] = iq_mean;
+    state[124] = iq_std;
+    state[125] = iq_p10;
+    state[126] = iq_p50;
+    state[127] = iq_p90;
+}
+
+static float reward_model_score_action(const float state[REWARD_MODEL_STATE_DIM], uint8_t action)
+{
+    float x[REWARD_MODEL_INPUT_DIM] = {0};
+    float h1[REWARD_MODEL_HIDDEN_DIM] = {0};
+    float h2[REWARD_MODEL_HIDDEN_DIM] = {0};
+
+    for (int i = 0; i < REWARD_MODEL_STATE_DIM; ++i) {
+        x[i] = (state[i] - reward_model_state_mean[i]) / reward_model_state_std[i];
+    }
+
+    for (int i = 0; i < REWARD_MODEL_ACTION_DIM; ++i) {
+        x[REWARD_MODEL_STATE_DIM + i] = (i == action) ? 1.0f : 0.0f;
+    }
+    x[REWARD_MODEL_STATE_DIM + REWARD_MODEL_ACTION_DIM] = (float)action / (float)(REWARD_MODEL_ACTION_DIM - 1);
+
+    for (int o = 0; o < REWARD_MODEL_HIDDEN_DIM; ++o) {
+        float sum = reward_model_b1[o];
+        const int row = o * REWARD_MODEL_INPUT_DIM;
+        for (int i = 0; i < REWARD_MODEL_INPUT_DIM; ++i) {
+            sum += reward_model_w1[row + i] * x[i];
+        }
+        h1[o] = (sum > 0.0f) ? sum : 0.0f;
+    }
+
+    for (int o = 0; o < REWARD_MODEL_HIDDEN_DIM; ++o) {
+        float sum = reward_model_b2[o];
+        const int row = o * REWARD_MODEL_HIDDEN_DIM;
+        for (int i = 0; i < REWARD_MODEL_HIDDEN_DIM; ++i) {
+            sum += reward_model_w2[row + i] * h1[i];
+        }
+        h2[o] = (sum > 0.0f) ? sum : 0.0f;
+    }
+
+    float out = reward_model_b3[0];
+    for (int i = 0; i < REWARD_MODEL_HIDDEN_DIM; ++i) {
+        out += reward_model_w3[i] * h2[i];
+    }
+
+    return out;
+}
+
+static uint8_t recommend_mcs_with_model(const float state[REWARD_MODEL_STATE_DIM], uint8_t *confidence_out)
+{
+    uint8_t best = 0;
+    float best_score = reward_model_score_action(state, 0);
+    float second_score = best_score;
+
+    for (uint8_t action = 1; action < REWARD_MODEL_ACTION_DIM; ++action) {
+        float score = reward_model_score_action(state, action);
+#if REWARD_MODEL_OBJECTIVE_MINIMIZE
+        if (score < best_score) {
+            second_score = best_score;
+            best_score = score;
+            best = action;
+        } else if (score < second_score || best == action - 1) {
+            second_score = score;
+        }
+#else
+        if (score > best_score) {
+            second_score = best_score;
+            best_score = score;
+            best = action;
+        } else if (score > second_score || best == action - 1) {
+            second_score = score;
+        }
+#endif
+    }
+
+    float margin = fabsf(best_score - second_score);
+    int conf = (int)(margin * 30.0f);
+    if (conf > 100) {
+        conf = 100;
+    }
+    if (conf < 0) {
+        conf = 0;
+    }
+
+    if (confidence_out != NULL) {
+        *confidence_out = (uint8_t)conf;
+    }
+    return best;
+}
+
+static uint8_t recommend_mcs_from_rssi(int8_t rssi)
+{
+    if (rssi >= -45) return 7;
+    if (rssi >= -50) return 6;
+    if (rssi >= -55) return 5;
+    if (rssi >= -60) return 4;
+    if (rssi >= -66) return 3;
+    if (rssi >= -72) return 2;
+    if (rssi >= -78) return 1;
+    return 0;
+}
+
+static void mcs_recommendation_task(void *arg)
+{
+    (void)arg;
+    mcs_reco_msg_t msg;
+
+    for (;;) {
+        if (xQueueReceive(s_mcs_reco_queue, &msg, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        esp_err_t ret = esp_now_send(CONFIG_CSI_SEND_MAC, (const uint8_t *)&msg, sizeof(msg));
+        if (ret != ESP_OK) {
+            ESP_LOGD(TAG, "MCS recommendation send failed: %s", esp_err_to_name(ret));
+        }
+    }
+}
+
+static void mcs_recommendation_init(void)
+{
+    s_mcs_reco_queue = xQueueCreate(MCS_RECO_QUEUE_SIZE, sizeof(mcs_reco_msg_t));
+    if (s_mcs_reco_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create recommendation queue");
+        abort();
+    }
+
+    if (xTaskCreate(mcs_recommendation_task,
+                    "mcs_reco_tx",
+                    MCS_RECO_TASK_STACK,
+                    NULL,
+                    MCS_RECO_TASK_PRIO,
+                    NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create recommendation task");
+        vQueueDelete(s_mcs_reco_queue);
+        s_mcs_reco_queue = NULL;
+        abort();
+    }
+}
+#endif
 
 static wifi_second_chan_t get_secondary_channel_for_ht40(int primary_channel)
 {
@@ -232,6 +501,33 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 #endif
 
     uint32_t rx_id = *(uint32_t *)(info->payload + 15);
+
+#if CONFIG_MCS_RECOMMENDATION_ENABLED
+    if ((s_mcs_data_pkt_count % CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS) == 0) {
+        int8_t snr = (int8_t)(rx_ctrl->rssi - rx_ctrl->noise_floor);
+        uint8_t recommended_mcs = recommend_mcs_from_rssi(rx_ctrl->rssi);
+        uint8_t confidence = 100;
+    #if CONFIG_MCS_RECOMMENDATION_USE_MODEL
+        float state[REWARD_MODEL_STATE_DIM] = {0};
+        build_model_state(info, rx_ctrl, fft_gain, agc_gain, state);
+        recommended_mcs = recommend_mcs_with_model(state, &confidence);
+    #endif
+        mcs_reco_msg_t reco = {
+            .magic = MCS_RECO_MAGIC,
+            .version = MCS_RECO_VERSION,
+            .recommended_mcs = recommended_mcs,
+            .confidence = confidence,
+            .seq = rx_id,
+            .rssi = rx_ctrl->rssi,
+            .snr = snr,
+            .reserved = {0, 0},
+        };
+        if (s_mcs_reco_queue == NULL || xQueueSend(s_mcs_reco_queue, &reco, 0) != pdTRUE) {
+            s_mcs_reco_drop_count++;
+        }
+    }
+    s_mcs_data_pkt_count++;
+#endif
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
     uint32_t rate_for_csv;
 #if CONFIG_SOC_WIFI_HE_SUPPORT
@@ -368,6 +664,10 @@ void app_main()
     memcpy(peer.peer_addr, CONFIG_CSI_SEND_MAC, sizeof(peer.peer_addr));
 
     wifi_esp_now_init(peer);
+
+#if CONFIG_MCS_RECOMMENDATION_ENABLED
+    mcs_recommendation_init();
+#endif
 
     wifi_csi_init();
 }

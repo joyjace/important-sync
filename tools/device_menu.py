@@ -22,6 +22,18 @@ RATE_CHOICES = [
     "WIFI_PHY_RATE_MCS7_LGI",
 ]
 
+LIVE_MCS_ALGO_CHOICES = [
+    "MINSTREL_LIKE - sender ACK EWMA + probing",
+    "CUSTOM_POLICY - receiver recommendations only",
+]
+
+DEPRECATED_SENDER_KEYS = (
+    "custom_reward_throughput_weight",
+    "custom_reward_delay_weight",
+    "custom_reward_loss_weight",
+    "custom_reward_exploration_weight",
+)
+
 DEFAULT_PROFILE = {
     "sender": {
         "channel": 11,
@@ -33,6 +45,19 @@ DEFAULT_PROFILE = {
         "rate_switch_packet_count": 1000,
         "payload_len": 128,
         "tx_power": 84,
+        "live_mcs_selection_enabled": 1,
+        "live_mcs_algo": 0,
+        "live_mcs_min_index": 0,
+        "live_mcs_max_index": 7,
+        "minstrel_update_every_pkts": 20,
+        "minstrel_probe_every_pkts": 10,
+        "minstrel_ewma_alpha_num": 1,
+        "minstrel_ewma_alpha_den": 4,
+        "custom_policy_default_mcs": 0,
+        "live_mcs_decision_log_enabled": 1,
+        "remote_mcs_recommendation_enabled": 1,
+        "remote_mcs_min_confidence": 0,
+        "remote_mcs_max_age_ms": 300,
     },
     "receiver": {
         "channel": 11,
@@ -102,11 +127,25 @@ def load_profile() -> dict:
         if section in profile and isinstance(profile[section], dict):
             merged[section].update(profile[section])
 
+    for key in DEPRECATED_SENDER_KEYS:
+        merged["sender"].pop(key, None)
+
     return merged
 
 
 def save_profile(profile: dict) -> None:
     PROFILE_PATH.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+
+
+def validate_sender_profile(sender: dict) -> None:
+    if sender["live_mcs_min_index"] > sender["live_mcs_max_index"]:
+        sender["live_mcs_min_index"], sender["live_mcs_max_index"] = (
+            sender["live_mcs_max_index"],
+            sender["live_mcs_min_index"],
+        )
+
+    if sender["minstrel_ewma_alpha_num"] > sender["minstrel_ewma_alpha_den"]:
+        sender["minstrel_ewma_alpha_num"] = sender["minstrel_ewma_alpha_den"]
 
 
 def apply_profile_to_sources(profile: dict) -> None:
@@ -117,6 +156,8 @@ def apply_profile_to_sources(profile: dict) -> None:
     receiver = profile["receiver"]
     shared = profile["shared"]
 
+    validate_sender_profile(sender)
+
     sender_text = replace_define(sender_text, "CONFIG_LESS_INTERFERENCE_CHANNEL", str(sender["channel"]))
     sender_text = replace_define(sender_text, "CONFIG_ESP_NOW_RATE", sender["esp_now_rate"])
     sender_text = replace_define(sender_text, "CONFIG_SEND_FREQUENCY", str(sender["send_frequency"]))
@@ -126,6 +167,19 @@ def apply_profile_to_sources(profile: dict) -> None:
     sender_text = replace_define(sender_text, "CONFIG_RATE_SWITCH_PACKET_COUNT", str(sender["rate_switch_packet_count"]))
     sender_text = replace_define(sender_text, "CONFIG_ESP_NOW_PAYLOAD_LEN", str(sender["payload_len"]))
     sender_text = replace_define(sender_text, "CONFIG_WIFI_TX_POWER", str(sender["tx_power"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_LIVE_MCS_SELECTION_ENABLED", str(sender["live_mcs_selection_enabled"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_LIVE_MCS_ALGO", str(sender["live_mcs_algo"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_LIVE_MCS_MIN_INDEX", str(sender["live_mcs_min_index"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_LIVE_MCS_MAX_INDEX", str(sender["live_mcs_max_index"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_MINSTREL_UPDATE_EVERY_PKTS", str(sender["minstrel_update_every_pkts"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_MINSTREL_PROBE_EVERY_PKTS", str(sender["minstrel_probe_every_pkts"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_MINSTREL_EWMA_ALPHA_NUM", str(sender["minstrel_ewma_alpha_num"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_MINSTREL_EWMA_ALPHA_DEN", str(sender["minstrel_ewma_alpha_den"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_CUSTOM_POLICY_DEFAULT_MCS", str(sender["custom_policy_default_mcs"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_LIVE_MCS_DECISION_LOG_ENABLED", str(sender["live_mcs_decision_log_enabled"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_REMOTE_MCS_RECOMMENDATION_ENABLED", str(sender["remote_mcs_recommendation_enabled"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_REMOTE_MCS_MIN_CONFIDENCE", str(sender["remote_mcs_min_confidence"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_REMOTE_MCS_MAX_AGE_MS", str(sender["remote_mcs_max_age_ms"]))
     sender_text = replace_mac_array(sender_text, "CONFIG_CSI_SEND_MAC", shared["sender_mac"])
     sender_text = replace_mac_array(sender_text, "CONFIG_CSI_RECV_MAC", shared["receiver_mac"])
 
@@ -205,6 +259,18 @@ def ask_choice(prompt: str, choices: list[str], default: str) -> str:
         print("Invalid selection.")
 
 
+def live_mcs_algo_label(value: int) -> str:
+    if 0 <= value < len(LIVE_MCS_ALGO_CHOICES):
+        return LIVE_MCS_ALGO_CHOICES[value]
+    return str(value)
+
+
+def ask_live_mcs_algo(default: int) -> int:
+    default_index = default if 0 <= default < len(LIVE_MCS_ALGO_CHOICES) else 0
+    selected = ask_choice("Live MCS algorithm", LIVE_MCS_ALGO_CHOICES, LIVE_MCS_ALGO_CHOICES[default_index])
+    return LIVE_MCS_ALGO_CHOICES.index(selected)
+
+
 def ask_mac(prompt: str, default: str) -> str:
     while True:
         raw = input(f"{prompt} [{default}]: ").strip()
@@ -242,6 +308,80 @@ def edit_sender_full(profile: dict) -> None:
     sender["rate_switch_packet_count"] = ask_int("Rate switch packet count", sender["rate_switch_packet_count"], 1, 1000000)
     sender["payload_len"] = ask_int("ESP-NOW payload length", sender["payload_len"], 4, 250)
     sender["tx_power"] = ask_int("TX power (0.25 dBm units, range 8-84)", sender["tx_power"], 8, 84)
+    sender["live_mcs_selection_enabled"] = 1 if ask_yes_no("Enable live MCS selection", sender["live_mcs_selection_enabled"] == 1) else 0
+    sender["live_mcs_algo"] = ask_live_mcs_algo(sender["live_mcs_algo"])
+    sender["live_mcs_min_index"] = ask_int("Live MCS min index", sender["live_mcs_min_index"], 0, 7)
+    sender["live_mcs_max_index"] = ask_int("Live MCS max index", sender["live_mcs_max_index"], 0, 7)
+    sender["minstrel_update_every_pkts"] = ask_int("Minstrel update every packets", sender["minstrel_update_every_pkts"], 1, 1000000)
+    sender["minstrel_probe_every_pkts"] = ask_int("Minstrel probe every packets", sender["minstrel_probe_every_pkts"], 1, 1000000)
+    sender["minstrel_ewma_alpha_den"] = ask_int("EWMA alpha denominator", sender["minstrel_ewma_alpha_den"], 1, 64)
+    sender["minstrel_ewma_alpha_num"] = ask_int("EWMA alpha numerator", sender["minstrel_ewma_alpha_num"], 1, sender["minstrel_ewma_alpha_den"])
+    sender["custom_policy_default_mcs"] = ask_int("Custom policy initial MCS", sender["custom_policy_default_mcs"], 0, 7)
+    sender["live_mcs_decision_log_enabled"] = 1 if ask_yes_no("Enable ACK_POLICY decision logs", sender["live_mcs_decision_log_enabled"] == 1) else 0
+    sender["remote_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver recommendations", sender["remote_mcs_recommendation_enabled"] == 1) else 0
+    sender["remote_mcs_min_confidence"] = ask_int("Remote recommendation min confidence", sender["remote_mcs_min_confidence"], 0, 100)
+    sender["remote_mcs_max_age_ms"] = ask_int("Remote recommendation max age ms", sender["remote_mcs_max_age_ms"], 1, 5000)
+    validate_sender_profile(sender)
+
+
+def edit_sender_live_mcs(profile: dict) -> None:
+    sender = profile["sender"]
+    while True:
+        algo_name = live_mcs_algo_label(sender["live_mcs_algo"])
+        print("\nEdit sender live MCS policy")
+        print(f"1. live_mcs_selection_enabled: {sender['live_mcs_selection_enabled']}")
+        print(f"2. live_mcs_algo: {sender['live_mcs_algo']} ({algo_name})")
+        print(f"3. live_mcs_min_index: {sender['live_mcs_min_index']}")
+        print(f"4. live_mcs_max_index: {sender['live_mcs_max_index']}")
+        print(f"5. minstrel_update_every_pkts: {sender['minstrel_update_every_pkts']}")
+        print(f"6. minstrel_probe_every_pkts: {sender['minstrel_probe_every_pkts']}")
+        print(f"7. minstrel_ewma_alpha_den: {sender['minstrel_ewma_alpha_den']}")
+        print(f"8. minstrel_ewma_alpha_num: {sender['minstrel_ewma_alpha_num']}")
+        print(f"9. custom_policy_initial_mcs: {sender['custom_policy_default_mcs']}")
+        print(f"10. live_mcs_decision_log_enabled: {sender['live_mcs_decision_log_enabled']}")
+        print(f"11. remote_mcs_recommendation_enabled: {sender['remote_mcs_recommendation_enabled']}")
+        print(f"12. remote_mcs_min_confidence: {sender['remote_mcs_min_confidence']}")
+        print(f"13. remote_mcs_max_age_ms: {sender['remote_mcs_max_age_ms']}")
+        print("14. Edit all sender fields")
+        print("0. Back")
+        choice = input("Select live MCS field: ").strip()
+
+        if choice == "1":
+            sender["live_mcs_selection_enabled"] = 1 if ask_yes_no("Enable live MCS selection", sender["live_mcs_selection_enabled"] == 1) else 0
+        elif choice == "2":
+            sender["live_mcs_algo"] = ask_live_mcs_algo(sender["live_mcs_algo"])
+        elif choice == "3":
+            sender["live_mcs_min_index"] = ask_int("Live MCS min index", sender["live_mcs_min_index"], 0, 7)
+        elif choice == "4":
+            sender["live_mcs_max_index"] = ask_int("Live MCS max index", sender["live_mcs_max_index"], 0, 7)
+        elif choice == "5":
+            sender["minstrel_update_every_pkts"] = ask_int("Minstrel update every packets", sender["minstrel_update_every_pkts"], 1, 1000000)
+        elif choice == "6":
+            sender["minstrel_probe_every_pkts"] = ask_int("Minstrel probe every packets", sender["minstrel_probe_every_pkts"], 1, 1000000)
+        elif choice == "7":
+            sender["minstrel_ewma_alpha_den"] = ask_int("EWMA alpha denominator", sender["minstrel_ewma_alpha_den"], 1, 64)
+        elif choice == "8":
+            sender["minstrel_ewma_alpha_num"] = ask_int("EWMA alpha numerator", sender["minstrel_ewma_alpha_num"], 1, sender["minstrel_ewma_alpha_den"])
+        elif choice == "9":
+            sender["custom_policy_default_mcs"] = ask_int("Custom policy initial MCS", sender["custom_policy_default_mcs"], 0, 7)
+        elif choice == "10":
+            sender["live_mcs_decision_log_enabled"] = 1 if ask_yes_no("Enable ACK_POLICY decision logs", sender["live_mcs_decision_log_enabled"] == 1) else 0
+        elif choice == "11":
+            sender["remote_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver recommendations", sender["remote_mcs_recommendation_enabled"] == 1) else 0
+        elif choice == "12":
+            sender["remote_mcs_min_confidence"] = ask_int("Remote recommendation min confidence", sender["remote_mcs_min_confidence"], 0, 100)
+        elif choice == "13":
+            sender["remote_mcs_max_age_ms"] = ask_int("Remote recommendation max age ms", sender["remote_mcs_max_age_ms"], 1, 5000)
+        elif choice == "14":
+            edit_sender_full(profile)
+        elif choice == "0":
+            return
+        else:
+            print("Invalid option.")
+            continue
+
+        validate_sender_profile(sender)
+        save_profile(profile)
 
 
 def edit_sender(profile: dict) -> None:
@@ -257,7 +397,11 @@ def edit_sender(profile: dict) -> None:
         print(f"7. rate_switch_packet_count: {sender['rate_switch_packet_count']}")
         print(f"8. payload_len: {sender['payload_len']}")
         print(f"9. tx_power: {sender['tx_power']} (0.25 dBm units, {sender['tx_power'] * 0.25:.1f} dBm nominal)")
-        print("10. Edit all sender fields")
+        print(f"10. live_mcs_selection_enabled: {sender['live_mcs_selection_enabled']}")
+        algo_name = live_mcs_algo_label(sender["live_mcs_algo"])
+        print(f"11. live_mcs_algo: {sender['live_mcs_algo']} ({algo_name})")
+        print("12. Edit live MCS policy fields")
+        print("13. Edit all sender fields")
         print("0. Back")
         choice = input("Select sender field: ").strip()
 
@@ -289,6 +433,14 @@ def edit_sender(profile: dict) -> None:
             sender["tx_power"] = ask_int("TX power (0.25 dBm units, range 8-84)", sender["tx_power"], 8, 84)
             save_profile(profile)
         elif choice == "10":
+            sender["live_mcs_selection_enabled"] = 1 if ask_yes_no("Enable live MCS selection", sender["live_mcs_selection_enabled"] == 1) else 0
+            save_profile(profile)
+        elif choice == "11":
+            sender["live_mcs_algo"] = ask_live_mcs_algo(sender["live_mcs_algo"])
+            save_profile(profile)
+        elif choice == "12":
+            edit_sender_live_mcs(profile)
+        elif choice == "13":
             edit_sender_full(profile)
             save_profile(profile)
         elif choice == "0":

@@ -700,6 +700,10 @@ def print_mcs_change(record):
     )
 
 
+def handle_mcs_change(record):
+    set_current_mcs(record['new_mcs'], record.get('reason', ''), record['seq'])
+
+
 def infer_single_port_mode(baudrate):
     # Typical setup: sender console at 115200, receiver CSI stream at 921600.
     # Allow auto mode to infer likely stream type from baudrate.
@@ -828,7 +832,7 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
 
             if record['type'] == 'MCS_CHANGE':
                 current_mcs_index = record['new_mcs']
-                set_current_mcs(record['new_mcs'], record.get('reason', ''), record['seq'])
+                handle_mcs_change(record)
                 print_mcs_change(record)
                 continue
 
@@ -1072,7 +1076,7 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
 
                     if ack_record['type'] == 'MCS_CHANGE':
                         current_mcs_index = ack_record['new_mcs']
-                        set_current_mcs(ack_record['new_mcs'], ack_record.get('reason', ''), ack_record['seq'])
+                        handle_mcs_change(ack_record)
                         print_mcs_change(ack_record)
                         continue
 

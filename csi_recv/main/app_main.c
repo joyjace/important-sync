@@ -56,6 +56,7 @@
 #define CONFIG_MCS_RECOMMENDATION_ENABLED 0 // 1 = enable MCS recommendation feature, 0 = disable
 #define CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS 20  // 1=every packet, N=every N data packets
 #define CONFIG_MCS_RECOMMENDATION_USE_MODEL 1  // 1=use ML model, 0=use RSSI-based heuristic
+#define CONFIG_IDENTICAL_TX_PAYLOAD         1  // Match csi_send: 1 = payload carries no per-packet sequence
 /* Bitrate options (choose one for `CONFIG_ESP_NOW_RATE` - type `wifi_phy_rate_t`):                                                                             
  *
  * Legacy (802.11b/g):
@@ -500,7 +501,11 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     ESP_LOGD(TAG, "compensate_gain %f, agc_gain %d, fft_gain %d", compensate_gain, agc_gain, fft_gain);
 #endif
 
+#if CONFIG_IDENTICAL_TX_PAYLOAD
+    uint32_t rx_id = (uint32_t)s_count;
+#else
     uint32_t rx_id = *(uint32_t *)(info->payload + 15);
+#endif
 
 #if CONFIG_MCS_RECOMMENDATION_ENABLED
     if ((s_mcs_data_pkt_count % CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS) == 0) {

@@ -133,6 +133,7 @@
 #define CONFIG_REMOTE_MCS_MIN_CONFIDENCE CONFIG_CSI_REMOTE_MCS_MIN_CONFIDENCE
 #define CONFIG_REMOTE_MCS_MAX_AGE_MS CONFIG_CSI_REMOTE_MCS_MAX_AGE_MS
 #define CONFIG_ESP_NOW_PAYLOAD_LEN          128 // Bytes per ESP-NOW data frame (>= 4 to keep sequence ID) (16, 64, 128)
+#define CONFIG_IDENTICAL_TX_PAYLOAD         1   // 1 = send the same ESP-NOW body every packet; seq stays only in local ACK logs
 // TX power in units of 0.25 dBm. Range [8, 84] => [2 dBm, 20 dBm].
 // Mapping: {set value range, actual value} = {{[8,19],8},{[20,27],20},{[28,33],28},{[34,43],34},{[44,51],44},{[52,55],52},{[56,59],56},{[60,65],60},{[66,71],66},{[72,79],72},{[80,84],80}}
 #define CONFIG_WIFI_TX_POWER                8
@@ -141,7 +142,7 @@
 #error "CONFIG_LESS_INTERFERENCE_CHANNEL must be in [1, 13] for 2.4 GHz"
 #endif
 
-#if CONFIG_ESP_NOW_PAYLOAD_LEN < 4
+#if !CONFIG_IDENTICAL_TX_PAYLOAD && CONFIG_ESP_NOW_PAYLOAD_LEN < 4
 #error "CONFIG_ESP_NOW_PAYLOAD_LEN must be at least 4 bytes"
 #endif
 
@@ -1042,7 +1043,11 @@ static void esp_now_set_peer_rate(const uint8_t *peer_addr, wifi_phy_rate_t rate
 
 static esp_err_t esp_now_send_with_seq(const uint8_t *peer_addr, uint32_t seq)
 {
+#if CONFIG_IDENTICAL_TX_PAYLOAD
+    (void)seq;
+#else
     memcpy(s_tx_payload, &seq, sizeof(seq));
+#endif
     return esp_now_send(peer_addr, s_tx_payload, sizeof(s_tx_payload));
 }
 

@@ -13,15 +13,19 @@
 */
 
 #include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <float.h>
 
 #include "nvs_flash.h"
 
 #include "esp_mac.h"
 #include "rom/ets_sys.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_now.h"
@@ -30,6 +34,14 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "generated_reward_model_v2.h"
+
+#ifndef CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED
+#define CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED 0
+#endif
+
+#if CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED
+#include "generated_dqn_model.h"
+#endif
 
 /* ESP-IDF 6.0+ renamed WIFI_BW_HT20/HT40 to WIFI_BW20/BW40. */
 #ifndef WIFI_BW_HT20
@@ -53,10 +65,25 @@
 #define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT20
 #define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS0_LGI
 #define CONFIG_MINIMIZE_CONSOLE_OUTPUT   1  // 1 = reduce non-CSI logs on UART, 0 = default logging
-#define CONFIG_MCS_RECOMMENDATION_ENABLED 0 // 1 = enable MCS recommendation feature, 0 = disable
+#define CONFIG_MCS_RECOMMENDATION_ENABLED 1 // 1 = enable MCS recommendation feature, 0 = disable
 #define CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS 20  // 1=every packet, N=every N data packets
 #define CONFIG_MCS_RECOMMENDATION_USE_MODEL 1  // 1=use ML model, 0=use RSSI-based heuristic
-#define CONFIG_IDENTICAL_TX_PAYLOAD         1  // Match csi_send: 1 = payload carries no per-packet sequence
+#ifndef CONFIG_CSI_DQN_RECOMMENDATION_EVERY_N_PACKETS
+#define CONFIG_CSI_DQN_RECOMMENDATION_EVERY_N_PACKETS 1
+#endif
+#ifndef CONFIG_CSI_DQN_WARMUP_PACKETS
+#define CONFIG_CSI_DQN_WARMUP_PACKETS 100
+#endif
+#ifndef CONFIG_CSI_DQN_CONTROL_INTERVAL_MS
+#define CONFIG_CSI_DQN_CONTROL_INTERVAL_MS 5
+#endif
+#ifndef CONFIG_CSI_DQN_STALE_MAX_AGE_PACKETS
+#define CONFIG_CSI_DQN_STALE_MAX_AGE_PACKETS 64
+#endif
+#ifndef CONFIG_CSI_DQN_LOG_ENABLED
+#define CONFIG_CSI_DQN_LOG_ENABLED 1
+#endif
+#define CONFIG_IDENTICAL_TX_PAYLOAD         0  // Match csi_send: 1 = payload carries no per-packet sequence
 /* Bitrate options (choose one for `CONFIG_ESP_NOW_RATE` - type `wifi_phy_rate_t`):                                                                             
  *
  * Legacy (802.11b/g):
@@ -90,6 +117,21 @@
 #endif
 #endif
 
+#if CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED
+#if CONFIG_CSI_DQN_RECOMMENDATION_EVERY_N_PACKETS <= 0
+#error "CONFIG_CSI_DQN_RECOMMENDATION_EVERY_N_PACKETS must be > 0"
+#endif
+#if CONFIG_CSI_DQN_CONTROL_INTERVAL_MS <= 0
+#error "CONFIG_CSI_DQN_CONTROL_INTERVAL_MS must be > 0"
+#endif
+#if CONFIG_CSI_DQN_STALE_MAX_AGE_PACKETS <= 0
+#error "CONFIG_CSI_DQN_STALE_MAX_AGE_PACKETS must be > 0"
+#endif
+#if CONFIG_MCS_RECOMMENDATION_ENABLED
+#error "Legacy/Custom and DQN recommendations cannot both be enabled on csi_recv"
+#endif
+#endif
+
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61
 #define CSI_FORCE_LLTF                      0
 #endif
@@ -108,6 +150,8 @@ static const char *TAG = "csi_recv";
 
 #define MCS_RECO_MAGIC 0xA5
 #define MCS_RECO_VERSION 1
+#define DQN_RECO_MAGIC 0xD7
+#define DQN_RECO_VERSION 1
 
 typedef struct __attribute__((packed)) {
     uint8_t magic;
@@ -120,6 +164,19 @@ typedef struct __attribute__((packed)) {
     uint8_t reserved[2];
 } mcs_reco_msg_t;
 
+typedef struct __attribute__((packed)) {
+    uint8_t magic;
+    uint8_t version;
+    uint8_t recommended_mcs;
+    uint8_t confidence;
+    uint32_t seq;
+    int8_t rssi;
+    int8_t snr;
+    uint16_t margin_milli;
+} dqn_reco_msg_t;
+
+_Static_assert(sizeof(dqn_reco_msg_t) == 12, "DQN feedback protocol size changed");
+
 #if CONFIG_MCS_RECOMMENDATION_ENABLED
 #define MCS_RECO_QUEUE_SIZE 128
 #define MCS_RECO_TASK_STACK 3072
@@ -128,6 +185,38 @@ typedef struct __attribute__((packed)) {
 static QueueHandle_t s_mcs_reco_queue = NULL;
 static volatile uint32_t s_mcs_reco_drop_count = 0;
 static uint32_t s_mcs_data_pkt_count = 0;
+
+#ifndef REWARD_MODEL_CONTEXT_IS_STATE_AGE_PACKETS
+#define REWARD_MODEL_CONTEXT_IS_STATE_AGE_PACKETS 0
+#endif
+#ifndef REWARD_MODEL_INCLUDES_STATE_MCS
+#define REWARD_MODEL_INCLUDES_STATE_MCS 0
+#endif
+#ifndef REWARD_MODEL_STATE_SCHEMA_LINK_V2
+#define REWARD_MODEL_STATE_SCHEMA_LINK_V2 0
+#endif
+#ifndef REWARD_MODEL_STATE_SCHEMA_LINK_V3
+#define REWARD_MODEL_STATE_SCHEMA_LINK_V3 0
+#endif
+#ifndef REWARD_MODEL_STATE_SCHEMA_LINK_V4
+#define REWARD_MODEL_STATE_SCHEMA_LINK_V4 0
+#endif
+#ifndef REWARD_MODEL_STATE_SCHEMA_LINK_V5
+#define REWARD_MODEL_STATE_SCHEMA_LINK_V5 0
+#endif
+
+#if REWARD_MODEL_INCLUDES_STATE_MCS
+#error "Receiver reward-model path does not support source/current-MCS conditioned reward models"
+#endif
+#if REWARD_MODEL_STATE_SCHEMA_LINK_V5 && !REWARD_MODEL_CONTEXT_IS_STATE_AGE_PACKETS
+#error "link_v5 reward model requires state_age_packets context"
+#endif
+#if REWARD_MODEL_STATE_SCHEMA_LINK_V5 && REWARD_MODEL_STATE_DIM != 132
+#error "link_v5 reward model without state_mcs requires REWARD_MODEL_STATE_DIM=132"
+#endif
+#if (REWARD_MODEL_STATE_SCHEMA_LINK_V2 || REWARD_MODEL_STATE_SCHEMA_LINK_V3 || REWARD_MODEL_STATE_SCHEMA_LINK_V4)
+#error "Receiver reward-model path currently supports legacy_v1 or link_v5 headers only"
+#endif
 
 static float quantile_from_sorted(const float *sorted, int n, float q)
 {
@@ -165,6 +254,7 @@ static void build_model_state(const wifi_csi_info_t *info,
                               const wifi_pkt_rx_ctrl_t *rx_ctrl,
                               int8_t fft_gain,
                               uint8_t agc_gain,
+                              float compensate_gain,
                               float state[REWARD_MODEL_STATE_DIM])
 {
     memset(state, 0, sizeof(float) * REWARD_MODEL_STATE_DIM);
@@ -176,8 +266,8 @@ static void build_model_state(const wifi_csi_info_t *info,
     }
 
     for (int i = 0; i < amp_count; ++i) {
-        float i_val = (float)((int8_t)info->buf[2 * i]);
-        float q_val = (float)((int8_t)info->buf[2 * i + 1]);
+        float i_val = (float)((int16_t)(compensate_gain * (float)info->buf[2 * i]));
+        float q_val = (float)((int16_t)(compensate_gain * (float)info->buf[2 * i + 1]));
         float amp = sqrtf(i_val * i_val + q_val * q_val);
         amps[i] = amp;
         state[i] = amp;
@@ -220,11 +310,23 @@ static void build_model_state(const wifi_csi_info_t *info,
     state[120] = (float)agc_gain;
     state[121] = (float)rx_ctrl->channel;
     state[122] = (float)rx_ctrl->sig_len;
+#if REWARD_MODEL_STATE_SCHEMA_LINK_V5
+    state[123] = log1pf(1.0f);
+    state[124] = log1pf(1.0f);
+    state[125] = log1pf(0.0f);
+    state[126] = 0.0f;
+    state[127] = iq_mean;
+    state[128] = iq_std;
+    state[129] = iq_p10;
+    state[130] = iq_p50;
+    state[131] = iq_p90;
+#else
     state[123] = iq_mean;
     state[124] = iq_std;
     state[125] = iq_p10;
     state[126] = iq_p50;
     state[127] = iq_p90;
+#endif
 }
 
 static float reward_model_score_action(const float state[REWARD_MODEL_STATE_DIM], uint8_t action)
@@ -356,6 +458,490 @@ static void mcs_recommendation_init(void)
         ESP_LOGE(TAG, "Failed to create recommendation task");
         vQueueDelete(s_mcs_reco_queue);
         s_mcs_reco_queue = NULL;
+        abort();
+    }
+}
+#endif
+
+#if CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED
+#if DQN_MODEL_ACTION_DIM != 8
+#error "DQN firmware pipeline requires an 8-output model"
+#endif
+#if (CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61) && CSI_FORCE_LLTF
+#error "DQN firmware pipeline does not support packed force-LLTF CSI"
+#endif
+#if !DQN_MODEL_CONTEXT_IS_STATE_AGE_PACKETS
+#error "DQN firmware pipeline requires causal state age"
+#endif
+#ifndef DQN_MODEL_STATE_SCHEMA_LINK_V2
+#define DQN_MODEL_STATE_SCHEMA_LINK_V2 0
+#endif
+#ifndef DQN_MODEL_STATE_SCHEMA_LINK_V3
+#define DQN_MODEL_STATE_SCHEMA_LINK_V3 0
+#endif
+#ifndef DQN_MODEL_STATE_SCHEMA_LINK_V4
+#define DQN_MODEL_STATE_SCHEMA_LINK_V4 0
+#endif
+#ifndef DQN_MODEL_STATE_SCHEMA_LINK_V5
+#define DQN_MODEL_STATE_SCHEMA_LINK_V5 0
+#endif
+
+#if (DQN_MODEL_STATE_SCHEMA_LINK_V3 || DQN_MODEL_STATE_SCHEMA_LINK_V4 || DQN_MODEL_STATE_SCHEMA_LINK_V5) && !DQN_MODEL_STATE_SCHEMA_LINK_V2
+/*
+ * link_v3/link_v4/link_v5 are extensions of link_v2. Older generated
+ * headers only defined LINK_V2, so keep the check explicit for schema-aware
+ * exports.
+ */
+#endif
+
+#if DQN_MODEL_STATE_SCHEMA_LINK_V5 && DQN_MODEL_INCLUDES_STATE_MCS && DQN_MODEL_STATE_DIM != 140
+#error "link_v5 DQN with state_mcs requires DQN_MODEL_STATE_DIM=140"
+#endif
+#if DQN_MODEL_STATE_SCHEMA_LINK_V5 && !DQN_MODEL_INCLUDES_STATE_MCS && DQN_MODEL_STATE_DIM != 132
+#error "link_v5 DQN without state_mcs requires DQN_MODEL_STATE_DIM=132"
+#endif
+#if DQN_MODEL_STATE_SCHEMA_LINK_V4 && DQN_MODEL_INCLUDES_STATE_MCS && DQN_MODEL_STATE_DIM != 143
+#error "link_v4 DQN with state_mcs requires DQN_MODEL_STATE_DIM=143"
+#endif
+#if DQN_MODEL_STATE_SCHEMA_LINK_V4 && !DQN_MODEL_INCLUDES_STATE_MCS && DQN_MODEL_STATE_DIM != 135
+#error "link_v4 DQN without state_mcs requires DQN_MODEL_STATE_DIM=135"
+#endif
+
+#define DQN_CSI_VALUE_COUNT 234
+#define DQN_CSI_QUEUE_SIZE 8
+#define DQN_INFERENCE_TASK_STACK 6144
+#define DQN_INFERENCE_TASK_PRIO (tskIDLE_PRIORITY + 1)
+
+typedef struct {
+    uint32_t seq;
+    int8_t rssi;
+    int8_t noise_floor;
+    int8_t fft_gain;
+    uint8_t agc_gain;
+    uint8_t channel;
+    uint16_t sig_len;
+    uint8_t state_mcs_index;
+    uint16_t state_age_packets;
+    uint16_t state_packet_gap;
+    uint16_t state_missing_packets;
+    uint8_t state_is_stale;
+    uint8_t state_prev_delivered;
+    uint16_t state_consecutive_losses;
+    float state_recent_loss_rate_8;
+    uint16_t csi_value_count;
+    int16_t csi_values[DQN_CSI_VALUE_COUNT];
+} dqn_csi_job_t;
+
+static QueueHandle_t s_dqn_csi_queue = NULL;
+static volatile uint32_t s_dqn_csi_drop_count = 0;
+static uint32_t s_dqn_data_pkt_count = 0;
+
+static uint8_t dqn_clamp_mcs_index(uint32_t value)
+{
+    return (value <= 7U) ? (uint8_t)value : 0U;
+}
+
+static uint8_t dqn_rx_mcs_index_from_ctrl(const wifi_pkt_rx_ctrl_t *rx_ctrl)
+{
+#if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
+#if CONFIG_SOC_WIFI_HE_SUPPORT
+    uint32_t rate_value = (rx_ctrl->cur_bb_format == RX_BB_FORMAT_HT)
+                          ? (uint32_t)(rx_ctrl->he_siga1 & 0x7F)
+                          : (uint32_t)rx_ctrl->rate;
+#else
+    uint32_t rate_value = (rx_ctrl->sig_mode == 1) ? (uint32_t)rx_ctrl->mcs : (uint32_t)rx_ctrl->rate;
+#endif
+    return dqn_clamp_mcs_index(rate_value);
+#else
+    if (rx_ctrl->sig_mode == 1) {
+        return dqn_clamp_mcs_index((uint32_t)rx_ctrl->mcs);
+    }
+    return 0U;
+#endif
+}
+
+static void dqn_sort_small_array(float *values, int count)
+{
+    for (int i = 1; i < count; ++i) {
+        float key = values[i];
+        int j = i - 1;
+        while (j >= 0 && values[j] > key) {
+            values[j + 1] = values[j];
+            --j;
+        }
+        values[j + 1] = key;
+    }
+}
+
+static float dqn_quantile_from_sorted(const float *values, int count, float quantile)
+{
+    if (count <= 0) {
+        return 0.0f;
+    }
+    if (count == 1) {
+        return values[0];
+    }
+    float position = quantile * (float)(count - 1);
+    int lower = (int)position;
+    int upper = lower + 1;
+    if (upper >= count) {
+        upper = count - 1;
+    }
+    float fraction = position - (float)lower;
+    return values[lower] * (1.0f - fraction) + values[upper] * fraction;
+}
+
+static float dqn_log1p_count_u16(uint16_t value)
+{
+    return log1pf((float)value);
+}
+
+static void build_dqn_state(const dqn_csi_job_t *job,
+                            float state[DQN_MODEL_STATE_DIM])
+{
+    memset(state, 0, sizeof(float) * DQN_MODEL_STATE_DIM);
+
+    int amplitude_count = (int)job->csi_value_count / 2;
+    if (amplitude_count > 117) {
+        amplitude_count = 117;
+    }
+
+    float amplitudes[117] = {0};
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    for (int i = 0; i < amplitude_count; ++i) {
+        float i_value = (float)job->csi_values[2 * i];
+        float q_value = (float)job->csi_values[2 * i + 1];
+        float amplitude = sqrtf(i_value * i_value + q_value * q_value);
+        amplitudes[i] = amplitude;
+        state[i] = amplitude;
+        sum += amplitude;
+        sum_sq += amplitude * amplitude;
+    }
+
+    float iq_mean = 0.0f;
+    float iq_std = 0.0f;
+    float iq_p10 = 0.0f;
+    float iq_p50 = 0.0f;
+    float iq_p90 = 0.0f;
+    if (amplitude_count > 0) {
+        iq_mean = sum / (float)amplitude_count;
+        float variance = (sum_sq / (float)amplitude_count) - (iq_mean * iq_mean);
+        if (variance < 0.0f) {
+            variance = 0.0f;
+        }
+        iq_std = sqrtf(variance);
+        dqn_sort_small_array(amplitudes, amplitude_count);
+        iq_p10 = dqn_quantile_from_sorted(amplitudes, amplitude_count, 0.10f);
+        iq_p50 = dqn_quantile_from_sorted(amplitudes, amplitude_count, 0.50f);
+        iq_p90 = dqn_quantile_from_sorted(amplitudes, amplitude_count, 0.90f);
+    }
+
+#if DQN_MODEL_STATE_SCHEMA_LINK_V5
+    state[117] = (float)job->rssi;
+    state[118] = (float)((int)job->rssi - (int)job->noise_floor);
+    state[119] = (float)job->fft_gain;
+    state[120] = (float)job->agc_gain;
+    state[121] = (float)job->channel;
+    state[122] = (float)job->sig_len;
+    state[123] = dqn_log1p_count_u16(job->state_age_packets);
+    state[124] = dqn_log1p_count_u16(job->state_packet_gap);
+    state[125] = dqn_log1p_count_u16(job->state_missing_packets);
+    state[126] = (float)job->state_is_stale;
+    state[127] = iq_mean;
+    state[128] = iq_std;
+    state[129] = iq_p10;
+    state[130] = iq_p50;
+    state[131] = iq_p90;
+#if DQN_MODEL_INCLUDES_STATE_MCS
+    uint8_t state_mcs = job->state_mcs_index <= 7U ? job->state_mcs_index : 0U;
+    if ((132 + state_mcs) < DQN_MODEL_STATE_DIM) {
+        state[132 + state_mcs] = 1.0f;
+    }
+#endif
+#elif DQN_MODEL_STATE_SCHEMA_LINK_V4
+    state[117] = (float)job->rssi;
+    state[118] = (float)((int)job->rssi - (int)job->noise_floor);
+    state[119] = (float)job->fft_gain;
+    state[120] = (float)job->agc_gain;
+    state[121] = (float)job->channel;
+    state[122] = (float)job->sig_len;
+    state[123] = dqn_log1p_count_u16(job->state_age_packets);
+    state[124] = dqn_log1p_count_u16(job->state_packet_gap);
+    state[125] = dqn_log1p_count_u16(job->state_missing_packets);
+    state[126] = (float)job->state_is_stale;
+    state[127] = iq_mean;
+    state[128] = iq_std;
+    state[129] = iq_p10;
+    state[130] = iq_p50;
+    state[131] = iq_p90;
+    state[132] = (float)job->state_prev_delivered;
+    state[133] = dqn_log1p_count_u16(job->state_consecutive_losses);
+    state[134] = job->state_recent_loss_rate_8;
+#if DQN_MODEL_INCLUDES_STATE_MCS
+    uint8_t state_mcs = job->state_mcs_index <= 7U ? job->state_mcs_index : 0U;
+    if ((135 + state_mcs) < DQN_MODEL_STATE_DIM) {
+        state[135 + state_mcs] = 1.0f;
+    }
+#endif
+#elif DQN_MODEL_STATE_SCHEMA_LINK_V3
+    state[117] = (float)job->rssi;
+    state[118] = (float)((int)job->rssi - (int)job->noise_floor);
+    state[119] = (float)job->fft_gain;
+    state[120] = (float)job->agc_gain;
+    state[121] = (float)job->channel;
+    state[122] = (float)job->sig_len;
+    state[123] = (float)job->state_age_packets;
+    state[124] = (float)job->state_packet_gap;
+    state[125] = (float)job->state_missing_packets;
+    state[126] = (float)job->state_is_stale;
+    state[127] = iq_mean;
+    state[128] = iq_std;
+    state[129] = iq_p10;
+    state[130] = iq_p50;
+    state[131] = iq_p90;
+    state[132] = (float)job->state_prev_delivered;
+    state[133] = (float)job->state_consecutive_losses;
+    state[134] = job->state_recent_loss_rate_8;
+#if DQN_MODEL_INCLUDES_STATE_MCS
+    uint8_t state_mcs = job->state_mcs_index <= 7U ? job->state_mcs_index : 0U;
+    if ((135 + state_mcs) < DQN_MODEL_STATE_DIM) {
+        state[135 + state_mcs] = 1.0f;
+    }
+#endif
+#elif DQN_MODEL_STATE_SCHEMA_LINK_V2
+    state[117] = (float)job->rssi;
+    state[118] = (float)((int)job->rssi - (int)job->noise_floor);
+    state[119] = (float)job->fft_gain;
+    state[120] = (float)job->agc_gain;
+    state[121] = (float)job->channel;
+    state[122] = (float)job->sig_len;
+    state[123] = (float)job->state_age_packets;
+    state[124] = (float)job->state_packet_gap;
+    state[125] = (float)job->state_missing_packets;
+    state[126] = (float)job->state_is_stale;
+    state[127] = iq_mean;
+    state[128] = iq_std;
+    state[129] = iq_p10;
+    state[130] = iq_p50;
+    state[131] = iq_p90;
+#if DQN_MODEL_INCLUDES_STATE_MCS
+    uint8_t state_mcs = job->state_mcs_index <= 7U ? job->state_mcs_index : 0U;
+    if ((132 + state_mcs) < DQN_MODEL_STATE_DIM) {
+        state[132 + state_mcs] = 1.0f;
+    }
+#endif
+#else
+    state[117] = (float)job->rssi;
+    state[118] = (float)((int)job->rssi - (int)job->noise_floor);
+    state[119] = (float)job->fft_gain;
+    state[120] = (float)job->agc_gain;
+    state[121] = (float)job->channel;
+    state[122] = (float)job->state_age_packets;
+    state[123] = iq_mean;
+    state[124] = iq_std;
+    state[125] = iq_p10;
+    state[126] = iq_p50;
+    state[127] = iq_p90;
+#if DQN_MODEL_INCLUDES_STATE_MCS
+    uint8_t state_mcs = job->state_mcs_index <= 7U ? job->state_mcs_index : 0U;
+    if ((128 + state_mcs) < DQN_MODEL_STATE_DIM) {
+        state[128 + state_mcs] = 1.0f;
+    }
+#endif
+#endif
+}
+
+static uint8_t dqn_predict_mcs(const float state[DQN_MODEL_STATE_DIM],
+                               float *best_q_out,
+                               float *second_q_out)
+{
+    float normalized[DQN_MODEL_STATE_DIM] = {0};
+    float hidden1[DQN_MODEL_HIDDEN_DIM] = {0};
+    float hidden2[DQN_MODEL_HIDDEN_DIM] = {0};
+
+    for (int i = 0; i < DQN_MODEL_STATE_DIM; ++i) {
+        normalized[i] = (state[i] - dqn_model_state_mean[i]) / dqn_model_state_std[i];
+    }
+
+    for (int output = 0; output < DQN_MODEL_HIDDEN_DIM; ++output) {
+        float sum = dqn_model_b1[output];
+        int row = output * DQN_MODEL_STATE_DIM;
+        for (int input = 0; input < DQN_MODEL_STATE_DIM; ++input) {
+            sum += dqn_model_w1[row + input] * normalized[input];
+        }
+        hidden1[output] = (sum > 0.0f) ? sum : 0.0f;
+    }
+
+    for (int output = 0; output < DQN_MODEL_HIDDEN_DIM; ++output) {
+        float sum = dqn_model_b2[output];
+        int row = output * DQN_MODEL_HIDDEN_DIM;
+        for (int input = 0; input < DQN_MODEL_HIDDEN_DIM; ++input) {
+            sum += dqn_model_w2[row + input] * hidden1[input];
+        }
+        hidden2[output] = (sum > 0.0f) ? sum : 0.0f;
+    }
+
+    uint8_t best_action = 0;
+    float best_q = -FLT_MAX;
+    float second_q = -FLT_MAX;
+    for (uint8_t action = 0; action < DQN_MODEL_ACTION_DIM; ++action) {
+        float q_value = dqn_model_b3[action];
+        int row = action * DQN_MODEL_HIDDEN_DIM;
+        for (int input = 0; input < DQN_MODEL_HIDDEN_DIM; ++input) {
+            q_value += dqn_model_w3[row + input] * hidden2[input];
+        }
+        if (q_value > best_q) {
+            second_q = best_q;
+            best_q = q_value;
+            best_action = action;
+        } else if (q_value > second_q) {
+            second_q = q_value;
+        }
+    }
+
+    if (best_q_out != NULL) {
+        *best_q_out = best_q;
+    }
+    if (second_q_out != NULL) {
+        *second_q_out = second_q;
+    }
+    return best_action;
+}
+
+static void dqn_inference_task(void *arg)
+{
+    (void)arg;
+    dqn_csi_job_t job = {0};
+    dqn_csi_job_t incoming = {0};
+    float state[DQN_MODEL_STATE_DIM] = {0};
+    bool have_state = false;
+    TickType_t interval_ticks = pdMS_TO_TICKS(CONFIG_CSI_DQN_CONTROL_INTERVAL_MS);
+    if (interval_ticks < 1) {
+        interval_ticks = 1;
+    }
+
+    for (;;) {
+        bool got_new_csi = false;
+        TickType_t wait_ticks = have_state ? interval_ticks : portMAX_DELAY;
+        if (xQueueReceive(s_dqn_csi_queue, &incoming, wait_ticks) == pdTRUE) {
+            job = incoming;
+            got_new_csi = true;
+            have_state = true;
+            while (xQueueReceive(s_dqn_csi_queue, &incoming, 0) == pdTRUE) {
+                job = incoming;
+            }
+        }
+
+        if (!have_state) {
+            continue;
+        }
+        if (!got_new_csi) {
+            if (job.state_age_packets < CONFIG_CSI_DQN_STALE_MAX_AGE_PACKETS) {
+                job.state_age_packets++;
+            }
+            if (job.state_packet_gap < CONFIG_CSI_DQN_STALE_MAX_AGE_PACKETS) {
+                job.state_packet_gap++;
+            }
+            if (job.state_missing_packets < CONFIG_CSI_DQN_STALE_MAX_AGE_PACKETS) {
+                job.state_missing_packets++;
+            }
+            job.state_is_stale = 1U;
+            /*
+             * Receiver-side DQN currently sees successful CSI arrivals and
+             * parser/missing-CSI intervals, but not sender-side ACK failures.
+             * Keep ACK-history neutral here. True link_v4 RF-failure fallback
+             * requires ACK/loss telemetry to be fed into these fields.
+             */
+            job.state_prev_delivered = 1U;
+            job.state_consecutive_losses = 0U;
+            job.state_recent_loss_rate_8 = 0.0f;
+        }
+
+        int64_t start_us = esp_timer_get_time();
+        build_dqn_state(&job, state);
+        float best_q = 0.0f;
+        float second_q = 0.0f;
+        uint8_t recommended_mcs = dqn_predict_mcs(state, &best_q, &second_q);
+        float margin = best_q - second_q;
+        if (margin < 0.0f) {
+            margin = 0.0f;
+        }
+        int confidence = (int)(margin * 1000.0f);
+        if (confidence > 100) {
+            confidence = 100;
+        }
+        uint32_t margin_milli = (uint32_t)(margin * 1000.0f);
+        if (margin_milli > UINT16_MAX) {
+            margin_milli = UINT16_MAX;
+        }
+
+        dqn_reco_msg_t recommendation = {
+            .magic = DQN_RECO_MAGIC,
+            .version = DQN_RECO_VERSION,
+            .recommended_mcs = recommended_mcs,
+            .confidence = (uint8_t)confidence,
+            .seq = job.seq,
+            .rssi = job.rssi,
+            .snr = (int8_t)((int)job.rssi - (int)job.noise_floor),
+            .margin_milli = (uint16_t)margin_milli,
+        };
+        esp_err_t result = esp_now_send(
+            CONFIG_CSI_SEND_MAC,
+            (const uint8_t *)&recommendation,
+            sizeof(recommendation)
+        );
+
+#if CONFIG_CSI_DQN_LOG_ENABLED
+        uint32_t dropped = __atomic_exchange_n(
+            &s_dqn_csi_drop_count,
+            0U,
+            __ATOMIC_ACQ_REL
+        );
+        printf("DQN_INFERENCE,%lu,%u,%.6f,%.6f,%.6f,%u,%lld,%d,%u,%u,%u,%u,%u,%u\n",
+               (unsigned long)job.seq,
+               (unsigned int)recommended_mcs,
+               best_q,
+               second_q,
+               margin,
+               (unsigned int)confidence,
+               (long long)(esp_timer_get_time() - start_us),
+               (int)result,
+               (unsigned int)job.state_age_packets,
+               (unsigned int)job.state_packet_gap,
+               (unsigned int)job.state_missing_packets,
+               (unsigned int)job.state_mcs_index,
+               (unsigned int)job.state_is_stale,
+               got_new_csi ? 1U : 0U);
+        if (dropped > 0) {
+            printf("DQN_QUEUE_DROPPED,%lu,%lu\n",
+                   (unsigned long)job.seq,
+                   (unsigned long)dropped);
+        }
+        fflush(stdout);
+#endif
+        job.state_mcs_index = recommended_mcs;
+    }
+}
+
+static void dqn_recommendation_init(void)
+{
+    s_dqn_csi_queue = xQueueCreate(DQN_CSI_QUEUE_SIZE, sizeof(dqn_csi_job_t));
+    if (s_dqn_csi_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create DQN CSI queue");
+        abort();
+    }
+    if (xTaskCreate(
+            dqn_inference_task,
+            "dqn_inference",
+            DQN_INFERENCE_TASK_STACK,
+            NULL,
+            DQN_INFERENCE_TASK_PRIO,
+            NULL
+        ) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create DQN inference task");
+        vQueueDelete(s_dqn_csi_queue);
+        s_dqn_csi_queue = NULL;
         abort();
     }
 }
@@ -514,7 +1100,7 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         uint8_t confidence = 100;
     #if CONFIG_MCS_RECOMMENDATION_USE_MODEL
         float state[REWARD_MODEL_STATE_DIM] = {0};
-        build_model_state(info, rx_ctrl, fft_gain, agc_gain, state);
+        build_model_state(info, rx_ctrl, fft_gain, agc_gain, compensate_gain, state);
         recommended_mcs = recommend_mcs_with_model(state, &confidence);
     #endif
         mcs_reco_msg_t reco = {
@@ -533,6 +1119,42 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     }
     s_mcs_data_pkt_count++;
 #endif
+
+#if CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED
+    if (s_count >= CONFIG_CSI_DQN_WARMUP_PACKETS
+            && (s_dqn_data_pkt_count % CONFIG_CSI_DQN_RECOMMENDATION_EVERY_N_PACKETS) == 0) {
+        dqn_csi_job_t job = {
+            .seq = rx_id,
+            .rssi = rx_ctrl->rssi,
+            .noise_floor = rx_ctrl->noise_floor,
+            .fft_gain = fft_gain,
+            .agc_gain = agc_gain,
+            .channel = rx_ctrl->channel,
+            .sig_len = (uint16_t)rx_ctrl->sig_len,
+            .state_mcs_index = dqn_rx_mcs_index_from_ctrl(rx_ctrl),
+            .state_age_packets = 1,
+            .state_packet_gap = 1,
+            .state_missing_packets = 0,
+            .state_is_stale = 0,
+            .state_prev_delivered = 1,
+            .state_consecutive_losses = 0,
+            .state_recent_loss_rate_8 = 0.0f,
+        };
+        size_t value_count = info->len;
+        if (value_count > DQN_CSI_VALUE_COUNT) {
+            value_count = DQN_CSI_VALUE_COUNT;
+        }
+        job.csi_value_count = (uint16_t)value_count;
+        for (size_t i = 0; i < value_count; ++i) {
+            job.csi_values[i] = (int16_t)(compensate_gain * info->buf[i]);
+        }
+        if (s_dqn_csi_queue == NULL || xQueueSend(s_dqn_csi_queue, &job, 0) != pdTRUE) {
+            s_dqn_csi_drop_count++;
+        }
+    }
+    s_dqn_data_pkt_count++;
+#endif
+
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
     uint32_t rate_for_csv;
 #if CONFIG_SOC_WIFI_HE_SUPPORT
@@ -672,6 +1294,16 @@ void app_main()
 
 #if CONFIG_MCS_RECOMMENDATION_ENABLED
     mcs_recommendation_init();
+#endif
+#if CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED
+    dqn_recommendation_init();
+    ESP_LOGI(
+        TAG,
+        "DQN recommendation enabled: every=%u packet(s), warmup=%u, control_interval_ms=%u",
+        (unsigned int)CONFIG_CSI_DQN_RECOMMENDATION_EVERY_N_PACKETS,
+        (unsigned int)CONFIG_CSI_DQN_WARMUP_PACKETS,
+        (unsigned int)CONFIG_CSI_DQN_CONTROL_INTERVAL_MS
+    );
 #endif
 
     wifi_csi_init();

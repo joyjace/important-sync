@@ -25,6 +25,7 @@ RATE_CHOICES = [
 LIVE_MCS_ALGO_CHOICES = [
     "MINSTREL_LIKE - sender ACK EWMA + probing",
     "CUSTOM_POLICY - receiver recommendations only",
+    "DQN_POLICY - receiver DQN recommendations only",
 ]
 
 DEPRECATED_SENDER_KEYS = (
@@ -58,12 +59,26 @@ DEFAULT_PROFILE = {
         "remote_mcs_recommendation_enabled": 1,
         "remote_mcs_min_confidence": 0,
         "remote_mcs_max_age_ms": 300,
+        "dqn_remote_recommendation_enabled": 0,
+        "dqn_default_mcs": 4,
+        "dqn_remote_min_confidence": 0,
+        "dqn_remote_max_age_ms": 50,
+        "dqn_remote_max_seq_gap": 0,
+        "dqn_failure_stepdown_enabled": 0,
+        "dqn_failure_stepdown_count": 3,
+        "dqn_log_enabled": 1,
     },
     "receiver": {
         "channel": 11,
         "esp_now_rate": "WIFI_PHY_RATE_MCS0_LGI",
         "force_gain": 1,
         "gain_control": 1,
+        "dqn_mcs_recommendation_enabled": 0,
+        "dqn_recommendation_every_n_packets": 1,
+        "dqn_warmup_packets": 100,
+        "dqn_control_interval_ms": 5,
+        "dqn_stale_max_age_packets": 64,
+        "dqn_log_enabled": 1,
     },
     "shared": {
         "sender_mac": "1a:00:00:00:00:00",
@@ -138,6 +153,9 @@ def save_profile(profile: dict) -> None:
 
 
 def validate_sender_profile(sender: dict) -> None:
+    if sender["live_mcs_algo"] < 0 or sender["live_mcs_algo"] >= len(LIVE_MCS_ALGO_CHOICES):
+        sender["live_mcs_algo"] = 0
+
     if sender["live_mcs_min_index"] > sender["live_mcs_max_index"]:
         sender["live_mcs_min_index"], sender["live_mcs_max_index"] = (
             sender["live_mcs_max_index"],
@@ -146,6 +164,20 @@ def validate_sender_profile(sender: dict) -> None:
 
     if sender["minstrel_ewma_alpha_num"] > sender["minstrel_ewma_alpha_den"]:
         sender["minstrel_ewma_alpha_num"] = sender["minstrel_ewma_alpha_den"]
+
+
+def validate_receiver_profile(receiver: dict) -> None:
+    if receiver["dqn_recommendation_every_n_packets"] <= 0:
+        receiver["dqn_recommendation_every_n_packets"] = 1
+
+    if receiver["dqn_warmup_packets"] < 0:
+        receiver["dqn_warmup_packets"] = 0
+
+    if receiver.get("dqn_control_interval_ms", 5) <= 0:
+        receiver["dqn_control_interval_ms"] = 5
+
+    if receiver.get("dqn_stale_max_age_packets", 64) <= 0:
+        receiver["dqn_stale_max_age_packets"] = 64
 
 
 def apply_profile_to_sources(profile: dict) -> None:
@@ -157,6 +189,7 @@ def apply_profile_to_sources(profile: dict) -> None:
     shared = profile["shared"]
 
     validate_sender_profile(sender)
+    validate_receiver_profile(receiver)
 
     sender_text = replace_define(sender_text, "CONFIG_LESS_INTERFERENCE_CHANNEL", str(sender["channel"]))
     sender_text = replace_define(sender_text, "CONFIG_ESP_NOW_RATE", sender["esp_now_rate"])
@@ -180,6 +213,14 @@ def apply_profile_to_sources(profile: dict) -> None:
     sender_text = replace_define(sender_text, "CONFIG_CSI_REMOTE_MCS_RECOMMENDATION_ENABLED", str(sender["remote_mcs_recommendation_enabled"]))
     sender_text = replace_define(sender_text, "CONFIG_CSI_REMOTE_MCS_MIN_CONFIDENCE", str(sender["remote_mcs_min_confidence"]))
     sender_text = replace_define(sender_text, "CONFIG_CSI_REMOTE_MCS_MAX_AGE_MS", str(sender["remote_mcs_max_age_ms"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_DQN_REMOTE_RECOMMENDATION_ENABLED", str(sender["dqn_remote_recommendation_enabled"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_DQN_DEFAULT_MCS", str(sender["dqn_default_mcs"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_DQN_REMOTE_MIN_CONFIDENCE", str(sender["dqn_remote_min_confidence"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_DQN_REMOTE_MAX_AGE_MS", str(sender["dqn_remote_max_age_ms"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_DQN_REMOTE_MAX_SEQ_GAP", str(sender["dqn_remote_max_seq_gap"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_DQN_FAILURE_STEPDOWN_ENABLED", str(sender["dqn_failure_stepdown_enabled"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_DQN_FAILURE_STEPDOWN_COUNT", str(sender["dqn_failure_stepdown_count"]))
+    sender_text = replace_define(sender_text, "CONFIG_CSI_DQN_LOG_ENABLED", str(sender["dqn_log_enabled"]))
     sender_text = replace_mac_array(sender_text, "CONFIG_CSI_SEND_MAC", shared["sender_mac"])
     sender_text = replace_mac_array(sender_text, "CONFIG_CSI_RECV_MAC", shared["receiver_mac"])
 
@@ -187,6 +228,17 @@ def apply_profile_to_sources(profile: dict) -> None:
     receiver_text = replace_define(receiver_text, "CONFIG_ESP_NOW_RATE", receiver["esp_now_rate"])
     receiver_text = replace_define(receiver_text, "CONFIG_FORCE_GAIN", str(receiver["force_gain"]))
     receiver_text = replace_define(receiver_text, "CONFIG_GAIN_CONTROL", str(receiver["gain_control"]))
+    receiver_text = replace_define(
+        receiver_text,
+        "CONFIG_MCS_RECOMMENDATION_ENABLED",
+        "0" if receiver["dqn_mcs_recommendation_enabled"] else "1",
+    )
+    receiver_text = replace_define(receiver_text, "CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED", str(receiver["dqn_mcs_recommendation_enabled"]))
+    receiver_text = replace_define(receiver_text, "CONFIG_CSI_DQN_RECOMMENDATION_EVERY_N_PACKETS", str(receiver["dqn_recommendation_every_n_packets"]))
+    receiver_text = replace_define(receiver_text, "CONFIG_CSI_DQN_WARMUP_PACKETS", str(receiver["dqn_warmup_packets"]))
+    receiver_text = replace_define(receiver_text, "CONFIG_CSI_DQN_CONTROL_INTERVAL_MS", str(receiver["dqn_control_interval_ms"]))
+    receiver_text = replace_define(receiver_text, "CONFIG_CSI_DQN_STALE_MAX_AGE_PACKETS", str(receiver["dqn_stale_max_age_packets"]))
+    receiver_text = replace_define(receiver_text, "CONFIG_CSI_DQN_LOG_ENABLED", str(receiver["dqn_log_enabled"]))
     receiver_text = replace_mac_array(receiver_text, "CONFIG_CSI_SEND_MAC", shared["sender_mac"])
     receiver_text = replace_mac_array(receiver_text, "CONFIG_CSI_RECV_MAC", shared["receiver_mac"])
 
@@ -321,7 +373,56 @@ def edit_sender_full(profile: dict) -> None:
     sender["remote_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver recommendations", sender["remote_mcs_recommendation_enabled"] == 1) else 0
     sender["remote_mcs_min_confidence"] = ask_int("Remote recommendation min confidence", sender["remote_mcs_min_confidence"], 0, 100)
     sender["remote_mcs_max_age_ms"] = ask_int("Remote recommendation max age ms", sender["remote_mcs_max_age_ms"], 1, 5000)
+    sender["dqn_remote_recommendation_enabled"] = 1 if ask_yes_no("Enable DQN receiver recommendations", sender["dqn_remote_recommendation_enabled"] == 1) else 0
+    sender["dqn_default_mcs"] = ask_int("DQN initial MCS", sender["dqn_default_mcs"], 0, 7)
+    sender["dqn_remote_min_confidence"] = ask_int("DQN recommendation min confidence", sender["dqn_remote_min_confidence"], 0, 100)
+    sender["dqn_remote_max_age_ms"] = ask_int("DQN recommendation max age ms", sender["dqn_remote_max_age_ms"], 1, 5000)
+    sender["dqn_remote_max_seq_gap"] = ask_int("DQN recommendation max sequence gap (0 disables)", sender["dqn_remote_max_seq_gap"], 0, 1000000)
+    sender["dqn_failure_stepdown_enabled"] = 1 if ask_yes_no("Enable DQN failure stepdown", sender["dqn_failure_stepdown_enabled"] == 1) else 0
+    sender["dqn_failure_stepdown_count"] = ask_int("DQN failure stepdown count", sender["dqn_failure_stepdown_count"], 1, 1000000)
+    sender["dqn_log_enabled"] = 1 if ask_yes_no("Enable DQN sender logs", sender["dqn_log_enabled"] == 1) else 0
     validate_sender_profile(sender)
+
+
+def edit_sender_dqn(profile: dict) -> None:
+    sender = profile["sender"]
+    while True:
+        print("\nEdit sender DQN policy")
+        print(f"1. dqn_remote_recommendation_enabled: {sender['dqn_remote_recommendation_enabled']}")
+        print(f"2. dqn_default_mcs: {sender['dqn_default_mcs']}")
+        print(f"3. dqn_remote_min_confidence: {sender['dqn_remote_min_confidence']}")
+        print(f"4. dqn_remote_max_age_ms: {sender['dqn_remote_max_age_ms']}")
+        print(f"5. dqn_remote_max_seq_gap: {sender['dqn_remote_max_seq_gap']}")
+        print(f"6. dqn_failure_stepdown_enabled: {sender['dqn_failure_stepdown_enabled']}")
+        print(f"7. dqn_failure_stepdown_count: {sender['dqn_failure_stepdown_count']}")
+        print(f"8. dqn_log_enabled: {sender['dqn_log_enabled']}")
+        print("0. Back")
+        choice = input("Select DQN sender field: ").strip()
+
+        if choice == "1":
+            sender["dqn_remote_recommendation_enabled"] = 1 if ask_yes_no("Enable DQN receiver recommendations", sender["dqn_remote_recommendation_enabled"] == 1) else 0
+        elif choice == "2":
+            sender["dqn_default_mcs"] = ask_int("DQN initial MCS", sender["dqn_default_mcs"], 0, 7)
+        elif choice == "3":
+            sender["dqn_remote_min_confidence"] = ask_int("DQN recommendation min confidence", sender["dqn_remote_min_confidence"], 0, 100)
+        elif choice == "4":
+            sender["dqn_remote_max_age_ms"] = ask_int("DQN recommendation max age ms", sender["dqn_remote_max_age_ms"], 1, 5000)
+        elif choice == "5":
+            sender["dqn_remote_max_seq_gap"] = ask_int("DQN recommendation max sequence gap (0 disables)", sender["dqn_remote_max_seq_gap"], 0, 1000000)
+        elif choice == "6":
+            sender["dqn_failure_stepdown_enabled"] = 1 if ask_yes_no("Enable DQN failure stepdown", sender["dqn_failure_stepdown_enabled"] == 1) else 0
+        elif choice == "7":
+            sender["dqn_failure_stepdown_count"] = ask_int("DQN failure stepdown count", sender["dqn_failure_stepdown_count"], 1, 1000000)
+        elif choice == "8":
+            sender["dqn_log_enabled"] = 1 if ask_yes_no("Enable DQN sender logs", sender["dqn_log_enabled"] == 1) else 0
+        elif choice == "0":
+            return
+        else:
+            print("Invalid option.")
+            continue
+
+        validate_sender_profile(sender)
+        save_profile(profile)
 
 
 def edit_sender_live_mcs(profile: dict) -> None:
@@ -342,7 +443,8 @@ def edit_sender_live_mcs(profile: dict) -> None:
         print(f"11. remote_mcs_recommendation_enabled: {sender['remote_mcs_recommendation_enabled']}")
         print(f"12. remote_mcs_min_confidence: {sender['remote_mcs_min_confidence']}")
         print(f"13. remote_mcs_max_age_ms: {sender['remote_mcs_max_age_ms']}")
-        print("14. Edit all sender fields")
+        print("14. Edit DQN policy fields")
+        print("15. Edit all sender fields")
         print("0. Back")
         choice = input("Select live MCS field: ").strip()
 
@@ -373,6 +475,8 @@ def edit_sender_live_mcs(profile: dict) -> None:
         elif choice == "13":
             sender["remote_mcs_max_age_ms"] = ask_int("Remote recommendation max age ms", sender["remote_mcs_max_age_ms"], 1, 5000)
         elif choice == "14":
+            edit_sender_dqn(profile)
+        elif choice == "15":
             edit_sender_full(profile)
         elif choice == "0":
             return
@@ -401,7 +505,8 @@ def edit_sender(profile: dict) -> None:
         algo_name = live_mcs_algo_label(sender["live_mcs_algo"])
         print(f"11. live_mcs_algo: {sender['live_mcs_algo']} ({algo_name})")
         print("12. Edit live MCS policy fields")
-        print("13. Edit all sender fields")
+        print("13. Edit DQN policy fields")
+        print("14. Edit all sender fields")
         print("0. Back")
         choice = input("Select sender field: ").strip()
 
@@ -441,6 +546,8 @@ def edit_sender(profile: dict) -> None:
         elif choice == "12":
             edit_sender_live_mcs(profile)
         elif choice == "13":
+            edit_sender_dqn(profile)
+        elif choice == "14":
             edit_sender_full(profile)
             save_profile(profile)
         elif choice == "0":
@@ -456,6 +563,48 @@ def edit_receiver_full(profile: dict) -> None:
     receiver["esp_now_rate"] = ask_choice("ESP-NOW PHY rate", RATE_CHOICES, receiver["esp_now_rate"])
     receiver["force_gain"] = 1 if ask_yes_no("Force gain", receiver["force_gain"] == 1) else 0
     receiver["gain_control"] = 1 if ask_yes_no("Enable gain control", receiver["gain_control"] == 1) else 0
+    receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver DQN recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
+    receiver["dqn_recommendation_every_n_packets"] = ask_int("DQN recommendation every N packets", receiver["dqn_recommendation_every_n_packets"], 1, 1000000)
+    receiver["dqn_warmup_packets"] = ask_int("DQN warmup packets", receiver["dqn_warmup_packets"], 0, 1000000)
+    receiver["dqn_control_interval_ms"] = ask_int("DQN control interval ms", receiver["dqn_control_interval_ms"], 1, 1000000)
+    receiver["dqn_stale_max_age_packets"] = ask_int("DQN stale max age packets", receiver["dqn_stale_max_age_packets"], 1, 1000000)
+    receiver["dqn_log_enabled"] = 1 if ask_yes_no("Enable DQN receiver logs", receiver["dqn_log_enabled"] == 1) else 0
+    validate_receiver_profile(receiver)
+
+
+def edit_receiver_dqn(profile: dict) -> None:
+    receiver = profile["receiver"]
+    while True:
+        print("\nEdit receiver DQN recommendations")
+        print(f"1. dqn_mcs_recommendation_enabled: {receiver['dqn_mcs_recommendation_enabled']}")
+        print(f"2. dqn_recommendation_every_n_packets: {receiver['dqn_recommendation_every_n_packets']}")
+        print(f"3. dqn_warmup_packets: {receiver['dqn_warmup_packets']}")
+        print(f"4. dqn_control_interval_ms: {receiver['dqn_control_interval_ms']}")
+        print(f"5. dqn_stale_max_age_packets: {receiver['dqn_stale_max_age_packets']}")
+        print(f"6. dqn_log_enabled: {receiver['dqn_log_enabled']}")
+        print("0. Back")
+        choice = input("Select DQN receiver field: ").strip()
+
+        if choice == "1":
+            receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver DQN recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
+        elif choice == "2":
+            receiver["dqn_recommendation_every_n_packets"] = ask_int("DQN recommendation every N packets", receiver["dqn_recommendation_every_n_packets"], 1, 1000000)
+        elif choice == "3":
+            receiver["dqn_warmup_packets"] = ask_int("DQN warmup packets", receiver["dqn_warmup_packets"], 0, 1000000)
+        elif choice == "4":
+            receiver["dqn_control_interval_ms"] = ask_int("DQN control interval ms", receiver["dqn_control_interval_ms"], 1, 1000000)
+        elif choice == "5":
+            receiver["dqn_stale_max_age_packets"] = ask_int("DQN stale max age packets", receiver["dqn_stale_max_age_packets"], 1, 1000000)
+        elif choice == "6":
+            receiver["dqn_log_enabled"] = 1 if ask_yes_no("Enable DQN receiver logs", receiver["dqn_log_enabled"] == 1) else 0
+        elif choice == "0":
+            return
+        else:
+            print("Invalid option.")
+            continue
+
+        validate_receiver_profile(receiver)
+        save_profile(profile)
 
 
 def edit_receiver(profile: dict) -> None:
@@ -466,7 +615,9 @@ def edit_receiver(profile: dict) -> None:
         print(f"2. esp_now_rate: {receiver['esp_now_rate']}")
         print(f"3. force_gain: {receiver['force_gain']}")
         print(f"4. gain_control: {receiver['gain_control']}")
-        print("5. Edit all receiver fields")
+        print(f"5. dqn_mcs_recommendation_enabled: {receiver['dqn_mcs_recommendation_enabled']}")
+        print("6. Edit DQN receiver fields")
+        print("7. Edit all receiver fields")
         print("0. Back")
         choice = input("Select receiver field: ").strip()
 
@@ -483,6 +634,12 @@ def edit_receiver(profile: dict) -> None:
             receiver["gain_control"] = 1 if ask_yes_no("Enable gain control", receiver["gain_control"] == 1) else 0
             save_profile(profile)
         elif choice == "5":
+            receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver DQN recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
+            validate_receiver_profile(receiver)
+            save_profile(profile)
+        elif choice == "6":
+            edit_receiver_dqn(profile)
+        elif choice == "7":
             edit_receiver_full(profile)
             save_profile(profile)
         elif choice == "0":

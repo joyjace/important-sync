@@ -51,7 +51,7 @@
 #endif
 
 #define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT20
-#define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS3_LGI 
+#define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS0_LGI 
 /* Bitrate options (choose one for `CONFIG_ESP_NOW_RATE` - type `wifi_phy_rate_t`):
  *
  * Legacy (802.11b/g):
@@ -76,7 +76,7 @@
 #define CONFIG_SEND_FREQUENCY               200
 #define CONFIG_PACKET_PACING_ENABLED        1  // 1 = paced by CONFIG_SEND_FREQUENCY, 0 = max-rate (no fixed sleep)
 #define CONFIG_ACK_TIMING_MODE              2  // 1 = async pipeline, 2 = stop-and-wait (one packet in flight)
-#define CONFIG_RATE_SWITCH_MODE             1  // 0 = TIME_BASED, 1 = PACKET_BASED, 2 = STATIC (fixed rate, no switching)
+#define CONFIG_RATE_SWITCH_MODE             0  // 0 = TIME_BASED, 1 = PACKET_BASED, 2 = STATIC (fixed rate, no switching)
 #define CONFIG_RATE_SWITCH_INTERVAL_SEC     10 // Used when TIME_BASED
 #define CONFIG_RATE_SWITCH_PACKET_COUNT     1 // Used when PACKET_BASED
 #ifndef CONFIG_CSI_LIVE_MCS_SELECTION_ENABLED
@@ -118,6 +118,30 @@
 #ifndef CONFIG_CSI_REMOTE_MCS_MAX_AGE_MS
 #define CONFIG_CSI_REMOTE_MCS_MAX_AGE_MS 300
 #endif
+#ifndef CONFIG_CSI_DQN_REMOTE_RECOMMENDATION_ENABLED
+#define CONFIG_CSI_DQN_REMOTE_RECOMMENDATION_ENABLED 0
+#endif
+#ifndef CONFIG_CSI_DQN_DEFAULT_MCS
+#define CONFIG_CSI_DQN_DEFAULT_MCS 4
+#endif
+#ifndef CONFIG_CSI_DQN_REMOTE_MIN_CONFIDENCE
+#define CONFIG_CSI_DQN_REMOTE_MIN_CONFIDENCE 0
+#endif
+#ifndef CONFIG_CSI_DQN_REMOTE_MAX_AGE_MS
+#define CONFIG_CSI_DQN_REMOTE_MAX_AGE_MS 50
+#endif
+#ifndef CONFIG_CSI_DQN_REMOTE_MAX_SEQ_GAP
+#define CONFIG_CSI_DQN_REMOTE_MAX_SEQ_GAP 0
+#endif
+#ifndef CONFIG_CSI_DQN_FAILURE_STEPDOWN_ENABLED
+#define CONFIG_CSI_DQN_FAILURE_STEPDOWN_ENABLED 0
+#endif
+#ifndef CONFIG_CSI_DQN_FAILURE_STEPDOWN_COUNT
+#define CONFIG_CSI_DQN_FAILURE_STEPDOWN_COUNT 3
+#endif
+#ifndef CONFIG_CSI_DQN_LOG_ENABLED
+#define CONFIG_CSI_DQN_LOG_ENABLED 1
+#endif
 //test
 #define CONFIG_LIVE_MCS_SELECTION_ENABLED   CONFIG_CSI_LIVE_MCS_SELECTION_ENABLED
 #define CONFIG_LIVE_MCS_ALGO                CONFIG_CSI_LIVE_MCS_ALGO
@@ -132,8 +156,16 @@
 #define CONFIG_REMOTE_MCS_RECOMMENDATION_ENABLED CONFIG_CSI_REMOTE_MCS_RECOMMENDATION_ENABLED
 #define CONFIG_REMOTE_MCS_MIN_CONFIDENCE CONFIG_CSI_REMOTE_MCS_MIN_CONFIDENCE
 #define CONFIG_REMOTE_MCS_MAX_AGE_MS CONFIG_CSI_REMOTE_MCS_MAX_AGE_MS
+#define CONFIG_DQN_REMOTE_RECOMMENDATION_ENABLED CONFIG_CSI_DQN_REMOTE_RECOMMENDATION_ENABLED
+#define CONFIG_DQN_DEFAULT_MCS CONFIG_CSI_DQN_DEFAULT_MCS
+#define CONFIG_DQN_REMOTE_MIN_CONFIDENCE CONFIG_CSI_DQN_REMOTE_MIN_CONFIDENCE
+#define CONFIG_DQN_REMOTE_MAX_AGE_MS CONFIG_CSI_DQN_REMOTE_MAX_AGE_MS
+#define CONFIG_DQN_REMOTE_MAX_SEQ_GAP CONFIG_CSI_DQN_REMOTE_MAX_SEQ_GAP
+#define CONFIG_DQN_FAILURE_STEPDOWN_ENABLED CONFIG_CSI_DQN_FAILURE_STEPDOWN_ENABLED
+#define CONFIG_DQN_FAILURE_STEPDOWN_COUNT CONFIG_CSI_DQN_FAILURE_STEPDOWN_COUNT
+#define CONFIG_DQN_LOG_ENABLED CONFIG_CSI_DQN_LOG_ENABLED
 #define CONFIG_ESP_NOW_PAYLOAD_LEN          128 // Bytes per ESP-NOW data frame (>= 4 to keep sequence ID) (16, 64, 128)
-#define CONFIG_IDENTICAL_TX_PAYLOAD         1   // 1 = send the same ESP-NOW body every packet; seq stays only in local ACK logs
+#define CONFIG_IDENTICAL_TX_PAYLOAD         0  // 1 = send the same ESP-NOW body every packet; seq stays only in local ACK logs
 // TX power in units of 0.25 dBm. Range [8, 84] => [2 dBm, 20 dBm].
 // Mapping: {set value range, actual value} = {{[8,19],8},{[20,27],20},{[28,33],28},{[34,43],34},{[44,51],44},{[52,55],52},{[56,59],56},{[60,65],60},{[66,71],66},{[72,79],72},{[80,84],80}}
 #define CONFIG_WIFI_TX_POWER                8
@@ -168,6 +200,10 @@
 #error "CONFIG_LIVE_MCS_MIN_INDEX must be <= CONFIG_LIVE_MCS_MAX_INDEX"
 #endif
 
+#if CONFIG_LIVE_MCS_ALGO < 0 || CONFIG_LIVE_MCS_ALGO > 2
+#error "CONFIG_LIVE_MCS_ALGO must be 0 (Minstrel), 1 (Custom), or 2 (DQN)"
+#endif
+
 #if CONFIG_MINSTREL_EWMA_ALPHA_NUM <= 0 || CONFIG_MINSTREL_EWMA_ALPHA_NUM > CONFIG_MINSTREL_EWMA_ALPHA_DEN
 #error "CONFIG_MINSTREL_EWMA_ALPHA_NUM must be in (0, CONFIG_MINSTREL_EWMA_ALPHA_DEN]"
 #endif
@@ -184,6 +220,22 @@
 #error "CONFIG_REMOTE_MCS_MAX_AGE_MS must be > 0"
 #endif
 
+#if CONFIG_DQN_DEFAULT_MCS < 0 || CONFIG_DQN_DEFAULT_MCS > 7
+#error "CONFIG_DQN_DEFAULT_MCS must be in [0, 7]"
+#endif
+
+#if CONFIG_DQN_REMOTE_MIN_CONFIDENCE < 0 || CONFIG_DQN_REMOTE_MIN_CONFIDENCE > 100
+#error "CONFIG_DQN_REMOTE_MIN_CONFIDENCE must be in [0, 100]"
+#endif
+
+#if CONFIG_DQN_REMOTE_MAX_AGE_MS <= 0 || CONFIG_DQN_REMOTE_MAX_SEQ_GAP < 0
+#error "DQN recommendation age must be positive and sequence gap must be non-negative"
+#endif
+
+#if CONFIG_DQN_FAILURE_STEPDOWN_ENABLED && CONFIG_DQN_FAILURE_STEPDOWN_COUNT <= 0
+#error "CONFIG_DQN_FAILURE_STEPDOWN_COUNT must be positive"
+#endif
+
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
 #define ESP_IF_WIFI_STA ESP_MAC_WIFI_STA
 #endif
@@ -194,6 +246,8 @@ static const char *TAG = "csi_send";
 
 #define MCS_RECO_MAGIC 0xA5
 #define MCS_RECO_VERSION 1
+#define DQN_RECO_MAGIC 0xD7
+#define DQN_RECO_VERSION 1
 
 typedef struct __attribute__((packed)) {
     uint8_t magic;
@@ -205,6 +259,19 @@ typedef struct __attribute__((packed)) {
     int8_t snr;
     uint8_t reserved[2];
 } mcs_reco_msg_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t magic;
+    uint8_t version;
+    uint8_t recommended_mcs;
+    uint8_t confidence;
+    uint32_t seq;
+    int8_t rssi;
+    int8_t snr;
+    uint16_t margin_milli;
+} dqn_reco_msg_t;
+
+_Static_assert(sizeof(dqn_reco_msg_t) == 12, "DQN feedback protocol size changed");
 
 typedef struct {
     uint8_t valid;
@@ -218,6 +285,24 @@ typedef struct {
 
 static remote_mcs_reco_state_t s_remote_mcs_reco = {0};
 static portMUX_TYPE s_remote_mcs_reco_mux = portMUX_INITIALIZER_UNLOCKED;
+
+typedef struct {
+    uint8_t valid;
+    uint8_t recommended_mcs;
+    uint8_t confidence;
+    uint16_t margin_milli;
+    uint32_t seq;
+    int8_t rssi;
+    int8_t snr;
+    int64_t rx_ts_us;
+} dqn_remote_reco_state_t;
+
+#if CONFIG_DQN_REMOTE_RECOMMENDATION_ENABLED
+static dqn_remote_reco_state_t s_dqn_remote_reco = {0};
+static portMUX_TYPE s_dqn_remote_reco_mux = portMUX_INITIALIZER_UNLOCKED;
+#endif
+static uint32_t s_dqn_consecutive_failures = 0;
+static volatile uint8_t s_dqn_failure_stepdown_pending = 0;
 
 static wifi_second_chan_t get_secondary_channel_for_ht40(int primary_channel)
 {
@@ -320,9 +405,11 @@ static const wifi_phy_rate_t s_esp_now_rate_cycle[] = {
     WIFI_PHY_RATE_MCS7_LGI,
 };
 
+#if CONFIG_LIVE_MCS_ALGO == 0
 static const float s_mcs_rate_mbps[] = {
     6.5f, 13.0f, 19.5f, 26.0f, 39.0f, 52.0f, 58.5f, 65.0f,
 };
+#endif
 
 typedef struct {
     uint32_t attempts_window;
@@ -392,6 +479,8 @@ static void live_rate_controller_reset(void)
     uint8_t initial_mcs = CONFIG_LIVE_MCS_MIN_INDEX;
 #if CONFIG_LIVE_MCS_ALGO == 1
     initial_mcs = clamp_live_mcs_index(CONFIG_CUSTOM_POLICY_DEFAULT_MCS);
+#elif CONFIG_LIVE_MCS_ALGO == 2
+    initial_mcs = clamp_live_mcs_index(CONFIG_DQN_DEFAULT_MCS);
 #else
     uint8_t configured_mcs = 0;
     if (rate_to_mcs_index(CONFIG_ESP_NOW_RATE, &configured_mcs)) {
@@ -401,6 +490,8 @@ static void live_rate_controller_reset(void)
 
     s_live_current_mcs_index = initial_mcs;
     s_live_best_mcs_index = initial_mcs;
+    s_dqn_consecutive_failures = 0;
+    s_dqn_failure_stepdown_pending = 0;
 
     for (uint8_t i = CONFIG_LIVE_MCS_MIN_INDEX; i <= CONFIG_LIVE_MCS_MAX_INDEX; ++i) {
         s_live_rate_stats[i].ewma_pdr = 0.5f;
@@ -409,6 +500,7 @@ static void live_rate_controller_reset(void)
     }
 }
 
+#if CONFIG_LIVE_MCS_ALGO == 0
 static uint8_t minstrel_like_pick_best_mcs(void)
 {
     uint8_t best = CONFIG_LIVE_MCS_MIN_INDEX;
@@ -457,6 +549,7 @@ static uint8_t minstrel_like_next_mcs(void)
     s_live_probe_active = 0;
     return s_live_best_mcs_index;
 }
+#endif
 
 static void live_rate_controller_on_ack(int delivered,
                                         wifi_phy_rate_t configured_rate,
@@ -500,11 +593,33 @@ static void live_rate_controller_on_ack(int delivered,
 #if CONFIG_LIVE_MCS_ALGO == 0
     s_live_current_mcs_index = minstrel_like_next_mcs();
     selected_reward = s_live_rate_stats[s_live_current_mcs_index].ewma_pdr * s_mcs_rate_mbps[s_live_current_mcs_index];
-#else
+#elif CONFIG_LIVE_MCS_ALGO == 1
     /*
      * CUSTOM_POLICY is receiver-driven only. ACK telemetry is still tracked for
      * logs, but local ACK statistics do not choose the next MCS.
      */
+    s_live_current_mcs_index = clamp_live_mcs_index(s_live_current_mcs_index);
+    s_live_best_mcs_index = s_live_current_mcs_index;
+    s_live_probe_active = 0;
+#else
+    /*
+     * DQN owns the MCS decision. ACK telemetry is still tracked for logs; local
+     * stepdown only runs when the explicit emergency fallback is enabled.
+     */
+    if (delivered) {
+        s_dqn_consecutive_failures = 0;
+    } else {
+        s_dqn_consecutive_failures++;
+#if CONFIG_DQN_FAILURE_STEPDOWN_ENABLED
+        if (s_dqn_consecutive_failures >= CONFIG_DQN_FAILURE_STEPDOWN_COUNT) {
+            if (s_live_current_mcs_index > CONFIG_LIVE_MCS_MIN_INDEX) {
+                s_live_current_mcs_index--;
+                __atomic_store_n(&s_dqn_failure_stepdown_pending, 1U, __ATOMIC_RELEASE);
+            }
+            s_dqn_consecutive_failures = 0;
+        }
+#endif
+    }
     s_live_current_mcs_index = clamp_live_mcs_index(s_live_current_mcs_index);
     s_live_best_mcs_index = s_live_current_mcs_index;
     s_live_probe_active = 0;
@@ -928,6 +1043,7 @@ static bool ack_seq_dequeue(uint32_t *seq, int64_t *send_ts_us, wifi_phy_rate_t 
     return dequeued;
 }
 
+#if CONFIG_LIVE_MCS_ALGO != 2
 static bool remote_mcs_try_apply_for_next_seq(uint32_t next_seq)
 {
 #if CONFIG_REMOTE_MCS_RECOMMENDATION_ENABLED && CONFIG_LIVE_MCS_SELECTION_ENABLED
@@ -962,10 +1078,75 @@ static bool remote_mcs_try_apply_for_next_seq(uint32_t next_seq)
     return false;
 #endif
 }
+#endif
+
+#if CONFIG_LIVE_MCS_ALGO == 2
+static bool dqn_remote_mcs_try_apply_for_next_seq(uint32_t next_seq)
+{
+#if CONFIG_DQN_REMOTE_RECOMMENDATION_ENABLED && CONFIG_LIVE_MCS_SELECTION_ENABLED && CONFIG_LIVE_MCS_ALGO == 2
+    dqn_remote_reco_state_t recommendation;
+
+    portENTER_CRITICAL(&s_dqn_remote_reco_mux);
+    recommendation = s_dqn_remote_reco;
+    portEXIT_CRITICAL(&s_dqn_remote_reco_mux);
+
+    if (!recommendation.valid) {
+        return false;
+    }
+#if CONFIG_DQN_REMOTE_MIN_CONFIDENCE > 0
+    if (recommendation.confidence < CONFIG_DQN_REMOTE_MIN_CONFIDENCE) {
+        return false;
+    }
+#endif
+    int64_t age_us = esp_timer_get_time() - recommendation.rx_ts_us;
+    if (age_us > ((int64_t)CONFIG_DQN_REMOTE_MAX_AGE_MS * 1000LL)) {
+        return false;
+    }
+    if (next_seq <= recommendation.seq) {
+        return false;
+    }
+#if CONFIG_DQN_REMOTE_MAX_SEQ_GAP > 0
+    uint32_t sequence_gap = next_seq - recommendation.seq;
+    if (sequence_gap > CONFIG_DQN_REMOTE_MAX_SEQ_GAP) {
+        return false;
+    }
+#endif
+
+    /* Consume a recommendation once; an old high-rate choice must not undo a
+     * later local failure step-down. */
+    portENTER_CRITICAL(&s_dqn_remote_reco_mux);
+    if (!s_dqn_remote_reco.valid || s_dqn_remote_reco.seq != recommendation.seq) {
+        portEXIT_CRITICAL(&s_dqn_remote_reco_mux);
+        return false;
+    }
+    s_dqn_remote_reco.valid = 0;
+    portEXIT_CRITICAL(&s_dqn_remote_reco_mux);
+
+    s_live_current_mcs_index = clamp_live_mcs_index(recommendation.recommended_mcs);
+    s_dqn_consecutive_failures = 0;
+#if CONFIG_DQN_LOG_ENABLED
+    printf("DQN_FEEDBACK,%lu,%lu,%u,%u,%u,%d,%d,%lld\n",
+           (unsigned long)recommendation.seq,
+           (unsigned long)next_seq,
+           (unsigned int)recommendation.recommended_mcs,
+           (unsigned int)recommendation.confidence,
+           (unsigned int)recommendation.margin_milli,
+           (int)recommendation.rssi,
+           (int)recommendation.snr,
+           (long long)age_us);
+    fflush(stdout);
+#endif
+    return true;
+#else
+    (void)next_seq;
+    return false;
+#endif
+}
+#endif
 
 static void esp_now_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int data_len)
 {
-#if CONFIG_REMOTE_MCS_RECOMMENDATION_ENABLED
+#if CONFIG_REMOTE_MCS_RECOMMENDATION_ENABLED || CONFIG_DQN_REMOTE_RECOMMENDATION_ENABLED
     if (recv_info == NULL || recv_info->src_addr == NULL || data == NULL) {
         return;
     }
@@ -974,24 +1155,45 @@ static void esp_now_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t 
         return;
     }
 
-    if (data_len != (int)sizeof(mcs_reco_msg_t)) {
-        return;
+#if CONFIG_REMOTE_MCS_RECOMMENDATION_ENABLED
+    if (data_len == (int)sizeof(mcs_reco_msg_t)) {
+        const mcs_reco_msg_t *msg = (const mcs_reco_msg_t *)data;
+        if (msg->magic == MCS_RECO_MAGIC
+                && msg->version == MCS_RECO_VERSION
+                && msg->recommended_mcs <= 7) {
+            portENTER_CRITICAL(&s_remote_mcs_reco_mux);
+            s_remote_mcs_reco.valid = 1;
+            s_remote_mcs_reco.recommended_mcs = msg->recommended_mcs;
+            s_remote_mcs_reco.confidence = msg->confidence;
+            s_remote_mcs_reco.seq = msg->seq;
+            s_remote_mcs_reco.rssi = msg->rssi;
+            s_remote_mcs_reco.snr = msg->snr;
+            s_remote_mcs_reco.rx_ts_us = esp_timer_get_time();
+            portEXIT_CRITICAL(&s_remote_mcs_reco_mux);
+            return;
+        }
     }
+#endif
 
-    const mcs_reco_msg_t *msg = (const mcs_reco_msg_t *)data;
-    if (msg->magic != MCS_RECO_MAGIC || msg->version != MCS_RECO_VERSION || msg->recommended_mcs > 7) {
-        return;
+#if CONFIG_DQN_REMOTE_RECOMMENDATION_ENABLED
+    if (data_len == (int)sizeof(dqn_reco_msg_t)) {
+        const dqn_reco_msg_t *msg = (const dqn_reco_msg_t *)data;
+        if (msg->magic == DQN_RECO_MAGIC
+                && msg->version == DQN_RECO_VERSION
+                && msg->recommended_mcs <= 7) {
+            portENTER_CRITICAL(&s_dqn_remote_reco_mux);
+            s_dqn_remote_reco.valid = 1;
+            s_dqn_remote_reco.recommended_mcs = msg->recommended_mcs;
+            s_dqn_remote_reco.confidence = msg->confidence;
+            s_dqn_remote_reco.margin_milli = msg->margin_milli;
+            s_dqn_remote_reco.seq = msg->seq;
+            s_dqn_remote_reco.rssi = msg->rssi;
+            s_dqn_remote_reco.snr = msg->snr;
+            s_dqn_remote_reco.rx_ts_us = esp_timer_get_time();
+            portEXIT_CRITICAL(&s_dqn_remote_reco_mux);
+        }
     }
-
-    portENTER_CRITICAL(&s_remote_mcs_reco_mux);
-    s_remote_mcs_reco.valid = 1;
-    s_remote_mcs_reco.recommended_mcs = msg->recommended_mcs;
-    s_remote_mcs_reco.confidence = msg->confidence;
-    s_remote_mcs_reco.seq = msg->seq;
-    s_remote_mcs_reco.rssi = msg->rssi;
-    s_remote_mcs_reco.snr = msg->snr;
-    s_remote_mcs_reco.rx_ts_us = esp_timer_get_time();
-    portEXIT_CRITICAL(&s_remote_mcs_reco_mux);
+#endif
 #else
     (void)recv_info;
     (void)data;
@@ -1224,6 +1426,17 @@ void app_main()
              (unsigned int)CONFIG_REMOTE_MCS_MIN_CONFIDENCE,
              (unsigned int)CONFIG_REMOTE_MCS_MAX_AGE_MS);
 #endif
+#if CONFIG_DQN_REMOTE_RECOMMENDATION_ENABLED
+    ESP_LOGI(
+        TAG,
+        "DQN recommendation enabled: min_conf=%u, max_age_ms=%u, max_seq_gap=%u, emergency_stepdown=%u after=%u failures",
+        (unsigned int)CONFIG_DQN_REMOTE_MIN_CONFIDENCE,
+        (unsigned int)CONFIG_DQN_REMOTE_MAX_AGE_MS,
+        (unsigned int)CONFIG_DQN_REMOTE_MAX_SEQ_GAP,
+        (unsigned int)CONFIG_DQN_FAILURE_STEPDOWN_ENABLED,
+        (unsigned int)CONFIG_DQN_FAILURE_STEPDOWN_COUNT
+    );
+#endif
     printf("ACK_STATUS_HEADER,seq,delivered,termination_event,ack_ts_us,send_ts_us,service_us,configured_rate,actual_rate,tx_status,data_len\n");
     printf("ACK_SERVICE_HEADER,total,delivered,avg_service_us,median_service_us,goodput_mbps,ts_us\n");
 #if CONFIG_LIVE_MCS_SELECTION_ENABLED && CONFIG_LIVE_MCS_DECISION_LOG_ENABLED
@@ -1238,20 +1451,38 @@ void app_main()
     ESP_LOGI(TAG, "Live MCS controller enabled (%s), range=[MCS%u..MCS%u], initial=MCS%u",
 #if CONFIG_LIVE_MCS_ALGO == 0
              "MINSTREL_LIKE",
-#else
+#elif CONFIG_LIVE_MCS_ALGO == 1
              "CUSTOM_POLICY",
+#else
+             "DQN_POLICY",
 #endif
              (unsigned int)CONFIG_LIVE_MCS_MIN_INDEX,
              (unsigned int)CONFIG_LIVE_MCS_MAX_INDEX,
              (unsigned int)s_live_current_mcs_index);
 
     for (uint32_t count = 0; ; ++count) {
+#if CONFIG_LIVE_MCS_ALGO == 2
+        const bool failure_stepdown = __atomic_exchange_n(
+            &s_dqn_failure_stepdown_pending,
+            0U,
+            __ATOMIC_ACQ_REL
+        ) != 0;
+        const bool remote_applied = failure_stepdown
+            ? false
+            : dqn_remote_mcs_try_apply_for_next_seq(count);
+        const char *mcs_change_reason = failure_stepdown
+            ? "dqn_failure_stepdown"
+            : remote_applied
+                ? "dqn_recommendation"
+                : "dqn_hold";
+#else
         const bool remote_applied = remote_mcs_try_apply_for_next_seq(count);
         const char *mcs_change_reason = remote_applied ? "receiver_recommendation" :
 #if CONFIG_LIVE_MCS_ALGO == 0
             s_live_probe_active ? "minstrel_probe" : "minstrel_best";
 #else
             "custom_hold";
+#endif
 #endif
         live_rate_controller_apply(peer.peer_addr, count, mcs_change_reason);
 

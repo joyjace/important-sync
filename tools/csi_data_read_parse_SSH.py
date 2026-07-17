@@ -878,14 +878,13 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                     'rolling_pdr_percent': '',
                 })
                 ack_pdr_file_fd.flush()
-                # Silenced for fast sweep mode. Uncomment to show final PDR at each MCS switch.
-                # ack_pdr_final_tag = color_text('[ACK_PDR_FINAL]', color='green', bold=True)
-                # mcs_text = f" mcs=MCS{current_mcs_index}" if current_mcs_index is not None else ""
-                # print(
-                #     f"{ack_pdr_final_tag} sent={record['sent']} delivered={record['delivered']} "
-                #     f"{mcs_text} pdr={color_pdr_percent(record['pdr_percent'])} (MCS rate switch complete)",
-                #     flush=True,
-                # )
+                ack_pdr_final_tag = color_text('[ACK_PDR_FINAL]', color='green', bold=True)
+                mcs_text = f" mcs=MCS{current_mcs_index}" if current_mcs_index is not None else ""
+                print(
+                    f"{ack_pdr_final_tag} sent={record['sent']} delivered={record['delivered']} "
+                    f"{mcs_text} pdr={color_pdr_percent(record['pdr_percent'])} (MCS rate switch complete)",
+                    flush=True,
+                )
 
                 continue
 
@@ -906,29 +905,27 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                 continue
 
             if record['type'] == 'ACK_SERVICE_FINAL':
-                # Silenced for fast sweep mode. Uncomment to show service stats at each MCS switch.
-                # ack_service_final_tag = color_text('[ACK_SERVICE_FINAL]', color='blue', bold=True)
-                # median_text = (
-                #     f" median_service_us={record['median_service_us']:.1f}"
-                #     if record.get('median_service_us') is not None else ""
-                # )
-                # mcs_text = f" mcs=MCS{current_mcs_index}" if current_mcs_index is not None else ""
-                # print(
-                #     f"{ack_service_final_tag} total={record['total']} delivered={record['delivered']} "
-                #     f"{mcs_text} avg_service_us={record['avg_service_us']:.1f}{median_text} "
-                #     f"goodput_mbps={record['goodput_mbps']:.3f} "
-                #     f"(MCS rate switch complete)",
-                #     flush=True,
-                # )
+                ack_service_final_tag = color_text('[ACK_SERVICE_FINAL]', color='blue', bold=True)
+                median_text = (
+                    f" median_service_us={record['median_service_us']:.1f}"
+                    if record.get('median_service_us') is not None else ""
+                )
+                mcs_text = f" mcs=MCS{current_mcs_index}" if current_mcs_index is not None else ""
+                print(
+                    f"{ack_service_final_tag} total={record['total']} delivered={record['delivered']} "
+                    f"{mcs_text} avg_service_us={record['avg_service_us']:.1f}{median_text} "
+                    f"goodput_mbps={record['goodput_mbps']:.3f} "
+                    f"(MCS rate switch complete)",
+                    flush=True,
+                )
                 continue
 
             if record['type'] == 'ACK_RESET':
-                # Silenced for fast sweep mode. Uncomment to show counter resets at each MCS switch.
-                # ack_reset_tag = color_text('[ACK_RESET]', color='yellow', bold=True)
-                # print(
-                #     f"{ack_reset_tag} Resetting counters for MCS{record['mcs_index']}",
-                #     flush=True,
-                # )
+                ack_reset_tag = color_text('[ACK_RESET]', color='yellow', bold=True)
+                print(
+                    f"{ack_reset_tag} Resetting counters for MCS{record['mcs_index']}",
+                    flush=True,
+                )
                 # Reset running counters for next MCS test
                 segment_id += 1
                 current_mcs_index = record['mcs_index']
@@ -1127,14 +1124,13 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                             })
                             if ack_pdr_file_fd is not None:
                                 ack_pdr_file_fd.flush()
-                        # Silenced for fast sweep mode. Uncomment to show final PDR at each MCS switch.
-                        # ack_pdr_final_tag = color_text('[ACK_PDR_FINAL]', color='green', bold=True)
-                        # mcs_text = f" mcs=MCS{current_mcs_index}" if current_mcs_index is not None else ""
-                        # print(
-                        #     f"{ack_pdr_final_tag} sent={ack_record['sent']} delivered={ack_record['delivered']} "
-                        #     f"{mcs_text} pdr={color_pdr_percent(ack_record['pdr_percent'])} (MCS rate switch complete)",
-                        #     flush=True,
-                        # )
+                        ack_pdr_final_tag = color_text('[ACK_PDR_FINAL]', color='green', bold=True)
+                        mcs_text = f" mcs=MCS{current_mcs_index}" if current_mcs_index is not None else ""
+                        print(
+                            f"{ack_pdr_final_tag} sent={ack_record['sent']} delivered={ack_record['delivered']} "
+                            f"{mcs_text} pdr={color_pdr_percent(ack_record['pdr_percent'])} (MCS rate switch complete)",
+                            flush=True,
+                        )
                         continue
 
                     if ack_record['type'] == 'ACK_SERVICE':
@@ -1153,29 +1149,27 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                         continue
 
                     if ack_record['type'] == 'ACK_SERVICE_FINAL':
-                        # Silenced for fast sweep mode. Uncomment to show service stats at each MCS switch.
-                        # ack_service_final_tag = color_text('[ACK_SERVICE_FINAL]', color='blue', bold=True)
-                        # median_text = (
-                        #     f" median_service_us={ack_record['median_service_us']:.1f}"
-                        #     if ack_record.get('median_service_us') is not None else ""
-                        # )
-                        # mcs_text = f" mcs=MCS{current_mcs_index}" if current_mcs_index is not None else ""
-                        # print(
-                        #     f"{ack_service_final_tag} total={ack_record['total']} delivered={ack_record['delivered']} "
-                        #     f"{mcs_text} avg_service_us={ack_record['avg_service_us']:.1f}{median_text} "
-                        #     f"goodput_mbps={ack_record['goodput_mbps']:.3f} "
-                        #     f"(MCS rate switch complete)",
-                        #     flush=True,
-                        # )
+                        ack_service_final_tag = color_text('[ACK_SERVICE_FINAL]', color='blue', bold=True)
+                        median_text = (
+                            f" median_service_us={ack_record['median_service_us']:.1f}"
+                            if ack_record.get('median_service_us') is not None else ""
+                        )
+                        mcs_text = f" mcs=MCS{current_mcs_index}" if current_mcs_index is not None else ""
+                        print(
+                            f"{ack_service_final_tag} total={ack_record['total']} delivered={ack_record['delivered']} "
+                            f"{mcs_text} avg_service_us={ack_record['avg_service_us']:.1f}{median_text} "
+                            f"goodput_mbps={ack_record['goodput_mbps']:.3f} "
+                            f"(MCS rate switch complete)",
+                            flush=True,
+                        )
                         continue
 
                     if ack_record['type'] == 'ACK_RESET':
-                        # Silenced for fast sweep mode. Uncomment to show counter resets at each MCS switch.
-                        # ack_reset_tag = color_text('[ACK_RESET]', color='yellow', bold=True)
-                        # print(
-                        #     f"{ack_reset_tag} Resetting counters for MCS{ack_record['mcs_index']}",
-                        #     flush=True,
-                        # )
+                        ack_reset_tag = color_text('[ACK_RESET]', color='yellow', bold=True)
+                        print(
+                            f"{ack_reset_tag} Resetting counters for MCS{ack_record['mcs_index']}",
+                            flush=True,
+                        )
                         segment_id += 1
                         current_mcs_index = ack_record['mcs_index']
                         set_current_mcs(current_mcs_index, 'ack_reset', None)

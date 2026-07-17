@@ -68,6 +68,12 @@
 #define CONFIG_MCS_RECOMMENDATION_ENABLED 1 // 1 = enable MCS recommendation feature, 0 = disable
 #define CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS 20  // 1=every packet, N=every N data packets
 #define CONFIG_MCS_RECOMMENDATION_USE_MODEL 1  // 1=use ML model, 0=use RSSI-based heuristic
+#ifndef CONFIG_MCS_RECOMMENDATION_SEND_ON_CHANGE
+#define CONFIG_MCS_RECOMMENDATION_SEND_ON_CHANGE 1
+#endif
+#ifndef CONFIG_MCS_RECOMMENDATION_KEEPALIVE_EVERY_N_PACKETS
+#define CONFIG_MCS_RECOMMENDATION_KEEPALIVE_EVERY_N_PACKETS 1000
+#endif
 #ifndef CONFIG_CSI_DQN_RECOMMENDATION_EVERY_N_PACKETS
 #define CONFIG_CSI_DQN_RECOMMENDATION_EVERY_N_PACKETS 1
 #endif
@@ -114,6 +120,9 @@
 #if CONFIG_MCS_RECOMMENDATION_ENABLED
 #if CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS <= 0
 #error "CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS must be > 0"
+#endif
+#if CONFIG_MCS_RECOMMENDATION_KEEPALIVE_EVERY_N_PACKETS < 0
+#error "CONFIG_MCS_RECOMMENDATION_KEEPALIVE_EVERY_N_PACKETS must be >= 0"
 #endif
 #endif
 
@@ -178,8 +187,8 @@ typedef struct __attribute__((packed)) {
 _Static_assert(sizeof(dqn_reco_msg_t) == 12, "DQN feedback protocol size changed");
 
 #if CONFIG_MCS_RECOMMENDATION_ENABLED
-#define MCS_RECO_QUEUE_SIZE 128
-#define MCS_RECO_TASK_STACK 3072
+#define MCS_RECO_QUEUE_SIZE 8
+#define MCS_RECO_TASK_STACK 6144
 #define MCS_RECO_TASK_PRIO (tskIDLE_PRIORITY + 1)
 
 static QueueHandle_t s_mcs_reco_queue = NULL;
@@ -217,6 +226,13 @@ static uint32_t s_mcs_data_pkt_count = 0;
 #if (REWARD_MODEL_STATE_SCHEMA_LINK_V2 || REWARD_MODEL_STATE_SCHEMA_LINK_V3 || REWARD_MODEL_STATE_SCHEMA_LINK_V4)
 #error "Receiver reward-model path currently supports legacy_v1 or link_v5 headers only"
 #endif
+
+typedef struct {
+    uint32_t seq;
+    int8_t rssi;
+    int8_t snr;
+    float state[REWARD_MODEL_STATE_DIM];
+} mcs_reco_job_t;
 
 static float quantile_from_sorted(const float *sorted, int n, float q)
 {
@@ -427,23 +443,66 @@ static uint8_t recommend_mcs_from_rssi(int8_t rssi)
 static void mcs_recommendation_task(void *arg)
 {
     (void)arg;
-    mcs_reco_msg_t msg;
+    mcs_reco_job_t job;
+    mcs_reco_job_t incoming;
+    uint8_t have_last_sent = 0;
+    uint8_t last_sent_mcs = 0;
+    uint32_t last_sent_seq = 0;
 
     for (;;) {
-        if (xQueueReceive(s_mcs_reco_queue, &msg, portMAX_DELAY) != pdTRUE) {
+        if (xQueueReceive(s_mcs_reco_queue, &incoming, portMAX_DELAY) != pdTRUE) {
             continue;
         }
+        job = incoming;
+        while (xQueueReceive(s_mcs_reco_queue, &incoming, 0) == pdTRUE) {
+            job = incoming;
+        }
+
+        uint8_t recommended_mcs = recommend_mcs_from_rssi(job.rssi);
+        uint8_t confidence = 100;
+#if CONFIG_MCS_RECOMMENDATION_USE_MODEL
+        recommended_mcs = recommend_mcs_with_model(job.state, &confidence);
+#endif
+
+        bool should_send = true;
+#if CONFIG_MCS_RECOMMENDATION_SEND_ON_CHANGE
+        should_send = (!have_last_sent || recommended_mcs != last_sent_mcs);
+#if CONFIG_MCS_RECOMMENDATION_KEEPALIVE_EVERY_N_PACKETS > 0
+        if (have_last_sent
+                && (uint32_t)(job.seq - last_sent_seq) >= CONFIG_MCS_RECOMMENDATION_KEEPALIVE_EVERY_N_PACKETS) {
+            should_send = true;
+        }
+#endif
+#endif
+        if (!should_send) {
+            continue;
+        }
+
+        mcs_reco_msg_t msg = {
+            .magic = MCS_RECO_MAGIC,
+            .version = MCS_RECO_VERSION,
+            .recommended_mcs = recommended_mcs,
+            .confidence = confidence,
+            .seq = job.seq,
+            .rssi = job.rssi,
+            .snr = job.snr,
+            .reserved = {0, 0},
+        };
 
         esp_err_t ret = esp_now_send(CONFIG_CSI_SEND_MAC, (const uint8_t *)&msg, sizeof(msg));
         if (ret != ESP_OK) {
             ESP_LOGD(TAG, "MCS recommendation send failed: %s", esp_err_to_name(ret));
+            continue;
         }
+        have_last_sent = 1;
+        last_sent_mcs = recommended_mcs;
+        last_sent_seq = job.seq;
     }
 }
 
 static void mcs_recommendation_init(void)
 {
-    s_mcs_reco_queue = xQueueCreate(MCS_RECO_QUEUE_SIZE, sizeof(mcs_reco_msg_t));
+    s_mcs_reco_queue = xQueueCreate(MCS_RECO_QUEUE_SIZE, sizeof(mcs_reco_job_t));
     if (s_mcs_reco_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create recommendation queue");
         abort();
@@ -1095,25 +1154,15 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 
 #if CONFIG_MCS_RECOMMENDATION_ENABLED
     if ((s_mcs_data_pkt_count % CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS) == 0) {
-        int8_t snr = (int8_t)(rx_ctrl->rssi - rx_ctrl->noise_floor);
-        uint8_t recommended_mcs = recommend_mcs_from_rssi(rx_ctrl->rssi);
-        uint8_t confidence = 100;
-    #if CONFIG_MCS_RECOMMENDATION_USE_MODEL
-        float state[REWARD_MODEL_STATE_DIM] = {0};
-        build_model_state(info, rx_ctrl, fft_gain, agc_gain, compensate_gain, state);
-        recommended_mcs = recommend_mcs_with_model(state, &confidence);
-    #endif
-        mcs_reco_msg_t reco = {
-            .magic = MCS_RECO_MAGIC,
-            .version = MCS_RECO_VERSION,
-            .recommended_mcs = recommended_mcs,
-            .confidence = confidence,
+        mcs_reco_job_t job = {
             .seq = rx_id,
             .rssi = rx_ctrl->rssi,
-            .snr = snr,
-            .reserved = {0, 0},
+            .snr = (int8_t)(rx_ctrl->rssi - rx_ctrl->noise_floor),
         };
-        if (s_mcs_reco_queue == NULL || xQueueSend(s_mcs_reco_queue, &reco, 0) != pdTRUE) {
+#if CONFIG_MCS_RECOMMENDATION_USE_MODEL
+        build_model_state(info, rx_ctrl, fft_gain, agc_gain, compensate_gain, job.state);
+#endif
+        if (s_mcs_reco_queue == NULL || xQueueSend(s_mcs_reco_queue, &job, 0) != pdTRUE) {
             s_mcs_reco_drop_count++;
         }
     }

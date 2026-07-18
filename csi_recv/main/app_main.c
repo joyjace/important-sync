@@ -218,6 +218,7 @@ _Static_assert(sizeof(dqn_reco_msg_t) == 12, "DQN feedback protocol size changed
 #define MCS_RECO_QUEUE_SIZE 8
 #define MCS_RECO_TASK_STACK 6144
 #define MCS_RECO_TASK_PRIO (tskIDLE_PRIORITY + 1)
+#define MCS_RECO_CSI_VALUE_COUNT 234
 
 static QueueHandle_t s_mcs_reco_queue = NULL;
 static volatile uint32_t s_mcs_reco_drop_count = 0;
@@ -265,7 +266,14 @@ typedef struct {
     uint32_t seq;
     int8_t rssi;
     int8_t snr;
-    float state[REWARD_MODEL_STATE_DIM];
+    int8_t noise_floor;
+    int8_t fft_gain;
+    uint8_t agc_gain;
+    uint8_t channel;
+    uint16_t sig_len;
+    float compensate_gain;
+    uint16_t csi_value_count;
+    int8_t csi_values[MCS_RECO_CSI_VALUE_COUNT];
 } mcs_reco_job_t;
 
 static float quantile_from_sorted(const float *sorted, int n, float q)
@@ -300,11 +308,7 @@ static void sort_small_array(float *arr, int n)
     }
 }
 
-static void build_model_state(const wifi_csi_info_t *info,
-                              const wifi_pkt_rx_ctrl_t *rx_ctrl,
-                              int8_t fft_gain,
-                              uint8_t agc_gain,
-                              float compensate_gain,
+static void build_model_state(const mcs_reco_job_t *job,
                               float state[REWARD_MODEL_STATE_DIM])
 {
     memset(state, 0, sizeof(float) * REWARD_MODEL_STATE_DIM);
@@ -314,14 +318,14 @@ static void build_model_state(const wifi_csi_info_t *info,
     float phases[117] = {0};
     float phase_residuals[117] = {0};
 #endif
-    int amp_count = info->len / 2;
+    int amp_count = job->csi_value_count / 2;
     if (amp_count > 117) {
         amp_count = 117;
     }
 
     for (int i = 0; i < amp_count; ++i) {
-        float i_val = (float)((int16_t)(compensate_gain * (float)info->buf[2 * i]));
-        float q_val = (float)((int16_t)(compensate_gain * (float)info->buf[2 * i + 1]));
+        float i_val = (float)((int16_t)(job->compensate_gain * (float)job->csi_values[2 * i]));
+        float q_val = (float)((int16_t)(job->compensate_gain * (float)job->csi_values[2 * i + 1]));
         float amp = sqrtf(i_val * i_val + q_val * q_val);
         amps[i] = amp;
         state[i] = amp;
@@ -418,14 +422,14 @@ static void build_model_state(const wifi_csi_info_t *info,
 #endif
     }
 
-    float snr = (float)((int)rx_ctrl->rssi - (int)rx_ctrl->noise_floor);
+    float snr = (float)((int)job->rssi - (int)job->noise_floor);
 #if REWARD_MODEL_STATE_SCHEMA_LINK_V6
-    state[234] = (float)rx_ctrl->rssi;
+    state[234] = (float)job->rssi;
     state[235] = snr;
-    state[236] = (float)fft_gain;
-    state[237] = (float)agc_gain;
-    state[238] = (float)rx_ctrl->channel;
-    state[239] = (float)rx_ctrl->sig_len;
+    state[236] = (float)job->fft_gain;
+    state[237] = (float)job->agc_gain;
+    state[238] = (float)job->channel;
+    state[239] = (float)job->sig_len;
     state[240] = log1pf(1.0f);
     state[241] = log1pf(1.0f);
     state[242] = log1pf(0.0f);
@@ -441,12 +445,12 @@ static void build_model_state(const wifi_csi_info_t *info,
     state[252] = phase_p50;
     state[253] = phase_p90;
 #else
-    state[117] = (float)rx_ctrl->rssi;
+    state[117] = (float)job->rssi;
     state[118] = snr;
-    state[119] = (float)fft_gain;
-    state[120] = (float)agc_gain;
-    state[121] = (float)rx_ctrl->channel;
-    state[122] = (float)rx_ctrl->sig_len;
+    state[119] = (float)job->fft_gain;
+    state[120] = (float)job->agc_gain;
+    state[121] = (float)job->channel;
+    state[122] = (float)job->sig_len;
 #if REWARD_MODEL_STATE_SCHEMA_LINK_V5
     state[123] = log1pf(1.0f);
     state[124] = log1pf(1.0f);
@@ -567,6 +571,7 @@ static void mcs_recommendation_task(void *arg)
     (void)arg;
     mcs_reco_job_t job;
     mcs_reco_job_t incoming;
+    float state[REWARD_MODEL_STATE_DIM] = {0};
     uint8_t have_last_sent = 0;
     uint8_t last_sent_mcs = 0;
     uint32_t last_sent_seq = 0;
@@ -583,7 +588,8 @@ static void mcs_recommendation_task(void *arg)
         uint8_t recommended_mcs = recommend_mcs_from_rssi(job.rssi);
         uint8_t confidence = 100;
 #if CONFIG_MCS_RECOMMENDATION_USE_MODEL
-        recommended_mcs = recommend_mcs_with_model(job.state, &confidence);
+        build_model_state(&job, state);
+        recommended_mcs = recommend_mcs_with_model(state, &confidence);
 #endif
 
         bool should_send = true;
@@ -655,8 +661,15 @@ static void mcs_recommendation_init(void)
 #if !BANDIT_MODEL_CONTEXT_IS_STATE_AGE_PACKETS
 #error "Live recommendation pipeline requires a causal bandit checkpoint"
 #endif
-#ifndef BANDIT_MODEL_STATE_SCHEMA_LINK_V3C
-#error "Firmware bandit path expects the link_v3c (57-amplitude) state schema"
+#if defined(BANDIT_MODEL_STATE_SCHEMA_LINK_V5)
+#if BANDIT_MODEL_INCLUDES_STATE_MCS
+#error "link_v5 bandit deployment is receiver-only; retrain with --ignore-state-mcs"
+#endif
+#if BANDIT_MODEL_STATE_DIM != 132
+#error "link_v5 receiver-only bandit requires BANDIT_MODEL_STATE_DIM=132"
+#endif
+#elif !defined(BANDIT_MODEL_STATE_SCHEMA_LINK_V3C)
+#error "Firmware bandit path expects the link_v5 or link_v3c state schema"
 #endif
 #define POLICY_MODEL_STATE_DIM BANDIT_MODEL_STATE_DIM
 #else
@@ -849,9 +862,17 @@ static void build_policy_state(const dqn_csi_job_t *job,
     state[base + 3] = (float)job->agc_gain;
     state[base + 4] = (float)job->channel;
     state[base + 5] = (float)job->sig_len;
+#if defined(BANDIT_MODEL_STATE_SCHEMA_LINK_V5)
+    /* link_v5 log-compresses the packet counters so live stale ages (up to
+     * CONFIG_CSI_DQN_STALE_MAX_AGE_PACKETS) stay inside the training range. */
+    state[base + 6] = log1pf((float)job->state_age_packets);
+    state[base + 7] = log1pf((float)job->state_packet_gap);
+    state[base + 8] = log1pf((float)job->state_missing_packets);
+#else
     state[base + 6] = (float)job->state_age_packets;
     state[base + 7] = (float)job->state_packet_gap;
     state[base + 8] = (float)job->state_missing_packets;
+#endif
     state[base + 9] = (float)job->state_is_stale;
     state[base + 10] = iq_mean;
     state[base + 11] = iq_std;
@@ -1673,9 +1694,20 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
             .seq = rx_id,
             .rssi = rx_ctrl->rssi,
             .snr = (int8_t)(rx_ctrl->rssi - rx_ctrl->noise_floor),
+            .noise_floor = rx_ctrl->noise_floor,
+            .fft_gain = fft_gain,
+            .agc_gain = agc_gain,
+            .channel = rx_ctrl->channel,
+            .sig_len = (uint16_t)rx_ctrl->sig_len,
+            .compensate_gain = compensate_gain,
         };
 #if CONFIG_MCS_RECOMMENDATION_USE_MODEL
-        build_model_state(info, rx_ctrl, fft_gain, agc_gain, compensate_gain, job.state);
+        size_t value_count = info->len;
+        if (value_count > MCS_RECO_CSI_VALUE_COUNT) {
+            value_count = MCS_RECO_CSI_VALUE_COUNT;
+        }
+        job.csi_value_count = (uint16_t)value_count;
+        memcpy(job.csi_values, info->buf, value_count);
 #endif
         if (s_mcs_reco_queue == NULL || xQueueSend(s_mcs_reco_queue, &job, 0) != pdTRUE) {
             s_mcs_reco_drop_count++;

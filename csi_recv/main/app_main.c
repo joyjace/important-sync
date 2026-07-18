@@ -39,8 +39,19 @@
 #define CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED 0
 #endif
 
+/* Model used by the live recommendation task when it is enabled:
+ * 0 = generated_dqn_model.h (Q-network), 1 = generated_bandit_model.h
+ * (two-head bandit; preferred). */
+#ifndef CONFIG_CSI_MCS_POLICY_MODEL
+#define CONFIG_CSI_MCS_POLICY_MODEL 1
+#endif
+
 #if CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED
+#if CONFIG_CSI_MCS_POLICY_MODEL == 1
+#include "generated_bandit_model.h"
+#else
 #include "generated_dqn_model.h"
+#endif
 #endif
 
 /* ESP-IDF 6.0+ renamed WIFI_BW_HT20/HT40 to WIFI_BW20/BW40. */
@@ -50,7 +61,6 @@
 #ifndef WIFI_BW_HT40
 #define WIFI_BW_HT40 WIFI_BW40
 #endif
-//test
 #define CONFIG_LESS_INTERFERENCE_CHANNEL   1
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61 || (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0))
 #define CONFIG_WIFI_BAND_MODE               WIFI_BAND_MODE_2G_ONLY
@@ -65,7 +75,23 @@
 #define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT20
 #define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS0_LGI
 #define CONFIG_MINIMIZE_CONSOLE_OUTPUT   1  // 1 = reduce non-CSI logs on UART, 0 = default logging
-#define CONFIG_MCS_RECOMMENDATION_ENABLED 1 // 1 = enable MCS recommendation feature, 0 = disable
+/*
+ * 1 = queue CSI frames out of the Wi-Fi callback and emit each frame as one
+ *     CRC-protected CSI_B64 line (base64 raw payload) from a dedicated task.
+ *     Roughly 2.5x smaller lines than CSI_DATA, no mid-line interleaving with
+ *     other console output, and the Wi-Fi task never blocks on the UART.
+ * 0 = legacy synchronous CSI_DATA decimal lines via ets_printf.
+ */
+#ifndef CONFIG_CSI_OUTPUT_ASYNC_COMPACT
+#define CONFIG_CSI_OUTPUT_ASYNC_COMPACT  1
+#endif
+/*
+ * Keep this DISABLED for RANDOM_SWEEP data collection. The every-N-packets
+ * recommendation transmit collides with the sender's stop-and-wait stream
+ * (its Wi-Fi retry train costs ~5 data packets per recommendation, a
+ * 15-22% uniform loss floor at N=20). Enable only for live-policy runs.
+ */
+#define CONFIG_MCS_RECOMMENDATION_ENABLED 0 // 1 = enable MCS recommendation feature, 0 = disable
 #define CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS 20  // 1=every packet, N=every N data packets
 #define CONFIG_MCS_RECOMMENDATION_USE_MODEL 1  // 1=use ML model, 0=use RSSI-based heuristic
 #ifndef CONFIG_MCS_RECOMMENDATION_SEND_ON_CHANGE
@@ -90,7 +116,7 @@
 #define CONFIG_CSI_DQN_LOG_ENABLED 1
 #endif
 #define CONFIG_IDENTICAL_TX_PAYLOAD         0  // Match csi_send: 1 = payload carries no per-packet sequence
-/* Bitrate options (choose one for `CONFIG_ESP_NOW_RATE` - type `wifi_phy_rate_t`):                                                                             
+/* Bitrate options (choose one for `CONFIG_ESP_NOW_RATE` - type `wifi_phy_rate_t`):
  *
  * Legacy (802.11b/g):
  *  - WIFI_PHY_RATE_1M_L, WIFI_PHY_RATE_2M_L, WIFI_PHY_RATE_5M5_L, WIFI_PHY_RATE_11M_L
@@ -161,6 +187,8 @@ static const char *TAG = "csi_recv";
 #define MCS_RECO_VERSION 1
 #define DQN_RECO_MAGIC 0xD7
 #define DQN_RECO_VERSION 1
+#define CSI_PHASE_PI 3.14159265358979323846f
+#define CSI_PHASE_TWO_PI 6.28318530717958647692f
 
 typedef struct __attribute__((packed)) {
     uint8_t magic;
@@ -213,18 +241,24 @@ static uint32_t s_mcs_data_pkt_count = 0;
 #ifndef REWARD_MODEL_STATE_SCHEMA_LINK_V5
 #define REWARD_MODEL_STATE_SCHEMA_LINK_V5 0
 #endif
+#ifndef REWARD_MODEL_STATE_SCHEMA_LINK_V6
+#define REWARD_MODEL_STATE_SCHEMA_LINK_V6 0
+#endif
 
 #if REWARD_MODEL_INCLUDES_STATE_MCS
 #error "Receiver reward-model path does not support source/current-MCS conditioned reward models"
 #endif
-#if REWARD_MODEL_STATE_SCHEMA_LINK_V5 && !REWARD_MODEL_CONTEXT_IS_STATE_AGE_PACKETS
-#error "link_v5 reward model requires state_age_packets context"
+#if (REWARD_MODEL_STATE_SCHEMA_LINK_V5 || REWARD_MODEL_STATE_SCHEMA_LINK_V6) && !REWARD_MODEL_CONTEXT_IS_STATE_AGE_PACKETS
+#error "link_v5/link_v6 reward model requires state_age_packets context"
 #endif
 #if REWARD_MODEL_STATE_SCHEMA_LINK_V5 && REWARD_MODEL_STATE_DIM != 132
 #error "link_v5 reward model without state_mcs requires REWARD_MODEL_STATE_DIM=132"
 #endif
+#if REWARD_MODEL_STATE_SCHEMA_LINK_V6 && REWARD_MODEL_STATE_DIM != 254
+#error "link_v6 reward model without state_mcs requires REWARD_MODEL_STATE_DIM=254"
+#endif
 #if (REWARD_MODEL_STATE_SCHEMA_LINK_V2 || REWARD_MODEL_STATE_SCHEMA_LINK_V3 || REWARD_MODEL_STATE_SCHEMA_LINK_V4)
-#error "Receiver reward-model path currently supports legacy_v1 or link_v5 headers only"
+#error "Receiver reward-model path currently supports legacy_v1, link_v5, or link_v6 headers only"
 #endif
 
 typedef struct {
@@ -276,6 +310,10 @@ static void build_model_state(const wifi_csi_info_t *info,
     memset(state, 0, sizeof(float) * REWARD_MODEL_STATE_DIM);
 
     float amps[117] = {0};
+#if REWARD_MODEL_STATE_SCHEMA_LINK_V6
+    float phases[117] = {0};
+    float phase_residuals[117] = {0};
+#endif
     int amp_count = info->len / 2;
     if (amp_count > 117) {
         amp_count = 117;
@@ -287,6 +325,18 @@ static void build_model_state(const wifi_csi_info_t *info,
         float amp = sqrtf(i_val * i_val + q_val * q_val);
         amps[i] = amp;
         state[i] = amp;
+#if REWARD_MODEL_STATE_SCHEMA_LINK_V6
+        float phase = atan2f(q_val, i_val);
+        if (i > 0) {
+            while ((phase - phases[i - 1]) > CSI_PHASE_PI) {
+                phase -= CSI_PHASE_TWO_PI;
+            }
+            while ((phase - phases[i - 1]) < -CSI_PHASE_PI) {
+                phase += CSI_PHASE_TWO_PI;
+            }
+        }
+        phases[i] = phase;
+#endif
     }
 
     float iq_mean = 0.0f;
@@ -294,6 +344,13 @@ static void build_model_state(const wifi_csi_info_t *info,
     float iq_p10 = 0.0f;
     float iq_p50 = 0.0f;
     float iq_p90 = 0.0f;
+#if REWARD_MODEL_STATE_SCHEMA_LINK_V6
+    float phase_mean = 0.0f;
+    float phase_std = 0.0f;
+    float phase_p10 = 0.0f;
+    float phase_p50 = 0.0f;
+    float phase_p90 = 0.0f;
+#endif
 
     if (amp_count > 0) {
         float sum = 0.0f;
@@ -317,9 +374,73 @@ static void build_model_state(const wifi_csi_info_t *info,
         iq_p10 = quantile_from_sorted(sorted, amp_count, 0.10f);
         iq_p50 = quantile_from_sorted(sorted, amp_count, 0.50f);
         iq_p90 = quantile_from_sorted(sorted, amp_count, 0.90f);
+
+#if REWARD_MODEL_STATE_SCHEMA_LINK_V6
+        float phase_sum = 0.0f;
+        for (int i = 0; i < amp_count; ++i) {
+            phase_sum += phases[i];
+        }
+        float x_mean = ((float)amp_count - 1.0f) * 0.5f;
+        float y_mean = phase_sum / (float)amp_count;
+        float denom = 0.0f;
+        float numer = 0.0f;
+        for (int i = 0; i < amp_count; ++i) {
+            float x_delta = (float)i - x_mean;
+            denom += x_delta * x_delta;
+            numer += x_delta * (phases[i] - y_mean);
+        }
+        float slope = (denom > 0.0f) ? (numer / denom) : 0.0f;
+        float intercept = y_mean - slope * x_mean;
+        float residual_sum = 0.0f;
+        float residual_sum_sq = 0.0f;
+        for (int i = 0; i < amp_count; ++i) {
+            float residual = phases[i] - (slope * (float)i + intercept);
+            phase_residuals[i] = residual;
+            state[117 + i] = residual;
+            residual_sum += residual;
+            residual_sum_sq += residual * residual;
+        }
+        phase_mean = residual_sum / (float)amp_count;
+        float phase_variance = (residual_sum_sq / (float)amp_count) - (phase_mean * phase_mean);
+        if (phase_variance < 0.0f) {
+            phase_variance = 0.0f;
+        }
+        phase_std = sqrtf(phase_variance);
+
+        float sorted_phase[117] = {0};
+        for (int i = 0; i < amp_count; ++i) {
+            sorted_phase[i] = phase_residuals[i];
+        }
+        sort_small_array(sorted_phase, amp_count);
+        phase_p10 = quantile_from_sorted(sorted_phase, amp_count, 0.10f);
+        phase_p50 = quantile_from_sorted(sorted_phase, amp_count, 0.50f);
+        phase_p90 = quantile_from_sorted(sorted_phase, amp_count, 0.90f);
+#endif
     }
 
     float snr = (float)((int)rx_ctrl->rssi - (int)rx_ctrl->noise_floor);
+#if REWARD_MODEL_STATE_SCHEMA_LINK_V6
+    state[234] = (float)rx_ctrl->rssi;
+    state[235] = snr;
+    state[236] = (float)fft_gain;
+    state[237] = (float)agc_gain;
+    state[238] = (float)rx_ctrl->channel;
+    state[239] = (float)rx_ctrl->sig_len;
+    state[240] = log1pf(1.0f);
+    state[241] = log1pf(1.0f);
+    state[242] = log1pf(0.0f);
+    state[243] = 0.0f;
+    state[244] = iq_mean;
+    state[245] = iq_std;
+    state[246] = iq_p10;
+    state[247] = iq_p50;
+    state[248] = iq_p90;
+    state[249] = phase_mean;
+    state[250] = phase_std;
+    state[251] = phase_p10;
+    state[252] = phase_p50;
+    state[253] = phase_p90;
+#else
     state[117] = (float)rx_ctrl->rssi;
     state[118] = snr;
     state[119] = (float)fft_gain;
@@ -342,6 +463,7 @@ static void build_model_state(const wifi_csi_info_t *info,
     state[125] = iq_p10;
     state[126] = iq_p50;
     state[127] = iq_p90;
+#endif
 #endif
 }
 
@@ -523,11 +645,23 @@ static void mcs_recommendation_init(void)
 #endif
 
 #if CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED
+#if (CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61) && CSI_FORCE_LLTF
+#error "Live recommendation pipeline does not support packed force-LLTF CSI"
+#endif
+#if CONFIG_CSI_MCS_POLICY_MODEL == 1
+#if BANDIT_MODEL_ACTION_DIM != 8
+#error "Live recommendation pipeline requires an 8-action bandit model"
+#endif
+#if !BANDIT_MODEL_CONTEXT_IS_STATE_AGE_PACKETS
+#error "Live recommendation pipeline requires a causal bandit checkpoint"
+#endif
+#ifndef BANDIT_MODEL_STATE_SCHEMA_LINK_V3C
+#error "Firmware bandit path expects the link_v3c (57-amplitude) state schema"
+#endif
+#define POLICY_MODEL_STATE_DIM BANDIT_MODEL_STATE_DIM
+#else
 #if DQN_MODEL_ACTION_DIM != 8
 #error "DQN firmware pipeline requires an 8-output model"
-#endif
-#if (CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61) && CSI_FORCE_LLTF
-#error "DQN firmware pipeline does not support packed force-LLTF CSI"
 #endif
 #if !DQN_MODEL_CONTEXT_IS_STATE_AGE_PACKETS
 #error "DQN firmware pipeline requires causal state age"
@@ -544,15 +678,24 @@ static void mcs_recommendation_init(void)
 #ifndef DQN_MODEL_STATE_SCHEMA_LINK_V5
 #define DQN_MODEL_STATE_SCHEMA_LINK_V5 0
 #endif
+#ifndef DQN_MODEL_STATE_SCHEMA_LINK_V6
+#define DQN_MODEL_STATE_SCHEMA_LINK_V6 0
+#endif
 
-#if (DQN_MODEL_STATE_SCHEMA_LINK_V3 || DQN_MODEL_STATE_SCHEMA_LINK_V4 || DQN_MODEL_STATE_SCHEMA_LINK_V5) && !DQN_MODEL_STATE_SCHEMA_LINK_V2
+#if (DQN_MODEL_STATE_SCHEMA_LINK_V3 || DQN_MODEL_STATE_SCHEMA_LINK_V4 || DQN_MODEL_STATE_SCHEMA_LINK_V5 || DQN_MODEL_STATE_SCHEMA_LINK_V6) && !DQN_MODEL_STATE_SCHEMA_LINK_V2
 /*
- * link_v3/link_v4/link_v5 are extensions of link_v2. Older generated
+ * link_v3/link_v4/link_v5/link_v6 are extensions of link_v2. Older generated
  * headers only defined LINK_V2, so keep the check explicit for schema-aware
  * exports.
  */
 #endif
 
+#if DQN_MODEL_STATE_SCHEMA_LINK_V6 && DQN_MODEL_INCLUDES_STATE_MCS && DQN_MODEL_STATE_DIM != 262
+#error "link_v6 DQN with state_mcs requires DQN_MODEL_STATE_DIM=262"
+#endif
+#if DQN_MODEL_STATE_SCHEMA_LINK_V6 && !DQN_MODEL_INCLUDES_STATE_MCS && DQN_MODEL_STATE_DIM != 254
+#error "link_v6 DQN without state_mcs requires DQN_MODEL_STATE_DIM=254"
+#endif
 #if DQN_MODEL_STATE_SCHEMA_LINK_V5 && DQN_MODEL_INCLUDES_STATE_MCS && DQN_MODEL_STATE_DIM != 140
 #error "link_v5 DQN with state_mcs requires DQN_MODEL_STATE_DIM=140"
 #endif
@@ -564,6 +707,8 @@ static void mcs_recommendation_init(void)
 #endif
 #if DQN_MODEL_STATE_SCHEMA_LINK_V4 && !DQN_MODEL_INCLUDES_STATE_MCS && DQN_MODEL_STATE_DIM != 135
 #error "link_v4 DQN without state_mcs requires DQN_MODEL_STATE_DIM=135"
+#endif
+#define POLICY_MODEL_STATE_DIM DQN_MODEL_STATE_DIM
 #endif
 
 #define DQN_CSI_VALUE_COUNT 234
@@ -650,22 +795,23 @@ static float dqn_quantile_from_sorted(const float *values, int count, float quan
     return values[lower] * (1.0f - fraction) + values[upper] * fraction;
 }
 
-static float dqn_log1p_count_u16(uint16_t value)
+#if CONFIG_CSI_MCS_POLICY_MODEL == 1
+/* Build the bandit link_v3c state: 57 gain-compensated subcarrier amplitudes,
+ * 15 link features, and a one-hot of the MCS that produced the CSI. Feature
+ * order must match state_feature_names('link_v3c', include_state_mcs=True) in
+ * tools/rl/DQN/dqn_model/train_dqn.py. Normalization happens inside the
+ * generated bandit inference. */
+static void build_policy_state(const dqn_csi_job_t *job,
+                               float state[BANDIT_MODEL_STATE_DIM])
 {
-    return log1pf((float)value);
-}
-
-static void build_dqn_state(const dqn_csi_job_t *job,
-                            float state[DQN_MODEL_STATE_DIM])
-{
-    memset(state, 0, sizeof(float) * DQN_MODEL_STATE_DIM);
+    memset(state, 0, sizeof(float) * BANDIT_MODEL_STATE_DIM);
 
     int amplitude_count = (int)job->csi_value_count / 2;
-    if (amplitude_count > 117) {
-        amplitude_count = 117;
+    if (amplitude_count > BANDIT_MODEL_AMPLITUDE_COUNT) {
+        amplitude_count = BANDIT_MODEL_AMPLITUDE_COUNT;
     }
 
-    float amplitudes[117] = {0};
+    float amplitudes[BANDIT_MODEL_AMPLITUDE_COUNT] = {0};
     float sum = 0.0f;
     float sum_sq = 0.0f;
     for (int i = 0; i < amplitude_count; ++i) {
@@ -696,7 +842,170 @@ static void build_dqn_state(const dqn_csi_job_t *job,
         iq_p90 = dqn_quantile_from_sorted(amplitudes, amplitude_count, 0.90f);
     }
 
-#if DQN_MODEL_STATE_SCHEMA_LINK_V5
+    const int base = BANDIT_MODEL_AMPLITUDE_COUNT;
+    state[base + 0] = (float)job->rssi;
+    state[base + 1] = (float)((int)job->rssi - (int)job->noise_floor);
+    state[base + 2] = (float)job->fft_gain;
+    state[base + 3] = (float)job->agc_gain;
+    state[base + 4] = (float)job->channel;
+    state[base + 5] = (float)job->sig_len;
+    state[base + 6] = (float)job->state_age_packets;
+    state[base + 7] = (float)job->state_packet_gap;
+    state[base + 8] = (float)job->state_missing_packets;
+    state[base + 9] = (float)job->state_is_stale;
+    state[base + 10] = iq_mean;
+    state[base + 11] = iq_std;
+    state[base + 12] = iq_p10;
+    state[base + 13] = iq_p50;
+    state[base + 14] = iq_p90;
+#if BANDIT_MODEL_INCLUDES_STATE_MCS
+    uint8_t state_mcs = job->state_mcs_index <= 7U ? job->state_mcs_index : 0U;
+    state[base + 15 + state_mcs] = 1.0f;
+#endif
+}
+
+static uint8_t policy_predict_mcs(const float state[BANDIT_MODEL_STATE_DIM],
+                                  float *best_out,
+                                  float *second_out)
+{
+    return bandit_model_predict_best_mcs(state, best_out, second_out);
+}
+#else /* CONFIG_CSI_MCS_POLICY_MODEL == 0: Q-network */
+static float dqn_log1p_count_u16(uint16_t value)
+{
+    return log1pf((float)value);
+}
+
+static void build_dqn_state(const dqn_csi_job_t *job,
+                            float state[DQN_MODEL_STATE_DIM])
+{
+    memset(state, 0, sizeof(float) * DQN_MODEL_STATE_DIM);
+
+    int amplitude_count = (int)job->csi_value_count / 2;
+    if (amplitude_count > 117) {
+        amplitude_count = 117;
+    }
+
+    float amplitudes[117] = {0};
+    float phases[117] = {0};
+    float phase_residuals[117] = {0};
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    for (int i = 0; i < amplitude_count; ++i) {
+        float i_value = (float)job->csi_values[2 * i];
+        float q_value = (float)job->csi_values[2 * i + 1];
+        float amplitude = sqrtf(i_value * i_value + q_value * q_value);
+        amplitudes[i] = amplitude;
+        state[i] = amplitude;
+        sum += amplitude;
+        sum_sq += amplitude * amplitude;
+#if DQN_MODEL_STATE_SCHEMA_LINK_V6
+        float phase = atan2f(q_value, i_value);
+        if (i > 0) {
+            while ((phase - phases[i - 1]) > CSI_PHASE_PI) {
+                phase -= CSI_PHASE_TWO_PI;
+            }
+            while ((phase - phases[i - 1]) < -CSI_PHASE_PI) {
+                phase += CSI_PHASE_TWO_PI;
+            }
+        }
+        phases[i] = phase;
+#endif
+    }
+
+    float iq_mean = 0.0f;
+    float iq_std = 0.0f;
+    float iq_p10 = 0.0f;
+    float iq_p50 = 0.0f;
+    float iq_p90 = 0.0f;
+    float phase_mean = 0.0f;
+    float phase_std = 0.0f;
+    float phase_p10 = 0.0f;
+    float phase_p50 = 0.0f;
+    float phase_p90 = 0.0f;
+    if (amplitude_count > 0) {
+        iq_mean = sum / (float)amplitude_count;
+        float variance = (sum_sq / (float)amplitude_count) - (iq_mean * iq_mean);
+        if (variance < 0.0f) {
+            variance = 0.0f;
+        }
+        iq_std = sqrtf(variance);
+        dqn_sort_small_array(amplitudes, amplitude_count);
+        iq_p10 = dqn_quantile_from_sorted(amplitudes, amplitude_count, 0.10f);
+        iq_p50 = dqn_quantile_from_sorted(amplitudes, amplitude_count, 0.50f);
+        iq_p90 = dqn_quantile_from_sorted(amplitudes, amplitude_count, 0.90f);
+
+#if DQN_MODEL_STATE_SCHEMA_LINK_V6
+        float phase_sum = 0.0f;
+        for (int i = 0; i < amplitude_count; ++i) {
+            phase_sum += phases[i];
+        }
+        float x_mean = ((float)amplitude_count - 1.0f) * 0.5f;
+        float y_mean = phase_sum / (float)amplitude_count;
+        float denom = 0.0f;
+        float numer = 0.0f;
+        for (int i = 0; i < amplitude_count; ++i) {
+            float x_delta = (float)i - x_mean;
+            denom += x_delta * x_delta;
+            numer += x_delta * (phases[i] - y_mean);
+        }
+        float slope = (denom > 0.0f) ? (numer / denom) : 0.0f;
+        float intercept = y_mean - slope * x_mean;
+        float residual_sum = 0.0f;
+        float residual_sum_sq = 0.0f;
+        for (int i = 0; i < amplitude_count; ++i) {
+            float residual = phases[i] - (slope * (float)i + intercept);
+            phase_residuals[i] = residual;
+            state[117 + i] = residual;
+            residual_sum += residual;
+            residual_sum_sq += residual * residual;
+        }
+        phase_mean = residual_sum / (float)amplitude_count;
+        float phase_variance = (residual_sum_sq / (float)amplitude_count) - (phase_mean * phase_mean);
+        if (phase_variance < 0.0f) {
+            phase_variance = 0.0f;
+        }
+        phase_std = sqrtf(phase_variance);
+
+        float sorted_phase[117] = {0};
+        for (int i = 0; i < amplitude_count; ++i) {
+            sorted_phase[i] = phase_residuals[i];
+        }
+        dqn_sort_small_array(sorted_phase, amplitude_count);
+        phase_p10 = dqn_quantile_from_sorted(sorted_phase, amplitude_count, 0.10f);
+        phase_p50 = dqn_quantile_from_sorted(sorted_phase, amplitude_count, 0.50f);
+        phase_p90 = dqn_quantile_from_sorted(sorted_phase, amplitude_count, 0.90f);
+#endif
+    }
+
+#if DQN_MODEL_STATE_SCHEMA_LINK_V6
+    state[234] = (float)job->rssi;
+    state[235] = (float)((int)job->rssi - (int)job->noise_floor);
+    state[236] = (float)job->fft_gain;
+    state[237] = (float)job->agc_gain;
+    state[238] = (float)job->channel;
+    state[239] = (float)job->sig_len;
+    state[240] = dqn_log1p_count_u16(job->state_age_packets);
+    state[241] = dqn_log1p_count_u16(job->state_packet_gap);
+    state[242] = dqn_log1p_count_u16(job->state_missing_packets);
+    state[243] = (float)job->state_is_stale;
+    state[244] = iq_mean;
+    state[245] = iq_std;
+    state[246] = iq_p10;
+    state[247] = iq_p50;
+    state[248] = iq_p90;
+    state[249] = phase_mean;
+    state[250] = phase_std;
+    state[251] = phase_p10;
+    state[252] = phase_p50;
+    state[253] = phase_p90;
+#if DQN_MODEL_INCLUDES_STATE_MCS
+    uint8_t state_mcs = job->state_mcs_index <= 7U ? job->state_mcs_index : 0U;
+    if ((254 + state_mcs) < DQN_MODEL_STATE_DIM) {
+        state[254 + state_mcs] = 1.0f;
+    }
+#endif
+#elif DQN_MODEL_STATE_SCHEMA_LINK_V5
     state[117] = (float)job->rssi;
     state[118] = (float)((int)job->rssi - (int)job->noise_floor);
     state[119] = (float)job->fft_gain;
@@ -868,12 +1177,16 @@ static uint8_t dqn_predict_mcs(const float state[DQN_MODEL_STATE_DIM],
     return best_action;
 }
 
+#define build_policy_state build_dqn_state
+#define policy_predict_mcs dqn_predict_mcs
+#endif /* CONFIG_CSI_MCS_POLICY_MODEL */
+
 static void dqn_inference_task(void *arg)
 {
     (void)arg;
     dqn_csi_job_t job = {0};
     dqn_csi_job_t incoming = {0};
-    float state[DQN_MODEL_STATE_DIM] = {0};
+    float state[POLICY_MODEL_STATE_DIM] = {0};
     bool have_state = false;
     TickType_t interval_ticks = pdMS_TO_TICKS(CONFIG_CSI_DQN_CONTROL_INTERVAL_MS);
     if (interval_ticks < 1) {
@@ -918,10 +1231,10 @@ static void dqn_inference_task(void *arg)
         }
 
         int64_t start_us = esp_timer_get_time();
-        build_dqn_state(&job, state);
+        build_policy_state(&job, state);
         float best_q = 0.0f;
         float second_q = 0.0f;
-        uint8_t recommended_mcs = dqn_predict_mcs(state, &best_q, &second_q);
+        uint8_t recommended_mcs = policy_predict_mcs(state, &best_q, &second_q);
         float margin = best_q - second_q;
         if (margin < 0.0f) {
             margin = 0.0f;
@@ -1096,14 +1409,216 @@ static void wifi_esp_now_init(esp_now_peer_info_t peer)
     ESP_ERROR_CHECK(esp_now_set_pmk((uint8_t *)"pmk1234567890123"));
     esp_now_rate_config_t rate_config = {
         .phymode = CONFIG_ESP_NOW_PHYMODE,
-        .rate = CONFIG_ESP_NOW_RATE,//  WIFI_PHY_RATE_MCS0_LGI,
+        .rate = CONFIG_ESP_NOW_RATE,
         .ersu = false,
         .dcm = false
     };
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
     ESP_ERROR_CHECK(esp_now_set_peer_rate_config(peer.peer_addr, &rate_config));
-
 }
+
+#if CONFIG_CSI_OUTPUT_ASYNC_COMPACT
+
+#if defined(CSI_FORCE_LLTF) && CSI_FORCE_LLTF
+#error "CONFIG_CSI_OUTPUT_ASYNC_COMPACT does not support packed force-LLTF CSI"
+#endif
+
+#define CSI_OUT_MAX_VALUES   384   /* raw CSI bytes forwarded per frame */
+#define CSI_OUT_QUEUE_SIZE   32
+#define CSI_OUT_LINE_MAX     704
+#define CSI_OUT_TASK_STACK   4096
+#define CSI_OUT_TASK_PRIO    (tskIDLE_PRIORITY + 1)
+
+typedef struct {
+    uint32_t seq;
+    uint8_t mac[6];
+    int8_t rssi;
+    uint32_t rate;
+    int8_t noise_floor;
+    int8_t fft_gain;
+    uint8_t agc_gain;
+    uint8_t channel;
+    uint32_t timestamp;
+    uint16_t sig_len;
+    uint8_t rx_state;
+    uint8_t first_word_invalid;
+    float compensate_gain;
+    uint16_t len;
+    int8_t buf[CSI_OUT_MAX_VALUES];
+} csi_out_job_t;
+
+static QueueHandle_t s_csi_out_queue = NULL;
+static volatile uint32_t s_csi_out_drop_count = 0;
+
+/* CRC16-CCITT (poly 0x1021, init 0xFFFF) over the line text before the CRC field. */
+static uint16_t csi_out_crc16(const uint8_t *data, size_t len)
+{
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+static size_t csi_out_base64(const int8_t *src, size_t len, char *dst)
+{
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const uint8_t *bytes = (const uint8_t *)src;
+    size_t out = 0;
+    size_t i = 0;
+
+    for (; i + 2 < len; i += 3) {
+        uint32_t chunk = ((uint32_t)bytes[i] << 16) | ((uint32_t)bytes[i + 1] << 8) | bytes[i + 2];
+        dst[out++] = alphabet[(chunk >> 18) & 0x3F];
+        dst[out++] = alphabet[(chunk >> 12) & 0x3F];
+        dst[out++] = alphabet[(chunk >> 6) & 0x3F];
+        dst[out++] = alphabet[chunk & 0x3F];
+    }
+    if (i < len) {
+        uint32_t chunk = (uint32_t)bytes[i] << 16;
+        if (i + 1 < len) {
+            chunk |= (uint32_t)bytes[i + 1] << 8;
+        }
+        dst[out++] = alphabet[(chunk >> 18) & 0x3F];
+        dst[out++] = alphabet[(chunk >> 12) & 0x3F];
+        dst[out++] = (i + 1 < len) ? alphabet[(chunk >> 6) & 0x3F] : '=';
+        dst[out++] = '=';
+    }
+    dst[out] = '\0';
+    return out;
+}
+
+static uint32_t csi_out_rate_value(const wifi_pkt_rx_ctrl_t *rx_ctrl)
+{
+#if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
+#if CONFIG_SOC_WIFI_HE_SUPPORT
+    if (rx_ctrl->cur_bb_format == RX_BB_FORMAT_HT) {
+        return (uint32_t)(rx_ctrl->he_siga1 & 0x7F);
+    }
+    return rx_ctrl->rate;
+#else
+    return (rx_ctrl->sig_mode == 1) ? (uint32_t)rx_ctrl->mcs : (uint32_t)rx_ctrl->rate;
+#endif
+#else
+    return (rx_ctrl->sig_mode == 1) ? (uint32_t)rx_ctrl->mcs : (uint32_t)rx_ctrl->rate;
+#endif
+}
+
+/*
+ * Emit queued CSI frames as single-write, CRC-protected lines:
+ *
+ *   CSI_B64,<ver>,<seq>,<mac>,<rssi>,<rate>,<noise_floor>,<fft_gain>,
+ *   <agc_gain>,<channel>,<timestamp>,<sig_len>,<rx_state>,<len>,
+ *   <first_word_invalid>,<compensate_gain>,<encoding>,<base64 payload>,<crc16>
+ *
+ * The payload is the raw int8 CSI buffer; the host applies compensate_gain.
+ * One fwrite per line keeps other console output from splicing into frames.
+ */
+static void csi_out_task(void *arg)
+{
+    (void)arg;
+    static char line[CSI_OUT_LINE_MAX];
+    csi_out_job_t job;
+    uint32_t reported_drops = 0;
+
+    printf("CSI_B64_HEADER,version,seq,mac,rssi,rate,noise_floor,fft_gain,agc_gain,"
+           "channel,local_timestamp,sig_len,rx_state,len,first_word,gain,encoding,data_b64,crc16\n");
+    fflush(stdout);
+
+    for (;;) {
+        if (xQueueReceive(s_csi_out_queue, &job, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        int off = snprintf(line, sizeof(line),
+                           "CSI_B64,1,%lu," MACSTR ",%d,%lu,%d,%d,%u,%u,%lu,%u,%u,%u,%u,%.6f,i8,",
+                           (unsigned long)job.seq, MAC2STR(job.mac),
+                           (int)job.rssi, (unsigned long)job.rate,
+                           (int)job.noise_floor, (int)job.fft_gain,
+                           (unsigned int)job.agc_gain, (unsigned int)job.channel,
+                           (unsigned long)job.timestamp, (unsigned int)job.sig_len,
+                           (unsigned int)job.rx_state, (unsigned int)job.len,
+                           (unsigned int)job.first_word_invalid, job.compensate_gain);
+        if (off < 0 || (size_t)off >= sizeof(line)) {
+            continue;
+        }
+
+        size_t payload_len = csi_out_base64(job.buf, job.len, &line[off]);
+        size_t total = (size_t)off + payload_len;
+        uint16_t crc = csi_out_crc16((const uint8_t *)line, total);
+        int tail = snprintf(&line[total], sizeof(line) - total, ",%04X\n", (unsigned int)crc);
+        if (tail < 0 || (size_t)tail >= sizeof(line) - total) {
+            continue;
+        }
+        total += (size_t)tail;
+
+        fwrite(line, 1, total, stdout);
+
+        uint32_t drops = s_csi_out_drop_count;
+        if (drops != reported_drops) {
+            reported_drops = drops;
+            printf("CSI_DROP,%lu,%lu\n", (unsigned long)job.seq, (unsigned long)drops);
+        }
+        fflush(stdout);
+    }
+}
+
+static void csi_out_init(void)
+{
+    s_csi_out_queue = xQueueCreate(CSI_OUT_QUEUE_SIZE, sizeof(csi_out_job_t));
+    if (s_csi_out_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create CSI output queue");
+        abort();
+    }
+    if (xTaskCreate(csi_out_task, "csi_out", CSI_OUT_TASK_STACK, NULL,
+                    CSI_OUT_TASK_PRIO, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create CSI output task");
+        vQueueDelete(s_csi_out_queue);
+        s_csi_out_queue = NULL;
+        abort();
+    }
+}
+
+/* Runs in the Wi-Fi task: copy the frame and return immediately. */
+static void csi_out_enqueue(const wifi_csi_info_t *info,
+                            const wifi_pkt_rx_ctrl_t *rx_ctrl,
+                            uint32_t rx_id,
+                            int8_t fft_gain,
+                            uint8_t agc_gain,
+                            float compensate_gain)
+{
+    csi_out_job_t job = {
+        .seq = rx_id,
+        .rssi = (int8_t)rx_ctrl->rssi,
+        .rate = csi_out_rate_value(rx_ctrl),
+        .noise_floor = (int8_t)rx_ctrl->noise_floor,
+        .fft_gain = fft_gain,
+        .agc_gain = agc_gain,
+        .channel = (uint8_t)rx_ctrl->channel,
+        .timestamp = (uint32_t)rx_ctrl->timestamp,
+        .sig_len = (uint16_t)rx_ctrl->sig_len,
+        .rx_state = (uint8_t)rx_ctrl->rx_state,
+        .first_word_invalid = info->first_word_invalid ? 1U : 0U,
+        .compensate_gain = compensate_gain,
+    };
+    memcpy(job.mac, info->mac, sizeof(job.mac));
+
+    size_t copy_len = (size_t)info->len;
+    if (copy_len > CSI_OUT_MAX_VALUES) {
+        copy_len = CSI_OUT_MAX_VALUES;
+    }
+    job.len = (uint16_t)copy_len;
+    memcpy(job.buf, info->buf, copy_len);
+
+    if (s_csi_out_queue == NULL || xQueueSend(s_csi_out_queue, &job, 0) != pdTRUE) {
+        s_csi_out_drop_count++;
+    }
+}
+#endif /* CONFIG_CSI_OUTPUT_ASYNC_COMPACT */
 
 static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 {
@@ -1204,6 +1719,10 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     s_dqn_data_pkt_count++;
 #endif
 
+#if CONFIG_CSI_OUTPUT_ASYNC_COMPACT
+    csi_out_enqueue(info, rx_ctrl, rx_id, fft_gain, agc_gain, compensate_gain);
+    s_count++;
+#else
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
     uint32_t rate_for_csv;
 #if CONFIG_SOC_WIFI_HE_SUPPORT
@@ -1253,6 +1772,7 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 #endif
     ets_printf("]\"\n");
     s_count++;
+#endif /* CONFIG_CSI_OUTPUT_ASYNC_COMPACT */
 }
 
 static void wifi_csi_init()
@@ -1341,6 +1861,9 @@ void app_main()
 
     wifi_esp_now_init(peer);
 
+#if CONFIG_CSI_OUTPUT_ASYNC_COMPACT
+    csi_out_init();
+#endif
 #if CONFIG_MCS_RECOMMENDATION_ENABLED
     mcs_recommendation_init();
 #endif

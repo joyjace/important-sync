@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
+"""Sender/receiver parameter menu with algorithm mode presets.
+
+Runs on any host that has a checkout (lab laptops, the per-device Raspberry
+Pis). Shared device configuration lives in device_menu_profile.json and is
+synced between hosts; host-local settings (serial ports, ESP-IDF export
+script, build directory) live in device_menu_local.json, which stays local
+to each machine. A mode preset edits BOTH firmware sources consistently;
+each host then builds/flashes only the board attached to it.
+"""
 import json
+import os
 import re
 import subprocess
 import sys
@@ -10,6 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SENDER_MAIN = ROOT / "csi_send" / "main" / "app_main.c"
 RECEIVER_MAIN = ROOT / "csi_recv" / "main" / "app_main.c"
 PROFILE_PATH = Path(__file__).resolve().parent / "device_menu_profile.json"
+LOCAL_PATH = Path(__file__).resolve().parent / "device_menu_local.json"
+
+IS_WINDOWS = os.name == "nt"
 
 RATE_CHOICES = [
     "WIFI_PHY_RATE_MCS0_LGI",
@@ -24,8 +37,8 @@ RATE_CHOICES = [
 
 LIVE_MCS_ALGO_CHOICES = [
     "MINSTREL_LIKE - sender ACK EWMA + probing",
-    "CUSTOM_POLICY - receiver recommendations only",
-    "DQN_POLICY - receiver DQN recommendations only",
+    "CUSTOM_POLICY - legacy reward-model receiver recommendations",
+    "RECEIVER_POLICY - receiver live-policy frames (bandit or DQN)",
 ]
 
 DEPRECATED_SENDER_KEYS = (
@@ -41,9 +54,11 @@ DEFAULT_PROFILE = {
         "esp_now_rate": "WIFI_PHY_RATE_MCS0_LGI",
         "send_frequency": 100,
         "packet_pacing_enabled": 1,
+        "ack_timing_mode": 2,
         "rate_switch_mode": 2,
         "rate_switch_interval_sec": 10,
         "rate_switch_packet_count": 1000,
+        "rate_sweep_group_size": 1,
         "payload_len": 128,
         "tx_power": 84,
         "live_mcs_selection_enabled": 1,
@@ -73,7 +88,9 @@ DEFAULT_PROFILE = {
         "esp_now_rate": "WIFI_PHY_RATE_MCS0_LGI",
         "force_gain": 1,
         "gain_control": 1,
+        "custom_mcs_recommendation_enabled": 0,
         "dqn_mcs_recommendation_enabled": 0,
+        "mcs_policy_model": 1,
         "dqn_recommendation_every_n_packets": 1,
         "dqn_warmup_packets": 100,
         "dqn_control_interval_ms": 5,
@@ -84,13 +101,134 @@ DEFAULT_PROFILE = {
         "sender_mac": "1a:00:00:00:00:00",
         "receiver_mac": "1a:00:00:00:00:01",
     },
-    "flash": {
+}
+
+if IS_WINDOWS:
+    DEFAULT_LOCAL = {
+        "sender_port": "COM3",
+        "receiver_port": "COM4",
+        "baud": 921600,
+        "export_script": str(Path.home() / "esp" / "esp-idf-v5.5.2" / "export.bat"),
+        "build_dir": "build_win",
+    }
+else:
+    DEFAULT_LOCAL = {
         "sender_port": "/dev/ttyUSB0",
         "receiver_port": "/dev/ttyUSB0",
         "baud": 921600,
         "export_script": "$HOME/esp/esp-idf/export.sh",
+        "build_dir": "build",
+    }
+
+# Algorithm mode presets. Applying one rewrites the sender AND receiver
+# profile sections so the pair stays consistent; each host then builds and
+# flashes only its own attached board. "headers" lists generated model
+# headers the receiver build needs: (relative path, required text, hint).
+MODES = {
+    "minstrel": {
+        "label": "Minstrel-like (sender-local ACK statistics, no receiver feedback)",
+        "sender": {
+            "live_mcs_selection_enabled": 1,
+            "live_mcs_algo": 0,
+            "remote_mcs_recommendation_enabled": 0,
+            "dqn_remote_recommendation_enabled": 0,
+        },
+        "receiver": {
+            "custom_mcs_recommendation_enabled": 0,
+            "dqn_mcs_recommendation_enabled": 0,
+        },
+        "headers": [],
+    },
+    "bandit": {
+        "label": "Contextual bandit (receiver live policy, link_v3c model)",
+        "sender": {
+            "live_mcs_selection_enabled": 1,
+            "live_mcs_algo": 2,
+            "remote_mcs_recommendation_enabled": 0,
+            "dqn_remote_recommendation_enabled": 1,
+        },
+        "receiver": {
+            "custom_mcs_recommendation_enabled": 0,
+            "dqn_mcs_recommendation_enabled": 1,
+            "mcs_policy_model": 1,
+        },
+        "headers": [
+            (
+                "csi_recv/main/generated_bandit_model.h",
+                "BANDIT_MODEL_STATE_SCHEMA_LINK_V3C",
+                "tools/rl/DQN/action_reward_model/export_bandit_model_to_c_header.py",
+            ),
+        ],
+    },
+    "dqn": {
+        "label": "DQN Q-network (receiver live policy)",
+        "sender": {
+            "live_mcs_selection_enabled": 1,
+            "live_mcs_algo": 2,
+            "remote_mcs_recommendation_enabled": 0,
+            "dqn_remote_recommendation_enabled": 1,
+        },
+        "receiver": {
+            "custom_mcs_recommendation_enabled": 0,
+            "dqn_mcs_recommendation_enabled": 1,
+            "mcs_policy_model": 0,
+        },
+        "headers": [
+            (
+                "csi_recv/main/generated_dqn_model.h",
+                "DQN_MODEL_STATE_DIM",
+                "tools/rl/DQN/dqn_model/export_dqn_to_c_header.py",
+            ),
+        ],
+    },
+    "reward_model": {
+        "label": "Legacy reward-model custom policy (receiver recommendations)",
+        "sender": {
+            "live_mcs_selection_enabled": 1,
+            "live_mcs_algo": 1,
+            "remote_mcs_recommendation_enabled": 1,
+            "dqn_remote_recommendation_enabled": 0,
+        },
+        "receiver": {
+            "custom_mcs_recommendation_enabled": 1,
+            "dqn_mcs_recommendation_enabled": 0,
+        },
+        "headers": [
+            (
+                "csi_recv/main/generated_reward_model_v2.h",
+                "REWARD_MODEL_STATE_DIM",
+                "tools/rl/DQN/action_reward_model/export_reward_model_to_c_header.py",
+            ),
+        ],
+    },
+    "static": {
+        "label": "Static MCS baseline (fixed rate, no adaptation)",
+        "sender": {
+            "live_mcs_selection_enabled": 0,
+            "rate_switch_mode": 2,
+        },
+        "receiver": {
+            "custom_mcs_recommendation_enabled": 0,
+            "dqn_mcs_recommendation_enabled": 0,
+        },
+        "headers": [],
+    },
+    "random_sweep": {
+        "label": "RANDOM_SWEEP data collection (uniform per-packet MCS, propensity 1/8)",
+        "sender": {
+            "live_mcs_selection_enabled": 0,
+            "rate_switch_mode": 3,
+            "ack_timing_mode": 2,
+        },
+        "receiver": {
+            "custom_mcs_recommendation_enabled": 0,
+            "dqn_mcs_recommendation_enabled": 0,
+        },
+        "headers": [],
     },
 }
+
+MODE_ORDER = ["minstrel", "bandit", "dqn", "reward_model", "static", "random_sweep"]
 
 
 def read_text(path: Path) -> str:
@@ -152,6 +290,37 @@ def save_profile(profile: dict) -> None:
     PROFILE_PATH.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
 
 
+def load_local() -> dict:
+    merged = json.loads(json.dumps(DEFAULT_LOCAL))
+
+    if LOCAL_PATH.exists():
+        local = json.loads(LOCAL_PATH.read_text(encoding="utf-8"))
+        if isinstance(local, dict):
+            merged.update(local)
+        return merged
+
+    # First run on this host: migrate the old profile["flash"] section if the
+    # synced profile still carries one (pre-split layout). Those values were
+    # Linux-style, so keep OS defaults on Windows.
+    if not IS_WINDOWS and PROFILE_PATH.exists():
+        try:
+            profile = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+            flash = profile.get("flash")
+            if isinstance(flash, dict):
+                for key in ("sender_port", "receiver_port", "baud", "export_script"):
+                    if key in flash:
+                        merged[key] = flash[key]
+        except (ValueError, OSError):
+            pass
+
+    save_local(merged)
+    return merged
+
+
+def save_local(local: dict) -> None:
+    LOCAL_PATH.write_text(json.dumps(local, indent=2) + "\n", encoding="utf-8")
+
+
 def validate_sender_profile(sender: dict) -> None:
     if sender["live_mcs_algo"] < 0 or sender["live_mcs_algo"] >= len(LIVE_MCS_ALGO_CHOICES):
         sender["live_mcs_algo"] = 0
@@ -164,6 +333,17 @@ def validate_sender_profile(sender: dict) -> None:
 
     if sender["minstrel_ewma_alpha_num"] > sender["minstrel_ewma_alpha_den"]:
         sender["minstrel_ewma_alpha_num"] = sender["minstrel_ewma_alpha_den"]
+
+    if sender.get("ack_timing_mode", 2) not in (1, 2):
+        sender["ack_timing_mode"] = 2
+
+    if sender.get("rate_sweep_group_size", 1) < 1:
+        sender["rate_sweep_group_size"] = 1
+
+    # RANDOM_SWEEP requires stop-and-wait for exact per-packet rate logging.
+    if sender.get("rate_switch_mode", 2) == 3 and sender["ack_timing_mode"] != 2:
+        print("NOTE: RANDOM_SWEEP requires stop-and-wait; forcing ack_timing_mode=2.")
+        sender["ack_timing_mode"] = 2
 
 
 def validate_receiver_profile(receiver: dict) -> None:
@@ -178,6 +358,14 @@ def validate_receiver_profile(receiver: dict) -> None:
 
     if receiver.get("dqn_stale_max_age_packets", 64) <= 0:
         receiver["dqn_stale_max_age_packets"] = 64
+
+    if receiver.get("mcs_policy_model", 1) not in (0, 1):
+        receiver["mcs_policy_model"] = 1
+
+    # Both recommendation paths on at once is a firmware compile error.
+    if receiver.get("custom_mcs_recommendation_enabled", 0) and receiver.get("dqn_mcs_recommendation_enabled", 0):
+        print("NOTE: custom and DQN recommendation paths are mutually exclusive; disabling the custom path.")
+        receiver["custom_mcs_recommendation_enabled"] = 0
 
 
 def apply_profile_to_sources(profile: dict) -> None:
@@ -195,9 +383,11 @@ def apply_profile_to_sources(profile: dict) -> None:
     sender_text = replace_define(sender_text, "CONFIG_ESP_NOW_RATE", sender["esp_now_rate"])
     sender_text = replace_define(sender_text, "CONFIG_SEND_FREQUENCY", str(sender["send_frequency"]))
     sender_text = replace_define(sender_text, "CONFIG_PACKET_PACING_ENABLED", str(sender["packet_pacing_enabled"]))
+    sender_text = replace_define(sender_text, "CONFIG_ACK_TIMING_MODE", str(sender["ack_timing_mode"]))
     sender_text = replace_define(sender_text, "CONFIG_RATE_SWITCH_MODE", str(sender["rate_switch_mode"]))
     sender_text = replace_define(sender_text, "CONFIG_RATE_SWITCH_INTERVAL_SEC", str(sender["rate_switch_interval_sec"]))
     sender_text = replace_define(sender_text, "CONFIG_RATE_SWITCH_PACKET_COUNT", str(sender["rate_switch_packet_count"]))
+    sender_text = replace_define(sender_text, "CONFIG_RATE_SWEEP_GROUP_SIZE", str(sender["rate_sweep_group_size"]))
     sender_text = replace_define(sender_text, "CONFIG_ESP_NOW_PAYLOAD_LEN", str(sender["payload_len"]))
     sender_text = replace_define(sender_text, "CONFIG_WIFI_TX_POWER", str(sender["tx_power"]))
     sender_text = replace_define(sender_text, "CONFIG_CSI_LIVE_MCS_SELECTION_ENABLED", str(sender["live_mcs_selection_enabled"]))
@@ -231,8 +421,9 @@ def apply_profile_to_sources(profile: dict) -> None:
     receiver_text = replace_define(
         receiver_text,
         "CONFIG_MCS_RECOMMENDATION_ENABLED",
-        "0" if receiver["dqn_mcs_recommendation_enabled"] else "1",
+        str(receiver["custom_mcs_recommendation_enabled"]),
     )
+    receiver_text = replace_define(receiver_text, "CONFIG_CSI_MCS_POLICY_MODEL", str(receiver["mcs_policy_model"]))
     receiver_text = replace_define(receiver_text, "CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED", str(receiver["dqn_mcs_recommendation_enabled"]))
     receiver_text = replace_define(receiver_text, "CONFIG_CSI_DQN_RECOMMENDATION_EVERY_N_PACKETS", str(receiver["dqn_recommendation_every_n_packets"]))
     receiver_text = replace_define(receiver_text, "CONFIG_CSI_DQN_WARMUP_PACKETS", str(receiver["dqn_warmup_packets"]))
@@ -246,36 +437,158 @@ def apply_profile_to_sources(profile: dict) -> None:
     write_text(RECEIVER_MAIN, receiver_text)
 
 
-def run_idf(target_dir: Path, command: str, export_script: str) -> int:
-    cmd = f'. {export_script} && idf.py {command}'
-    print(f"\n[run] {target_dir}: {cmd}\n")
-    proc = subprocess.run(["bash", "-lc", cmd], cwd=str(target_dir))
+# ---------------------------------------------------------------------------
+# Mode presets
+# ---------------------------------------------------------------------------
+
+def mode_profile_changes(profile: dict, mode: dict) -> list:
+    """Return [(section, key, old, new)] for values the mode would change."""
+    changes = []
+    for section in ("sender", "receiver"):
+        for key, new in mode.get(section, {}).items():
+            old = profile[section].get(key)
+            if old != new:
+                changes.append((section, key, old, new))
+    return changes
+
+
+def apply_mode_to_profile(profile: dict, mode: dict) -> None:
+    for section in ("sender", "receiver"):
+        profile[section].update(mode.get(section, {}))
+    validate_sender_profile(profile["sender"])
+    validate_receiver_profile(profile["receiver"])
+
+
+def check_mode_headers(mode: dict) -> bool:
+    ok = True
+    for rel_path, required_text, hint in mode.get("headers", []):
+        path = ROOT / rel_path
+        if not path.exists():
+            print(f"WARNING: {rel_path} is missing. Export it with {hint}")
+            ok = False
+        elif required_text not in read_text(path):
+            print(f"WARNING: {rel_path} does not contain {required_text}.")
+            print(f"         Re-export a matching checkpoint with {hint}")
+            ok = False
+    return ok
+
+
+def guess_current_mode(profile: dict) -> str:
+    sender = profile["sender"]
+    receiver = profile["receiver"]
+    for key in MODE_ORDER:
+        mode = MODES[key]
+        if not mode_profile_changes(profile, mode):
+            return key
+    if not sender["live_mcs_selection_enabled"]:
+        return {2: "static", 3: "random_sweep"}.get(sender["rate_switch_mode"], "custom")
+    return "custom"
+
+
+def select_mode(profile: dict, local: dict) -> None:
+    print("\nSelect algorithm mode (configures sender AND receiver consistently)")
+    current = guess_current_mode(profile)
+    for idx, key in enumerate(MODE_ORDER, start=1):
+        marker = "  <- current" if key == current else ""
+        print(f"  {idx}. {MODES[key]['label']}{marker}")
+    print("  0. Back")
+
+    raw = input("Choose mode: ").strip()
+    if not raw.isdigit() or not (1 <= int(raw) <= len(MODE_ORDER)):
+        return
+    key = MODE_ORDER[int(raw) - 1]
+    mode = json.loads(json.dumps(MODES[key]))
+
+    if key == "static":
+        idx = ask_int("Fixed MCS index", 0, 0, 7)
+        mode["sender"]["esp_now_rate"] = RATE_CHOICES[idx]
+    elif key == "random_sweep":
+        mode["sender"]["rate_sweep_group_size"] = ask_int(
+            "Packets per MCS inside each shuffled 8-MCS window",
+            profile["sender"].get("rate_sweep_group_size", 1), 1, 1000000)
+
+    changes = mode_profile_changes(profile, mode)
+    if not changes:
+        print("Profile already matches this mode.")
+    else:
+        print("\nThis mode will change:")
+        for section, field, old, new in changes:
+            print(f"  {section}.{field}: {old} -> {new}")
+
+    if not ask_yes_no("Apply this mode to the profile and C sources", True):
+        return
+
+    apply_mode_to_profile(profile, mode)
+    save_profile(profile)
+    check_mode_headers(mode)
+    try:
+        apply_profile_to_sources(profile)
+    except Exception as exc:
+        print(f"Apply failed: {exc}")
+        return
+    print(f"Mode '{key}' applied to profile and both app_main.c files.")
+    print("Remember: every host (both Pis) must get these sources before flashing.")
+
+    print("\nBuild + flash on this host now?")
+    print("  1. Sender (board attached here)")
+    print("  2. Receiver (board attached here)")
+    print("  3. Both (single-host bench)")
+    print("  0. Skip")
+    choice = input("Choose: ").strip()
+    if choice == "1":
+        run_flash_sender(local)
+    elif choice == "2":
+        run_flash_receiver(local)
+    elif choice == "3":
+        run_flash_sender(local)
+        run_flash_receiver(local)
+
+
+# ---------------------------------------------------------------------------
+# Build / flash (host-local)
+# ---------------------------------------------------------------------------
+
+def run_idf(target_dir: Path, command: str, local: dict) -> int:
+    build_dir = str(local.get("build_dir", "")).strip()
+    build_arg = f"-B {build_dir} " if build_dir else ""
+    export_script = local["export_script"]
+
+    if IS_WINDOWS:
+        cmd = f'call "{export_script}" >NUL 2>&1 && cd /d "{target_dir}" && idf.py {build_arg}{command}'
+        print(f"\n[run] {target_dir}: idf.py {build_arg}{command}\n")
+        proc = subprocess.run(["cmd", "/c", cmd])
+    else:
+        cmd = f'. {export_script} && idf.py {build_arg}{command}'
+        print(f"\n[run] {target_dir}: {cmd}\n")
+        proc = subprocess.run(["bash", "-lc", cmd], cwd=str(target_dir))
     return proc.returncode
 
 
-def run_build_sender(profile: dict) -> None:
-    code = run_idf(ROOT / "csi_send", "build", profile["flash"]["export_script"])
+def run_build_sender(local: dict) -> None:
+    code = run_idf(ROOT / "csi_send", "build", local)
     print("Sender build OK" if code == 0 else f"Sender build failed with exit code {code}")
 
 
-def run_build_receiver(profile: dict) -> None:
-    code = run_idf(ROOT / "csi_recv", "build", profile["flash"]["export_script"])
+def run_build_receiver(local: dict) -> None:
+    code = run_idf(ROOT / "csi_recv", "build", local)
     print("Receiver build OK" if code == 0 else f"Receiver build failed with exit code {code}")
 
 
-def run_flash_sender(profile: dict) -> None:
-    flash = profile["flash"]
-    command = f'flash -b {flash["baud"]} -p {flash["sender_port"]}'
-    code = run_idf(ROOT / "csi_send", command, flash["export_script"])
+def run_flash_sender(local: dict) -> None:
+    command = f'flash -b {local["baud"]} -p {local["sender_port"]}'
+    code = run_idf(ROOT / "csi_send", command, local)
     print("Sender flash OK" if code == 0 else f"Sender flash failed with exit code {code}")
 
 
-def run_flash_receiver(profile: dict) -> None:
-    flash = profile["flash"]
-    command = f'flash -b {flash["baud"]} -p {flash["receiver_port"]}'
-    code = run_idf(ROOT / "csi_recv", command, flash["export_script"])
+def run_flash_receiver(local: dict) -> None:
+    command = f'flash -b {local["baud"]} -p {local["receiver_port"]}'
+    code = run_idf(ROOT / "csi_recv", command, local)
     print("Receiver flash OK" if code == 0 else f"Receiver flash failed with exit code {code}")
 
+
+# ---------------------------------------------------------------------------
+# Interactive helpers
+# ---------------------------------------------------------------------------
 
 def ask_int(prompt: str, default: int, min_value: int = None, max_value: int = None) -> int:
     while True:
@@ -297,7 +610,7 @@ def ask_int(prompt: str, default: int, min_value: int = None, max_value: int = N
         return value
 
 
-def ask_choice(prompt: str, choices: list[str], default: str) -> str:
+def ask_choice(prompt: str, choices: list, default: str) -> str:
     print(prompt)
     for idx, item in enumerate(choices, start=1):
         marker = " (default)" if item == default else ""
@@ -348,6 +661,10 @@ def ask_yes_no(prompt: str, default: bool) -> bool:
         print("Please answer y or n.")
 
 
+# ---------------------------------------------------------------------------
+# Advanced editing menus
+# ---------------------------------------------------------------------------
+
 def edit_sender_full(profile: dict) -> None:
     sender = profile["sender"]
     print("\nEdit sender parameters")
@@ -355,9 +672,11 @@ def edit_sender_full(profile: dict) -> None:
     sender["esp_now_rate"] = ask_choice("ESP-NOW PHY rate", RATE_CHOICES, sender["esp_now_rate"])
     sender["send_frequency"] = ask_int("Send frequency (packets/sec)", sender["send_frequency"], 1, 5000)
     sender["packet_pacing_enabled"] = 1 if ask_yes_no("Enable packet pacing", sender["packet_pacing_enabled"] == 1) else 0
-    sender["rate_switch_mode"] = ask_int("Rate switch mode (0=time, 1=packet, 2=static)", sender["rate_switch_mode"], 0, 2)
+    sender["ack_timing_mode"] = ask_int("ACK timing mode (1=async pipeline, 2=stop-and-wait)", sender["ack_timing_mode"], 1, 2)
+    sender["rate_switch_mode"] = ask_int("Rate switch mode (0=time, 1=packet, 2=static, 3=random_sweep)", sender["rate_switch_mode"], 0, 3)
     sender["rate_switch_interval_sec"] = ask_int("Rate switch interval seconds", sender["rate_switch_interval_sec"], 1, 3600)
     sender["rate_switch_packet_count"] = ask_int("Rate switch packet count", sender["rate_switch_packet_count"], 1, 1000000)
+    sender["rate_sweep_group_size"] = ask_int("Random-sweep packets per MCS step", sender["rate_sweep_group_size"], 1, 1000000)
     sender["payload_len"] = ask_int("ESP-NOW payload length", sender["payload_len"], 4, 250)
     sender["tx_power"] = ask_int("TX power (0.25 dBm units, range 8-84)", sender["tx_power"], 8, 84)
     sender["live_mcs_selection_enabled"] = 1 if ask_yes_no("Enable live MCS selection", sender["live_mcs_selection_enabled"] == 1) else 0
@@ -387,7 +706,7 @@ def edit_sender_full(profile: dict) -> None:
 def edit_sender_dqn(profile: dict) -> None:
     sender = profile["sender"]
     while True:
-        print("\nEdit sender DQN policy")
+        print("\nEdit sender receiver-policy (DQN frame) fields")
         print(f"1. dqn_remote_recommendation_enabled: {sender['dqn_remote_recommendation_enabled']}")
         print(f"2. dqn_default_mcs: {sender['dqn_default_mcs']}")
         print(f"3. dqn_remote_min_confidence: {sender['dqn_remote_min_confidence']}")
@@ -496,64 +815,64 @@ def edit_sender(profile: dict) -> None:
         print(f"2. esp_now_rate: {sender['esp_now_rate']}")
         print(f"3. send_frequency: {sender['send_frequency']}")
         print(f"4. packet_pacing_enabled: {sender['packet_pacing_enabled']}")
-        print(f"5. rate_switch_mode: {sender['rate_switch_mode']}")
-        print(f"6. rate_switch_interval_sec: {sender['rate_switch_interval_sec']}")
-        print(f"7. rate_switch_packet_count: {sender['rate_switch_packet_count']}")
-        print(f"8. payload_len: {sender['payload_len']}")
-        print(f"9. tx_power: {sender['tx_power']} (0.25 dBm units, {sender['tx_power'] * 0.25:.1f} dBm nominal)")
-        print(f"10. live_mcs_selection_enabled: {sender['live_mcs_selection_enabled']}")
+        print(f"5. ack_timing_mode: {sender['ack_timing_mode']} (1=async, 2=stop-and-wait)")
+        print(f"6. rate_switch_mode: {sender['rate_switch_mode']} (0=time, 1=packet, 2=static, 3=random_sweep)")
+        print(f"7. rate_switch_interval_sec: {sender['rate_switch_interval_sec']}")
+        print(f"8. rate_switch_packet_count: {sender['rate_switch_packet_count']}")
+        print(f"9. rate_sweep_group_size: {sender['rate_sweep_group_size']}")
+        print(f"10. payload_len: {sender['payload_len']}")
+        print(f"11. tx_power: {sender['tx_power']} (0.25 dBm units, {sender['tx_power'] * 0.25:.1f} dBm nominal)")
+        print(f"12. live_mcs_selection_enabled: {sender['live_mcs_selection_enabled']}")
         algo_name = live_mcs_algo_label(sender["live_mcs_algo"])
-        print(f"11. live_mcs_algo: {sender['live_mcs_algo']} ({algo_name})")
-        print("12. Edit live MCS policy fields")
-        print("13. Edit DQN policy fields")
-        print("14. Edit all sender fields")
+        print(f"13. live_mcs_algo: {sender['live_mcs_algo']} ({algo_name})")
+        print("14. Edit live MCS policy fields")
+        print("15. Edit DQN policy fields")
+        print("16. Edit all sender fields")
         print("0. Back")
         choice = input("Select sender field: ").strip()
 
         if choice == "1":
             sender["channel"] = ask_int("Channel", sender["channel"], 1, 14)
-            save_profile(profile)
         elif choice == "2":
             sender["esp_now_rate"] = ask_choice("ESP-NOW PHY rate", RATE_CHOICES, sender["esp_now_rate"])
-            save_profile(profile)
         elif choice == "3":
             sender["send_frequency"] = ask_int("Send frequency (packets/sec)", sender["send_frequency"], 1, 5000)
-            save_profile(profile)
         elif choice == "4":
             sender["packet_pacing_enabled"] = 1 if ask_yes_no("Enable packet pacing", sender["packet_pacing_enabled"] == 1) else 0
-            save_profile(profile)
         elif choice == "5":
-            sender["rate_switch_mode"] = ask_int("Rate switch mode (0=time, 1=packet, 2=static)", sender["rate_switch_mode"], 0, 2)
-            save_profile(profile)
+            sender["ack_timing_mode"] = ask_int("ACK timing mode (1=async pipeline, 2=stop-and-wait)", sender["ack_timing_mode"], 1, 2)
         elif choice == "6":
-            sender["rate_switch_interval_sec"] = ask_int("Rate switch interval seconds", sender["rate_switch_interval_sec"], 1, 3600)
-            save_profile(profile)
+            sender["rate_switch_mode"] = ask_int("Rate switch mode (0=time, 1=packet, 2=static, 3=random_sweep)", sender["rate_switch_mode"], 0, 3)
         elif choice == "7":
-            sender["rate_switch_packet_count"] = ask_int("Rate switch packet count", sender["rate_switch_packet_count"], 1, 1000000)
-            save_profile(profile)
+            sender["rate_switch_interval_sec"] = ask_int("Rate switch interval seconds", sender["rate_switch_interval_sec"], 1, 3600)
         elif choice == "8":
-            sender["payload_len"] = ask_int("ESP-NOW payload length", sender["payload_len"], 4, 250)
-            save_profile(profile)
+            sender["rate_switch_packet_count"] = ask_int("Rate switch packet count", sender["rate_switch_packet_count"], 1, 1000000)
         elif choice == "9":
-            sender["tx_power"] = ask_int("TX power (0.25 dBm units, range 8-84)", sender["tx_power"], 8, 84)
-            save_profile(profile)
+            sender["rate_sweep_group_size"] = ask_int("Random-sweep packets per MCS step", sender["rate_sweep_group_size"], 1, 1000000)
         elif choice == "10":
-            sender["live_mcs_selection_enabled"] = 1 if ask_yes_no("Enable live MCS selection", sender["live_mcs_selection_enabled"] == 1) else 0
-            save_profile(profile)
+            sender["payload_len"] = ask_int("ESP-NOW payload length", sender["payload_len"], 4, 250)
         elif choice == "11":
-            sender["live_mcs_algo"] = ask_live_mcs_algo(sender["live_mcs_algo"])
-            save_profile(profile)
+            sender["tx_power"] = ask_int("TX power (0.25 dBm units, range 8-84)", sender["tx_power"], 8, 84)
         elif choice == "12":
-            edit_sender_live_mcs(profile)
+            sender["live_mcs_selection_enabled"] = 1 if ask_yes_no("Enable live MCS selection", sender["live_mcs_selection_enabled"] == 1) else 0
         elif choice == "13":
-            edit_sender_dqn(profile)
+            sender["live_mcs_algo"] = ask_live_mcs_algo(sender["live_mcs_algo"])
         elif choice == "14":
+            edit_sender_live_mcs(profile)
+            continue
+        elif choice == "15":
+            edit_sender_dqn(profile)
+            continue
+        elif choice == "16":
             edit_sender_full(profile)
-            save_profile(profile)
         elif choice == "0":
             return
         else:
             print("Invalid option.")
+            continue
+
+        validate_sender_profile(sender)
+        save_profile(profile)
 
 
 def edit_receiver_full(profile: dict) -> None:
@@ -563,40 +882,45 @@ def edit_receiver_full(profile: dict) -> None:
     receiver["esp_now_rate"] = ask_choice("ESP-NOW PHY rate", RATE_CHOICES, receiver["esp_now_rate"])
     receiver["force_gain"] = 1 if ask_yes_no("Force gain", receiver["force_gain"] == 1) else 0
     receiver["gain_control"] = 1 if ask_yes_no("Enable gain control", receiver["gain_control"] == 1) else 0
-    receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver DQN recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
-    receiver["dqn_recommendation_every_n_packets"] = ask_int("DQN recommendation every N packets", receiver["dqn_recommendation_every_n_packets"], 1, 1000000)
-    receiver["dqn_warmup_packets"] = ask_int("DQN warmup packets", receiver["dqn_warmup_packets"], 0, 1000000)
-    receiver["dqn_control_interval_ms"] = ask_int("DQN control interval ms", receiver["dqn_control_interval_ms"], 1, 1000000)
-    receiver["dqn_stale_max_age_packets"] = ask_int("DQN stale max age packets", receiver["dqn_stale_max_age_packets"], 1, 1000000)
-    receiver["dqn_log_enabled"] = 1 if ask_yes_no("Enable DQN receiver logs", receiver["dqn_log_enabled"] == 1) else 0
+    receiver["custom_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable legacy reward-model recommendations", receiver["custom_mcs_recommendation_enabled"] == 1) else 0
+    receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver live-policy recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
+    receiver["mcs_policy_model"] = ask_int("Live policy model (1=bandit link_v3c, 0=DQN Q-network)", receiver["mcs_policy_model"], 0, 1)
+    receiver["dqn_recommendation_every_n_packets"] = ask_int("Live policy recommendation every N packets", receiver["dqn_recommendation_every_n_packets"], 1, 1000000)
+    receiver["dqn_warmup_packets"] = ask_int("Live policy warmup packets", receiver["dqn_warmup_packets"], 0, 1000000)
+    receiver["dqn_control_interval_ms"] = ask_int("Live policy control interval ms", receiver["dqn_control_interval_ms"], 1, 1000000)
+    receiver["dqn_stale_max_age_packets"] = ask_int("Live policy stale max age packets", receiver["dqn_stale_max_age_packets"], 1, 1000000)
+    receiver["dqn_log_enabled"] = 1 if ask_yes_no("Enable live policy receiver logs", receiver["dqn_log_enabled"] == 1) else 0
     validate_receiver_profile(receiver)
 
 
 def edit_receiver_dqn(profile: dict) -> None:
     receiver = profile["receiver"]
     while True:
-        print("\nEdit receiver DQN recommendations")
+        print("\nEdit receiver live-policy recommendations")
         print(f"1. dqn_mcs_recommendation_enabled: {receiver['dqn_mcs_recommendation_enabled']}")
-        print(f"2. dqn_recommendation_every_n_packets: {receiver['dqn_recommendation_every_n_packets']}")
-        print(f"3. dqn_warmup_packets: {receiver['dqn_warmup_packets']}")
-        print(f"4. dqn_control_interval_ms: {receiver['dqn_control_interval_ms']}")
-        print(f"5. dqn_stale_max_age_packets: {receiver['dqn_stale_max_age_packets']}")
-        print(f"6. dqn_log_enabled: {receiver['dqn_log_enabled']}")
+        print(f"2. mcs_policy_model: {receiver['mcs_policy_model']} (1=bandit link_v3c, 0=DQN Q-network)")
+        print(f"3. dqn_recommendation_every_n_packets: {receiver['dqn_recommendation_every_n_packets']}")
+        print(f"4. dqn_warmup_packets: {receiver['dqn_warmup_packets']}")
+        print(f"5. dqn_control_interval_ms: {receiver['dqn_control_interval_ms']}")
+        print(f"6. dqn_stale_max_age_packets: {receiver['dqn_stale_max_age_packets']}")
+        print(f"7. dqn_log_enabled: {receiver['dqn_log_enabled']}")
         print("0. Back")
-        choice = input("Select DQN receiver field: ").strip()
+        choice = input("Select live-policy receiver field: ").strip()
 
         if choice == "1":
-            receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver DQN recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
+            receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver live-policy recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
         elif choice == "2":
-            receiver["dqn_recommendation_every_n_packets"] = ask_int("DQN recommendation every N packets", receiver["dqn_recommendation_every_n_packets"], 1, 1000000)
+            receiver["mcs_policy_model"] = ask_int("Live policy model (1=bandit link_v3c, 0=DQN Q-network)", receiver["mcs_policy_model"], 0, 1)
         elif choice == "3":
-            receiver["dqn_warmup_packets"] = ask_int("DQN warmup packets", receiver["dqn_warmup_packets"], 0, 1000000)
+            receiver["dqn_recommendation_every_n_packets"] = ask_int("Live policy recommendation every N packets", receiver["dqn_recommendation_every_n_packets"], 1, 1000000)
         elif choice == "4":
-            receiver["dqn_control_interval_ms"] = ask_int("DQN control interval ms", receiver["dqn_control_interval_ms"], 1, 1000000)
+            receiver["dqn_warmup_packets"] = ask_int("Live policy warmup packets", receiver["dqn_warmup_packets"], 0, 1000000)
         elif choice == "5":
-            receiver["dqn_stale_max_age_packets"] = ask_int("DQN stale max age packets", receiver["dqn_stale_max_age_packets"], 1, 1000000)
+            receiver["dqn_control_interval_ms"] = ask_int("Live policy control interval ms", receiver["dqn_control_interval_ms"], 1, 1000000)
         elif choice == "6":
-            receiver["dqn_log_enabled"] = 1 if ask_yes_no("Enable DQN receiver logs", receiver["dqn_log_enabled"] == 1) else 0
+            receiver["dqn_stale_max_age_packets"] = ask_int("Live policy stale max age packets", receiver["dqn_stale_max_age_packets"], 1, 1000000)
+        elif choice == "7":
+            receiver["dqn_log_enabled"] = 1 if ask_yes_no("Enable live policy receiver logs", receiver["dqn_log_enabled"] == 1) else 0
         elif choice == "0":
             return
         else:
@@ -615,37 +939,41 @@ def edit_receiver(profile: dict) -> None:
         print(f"2. esp_now_rate: {receiver['esp_now_rate']}")
         print(f"3. force_gain: {receiver['force_gain']}")
         print(f"4. gain_control: {receiver['gain_control']}")
-        print(f"5. dqn_mcs_recommendation_enabled: {receiver['dqn_mcs_recommendation_enabled']}")
-        print("6. Edit DQN receiver fields")
-        print("7. Edit all receiver fields")
+        print(f"5. custom_mcs_recommendation_enabled: {receiver['custom_mcs_recommendation_enabled']}")
+        print(f"6. dqn_mcs_recommendation_enabled: {receiver['dqn_mcs_recommendation_enabled']}")
+        print(f"7. mcs_policy_model: {receiver['mcs_policy_model']} (1=bandit, 0=DQN)")
+        print("8. Edit live-policy receiver fields")
+        print("9. Edit all receiver fields")
         print("0. Back")
         choice = input("Select receiver field: ").strip()
 
         if choice == "1":
             receiver["channel"] = ask_int("Channel", receiver["channel"], 1, 14)
-            save_profile(profile)
         elif choice == "2":
             receiver["esp_now_rate"] = ask_choice("ESP-NOW PHY rate", RATE_CHOICES, receiver["esp_now_rate"])
-            save_profile(profile)
         elif choice == "3":
             receiver["force_gain"] = 1 if ask_yes_no("Force gain", receiver["force_gain"] == 1) else 0
-            save_profile(profile)
         elif choice == "4":
             receiver["gain_control"] = 1 if ask_yes_no("Enable gain control", receiver["gain_control"] == 1) else 0
-            save_profile(profile)
         elif choice == "5":
-            receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver DQN recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
-            validate_receiver_profile(receiver)
-            save_profile(profile)
+            receiver["custom_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable legacy reward-model recommendations", receiver["custom_mcs_recommendation_enabled"] == 1) else 0
         elif choice == "6":
-            edit_receiver_dqn(profile)
+            receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver live-policy recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
         elif choice == "7":
+            receiver["mcs_policy_model"] = ask_int("Live policy model (1=bandit link_v3c, 0=DQN Q-network)", receiver["mcs_policy_model"], 0, 1)
+        elif choice == "8":
+            edit_receiver_dqn(profile)
+            continue
+        elif choice == "9":
             edit_receiver_full(profile)
-            save_profile(profile)
         elif choice == "0":
             return
         else:
             print("Invalid option.")
+            continue
+
+        validate_receiver_profile(receiver)
+        save_profile(profile)
 
 
 def edit_shared(profile: dict) -> None:
@@ -674,60 +1002,52 @@ def edit_shared(profile: dict) -> None:
             print("Invalid option.")
 
 
-def edit_flash(profile: dict) -> None:
-    flash = profile["flash"]
+def edit_local(local: dict) -> None:
     while True:
-        print("\nEdit flashing parameters (quick)")
-        print(f"1. sender_port: {flash['sender_port']}")
-        print(f"2. receiver_port: {flash['receiver_port']}")
-        print(f"3. baud: {flash['baud']}")
-        print(f"4. export_script: {flash['export_script']}")
-        print("5. Edit all flash fields")
+        print(f"\nEdit host-local settings (this machine only: {LOCAL_PATH.name}, not synced)")
+        print(f"1. sender_port: {local['sender_port']}")
+        print(f"2. receiver_port: {local['receiver_port']}")
+        print(f"3. baud: {local['baud']}")
+        print(f"4. export_script: {local['export_script']}")
+        print(f"5. build_dir: {local['build_dir']}")
         print("0. Back")
-        choice = input("Select flash field: ").strip()
+        choice = input("Select local field: ").strip()
 
         if choice == "1":
-            sender_port = input(f"Sender serial port [{flash['sender_port']}]: ").strip()
-            if sender_port:
-                flash["sender_port"] = sender_port
-                save_profile(profile)
+            value = input(f"Sender serial port [{local['sender_port']}]: ").strip()
+            if value:
+                local["sender_port"] = value
+                save_local(local)
         elif choice == "2":
-            receiver_port = input(f"Receiver serial port [{flash['receiver_port']}]: ").strip()
-            if receiver_port:
-                flash["receiver_port"] = receiver_port
-                save_profile(profile)
+            value = input(f"Receiver serial port [{local['receiver_port']}]: ").strip()
+            if value:
+                local["receiver_port"] = value
+                save_local(local)
         elif choice == "3":
-            flash["baud"] = ask_int("Flash baud", int(flash["baud"]), 115200, 2000000)
-            save_profile(profile)
+            local["baud"] = ask_int("Flash baud", int(local["baud"]), 115200, 2000000)
+            save_local(local)
         elif choice == "4":
-            export_script = input(f"ESP-IDF export script [{flash['export_script']}]: ").strip()
-            if export_script:
-                flash["export_script"] = export_script
-                save_profile(profile)
+            value = input(f"ESP-IDF export script [{local['export_script']}]: ").strip()
+            if value:
+                local["export_script"] = value
+                save_local(local)
         elif choice == "5":
-            sender_port = input(f"Sender serial port [{flash['sender_port']}]: ").strip()
-            if sender_port:
-                flash["sender_port"] = sender_port
-
-            receiver_port = input(f"Receiver serial port [{flash['receiver_port']}]: ").strip()
-            if receiver_port:
-                flash["receiver_port"] = receiver_port
-
-            flash["baud"] = ask_int("Flash baud", int(flash["baud"]), 115200, 2000000)
-
-            export_script = input(f"ESP-IDF export script [{flash['export_script']}]: ").strip()
-            if export_script:
-                flash["export_script"] = export_script
-            save_profile(profile)
+            value = input(f"Build directory [{local['build_dir']}]: ").strip()
+            if value:
+                local["build_dir"] = value
+                save_local(local)
         elif choice == "0":
             return
         else:
             print("Invalid option.")
 
 
-def show_profile(profile: dict) -> None:
-    print("\nCurrent profile")
+def show_profile(profile: dict, local: dict) -> None:
+    print("\nCurrent shared profile")
     print(json.dumps(profile, indent=2))
+    print("\nHost-local settings (not synced)")
+    print(json.dumps(local, indent=2))
+    print(f"\nDetected mode: {guess_current_mode(profile)}")
 
 
 def apply_and_save(profile: dict) -> bool:
@@ -743,56 +1063,61 @@ def apply_and_save(profile: dict) -> bool:
 
 def run_menu() -> int:
     profile = load_profile()
+    local = load_local()
 
     while True:
         print("\n=== ESP CSI Sender/Receiver Menu ===")
-        print("1. Show current profile")
-        print("2. Edit sender parameters")
-        print("3. Edit receiver parameters")
-        print("4. Edit shared MAC parameters")
-        print("5. Edit flash/build parameters")
-        print("6. Apply profile to C source files")
-        print("7. Build sender")
-        print("8. Build receiver")
-        print("9. Flash sender")
-        print("10. Flash receiver")
-        print("11. Apply + flash sender")
-        print("12. Apply + flash receiver")
-        print("13. Apply + flash both")
+        print(f"(host: {'windows' if IS_WINDOWS else 'linux'}, mode: {guess_current_mode(profile)})")
+        print("1. Select algorithm mode (preset for both devices)")
+        print("2. Show current profile")
+        print("3. Edit sender parameters (advanced)")
+        print("4. Edit receiver parameters (advanced)")
+        print("5. Edit shared MAC parameters")
+        print("6. Edit host-local flash/build settings")
+        print("7. Apply profile to C source files")
+        print("8. Build sender")
+        print("9. Build receiver")
+        print("10. Flash sender")
+        print("11. Flash receiver")
+        print("12. Apply + flash sender")
+        print("13. Apply + flash receiver")
+        print("14. Apply + flash both")
         print("0. Exit")
 
         choice = input("Select option: ").strip()
 
         if choice == "1":
-            show_profile(profile)
+            select_mode(profile, local)
         elif choice == "2":
-            edit_sender(profile)
+            show_profile(profile, local)
         elif choice == "3":
-            edit_receiver(profile)
+            edit_sender(profile)
         elif choice == "4":
-            edit_shared(profile)
+            edit_receiver(profile)
         elif choice == "5":
-            edit_flash(profile)
+            edit_shared(profile)
         elif choice == "6":
-            apply_and_save(profile)
+            edit_local(local)
         elif choice == "7":
-            run_build_sender(profile)
+            apply_and_save(profile)
         elif choice == "8":
-            run_build_receiver(profile)
+            run_build_sender(local)
         elif choice == "9":
-            run_flash_sender(profile)
+            run_build_receiver(local)
         elif choice == "10":
-            run_flash_receiver(profile)
+            run_flash_sender(local)
         elif choice == "11":
-            if apply_and_save(profile):
-                run_flash_sender(profile)
+            run_flash_receiver(local)
         elif choice == "12":
             if apply_and_save(profile):
-                run_flash_receiver(profile)
+                run_flash_sender(local)
         elif choice == "13":
             if apply_and_save(profile):
-                run_flash_sender(profile)
-                run_flash_receiver(profile)
+                run_flash_receiver(local)
+        elif choice == "14":
+            if apply_and_save(profile):
+                run_flash_sender(local)
+                run_flash_receiver(local)
         elif choice == "0":
             return 0
         else:

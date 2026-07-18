@@ -14,6 +14,7 @@ import re
 import threading
 import argparse
 import os
+import base64
 from collections import deque
 from io import StringIO
 from pathlib import Path
@@ -364,6 +365,14 @@ def parse_ack_line(line):
             'termination_event': termination_event,
         }, None
 
+    if line.startswith('RATE_POLICY,'):
+        # Provenance line from the sender, e.g.
+        # RATE_POLICY,shuffled_round_robin,group_size=1,actions=8,propensity=0.125000
+        return {
+            'type': 'RATE_POLICY',
+            'raw': line,
+        }, None
+
     if line.startswith('MCS_CHANGE,'):
         fields = [f.strip() for f in line.split(',')]
         if len(fields) < 7:
@@ -558,6 +567,114 @@ def parse_csi_line(line):
         'rx_state': safe_int(row.get('rx_state')),
         'data_len': data_len,
         'first_word': safe_int(row.get('first_word')),
+        'raw_data': raw_data,
+        'line': line,
+    }
+
+    return frame, None
+
+
+def _build_crc16_ccitt_table():
+    table = []
+    for byte in range(256):
+        crc = byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+        table.append(crc)
+    return table
+
+
+CRC16_CCITT_TABLE = _build_crc16_ccitt_table()
+
+
+def crc16_ccitt(data):
+    """CRC16-CCITT (poly 0x1021, init 0xFFFF); matches the firmware CSI_B64 CRC."""
+    crc = 0xFFFF
+    for byte in data:
+        crc = ((crc << 8) & 0xFFFF) ^ CRC16_CCITT_TABLE[((crc >> 8) ^ byte) & 0xFF]
+    return crc
+
+
+CSI_B64_FIELD_COUNT = 19
+
+
+def parse_csi_b64_line(line):
+    """
+    Parse one compact CRC-protected CSI line:
+
+    CSI_B64,<ver>,<seq>,<mac>,<rssi>,<rate>,<noise_floor>,<fft_gain>,<agc_gain>,
+    <channel>,<timestamp>,<sig_len>,<rx_state>,<len>,<first_word_invalid>,
+    <compensate_gain>,<encoding>,<base64 payload>,<crc16 hex>
+
+    Returns: (frame_dict, error_string). The raw int8 payload is scaled by
+    compensate_gain with truncation toward zero, mirroring the firmware's
+    (int16_t)(compensate_gain * value) cast in the legacy CSI_DATA path.
+    """
+    index = line.find('CSI_B64,')
+    if index == -1:
+        return None, 'not_csi'
+
+    line = line[index:].strip()
+    fields = line.split(',')
+    if len(fields) != CSI_B64_FIELD_COUNT:
+        return None, f'b64_wrong_field_count: got {len(fields)}'
+
+    crc_text = fields[-1]
+    body_len = len(line) - len(crc_text) - 1
+    if body_len <= 0:
+        return None, 'b64_missing_crc'
+    try:
+        expected_crc = int(crc_text, 16)
+    except ValueError:
+        return None, 'b64_invalid_crc_field'
+    actual_crc = crc16_ccitt(line[:body_len].encode('utf-8', errors='replace'))
+    if actual_crc != expected_crc:
+        return None, f'b64_crc_mismatch: expected {expected_crc:04X}, got {actual_crc:04X}'
+
+    (_tag, version, seq, mac, rssi, rate, noise_floor, fft_gain, agc_gain,
+     channel, timestamp, sig_len, rx_state, data_len_text, first_word,
+     gain_text, encoding, payload) = fields[:-1]
+
+    if version != '1':
+        return None, f'b64_unknown_version: {version}'
+    if encoding != 'i8':
+        return None, f'b64_unknown_encoding: {encoding}'
+
+    data_len = safe_int(data_len_text)
+    gain = safe_float(gain_text)
+    if data_len is None or gain is None:
+        return None, 'b64_invalid_len_or_gain'
+
+    try:
+        raw_bytes = base64.b64decode(payload, validate=True)
+    except (ValueError, TypeError):
+        return None, 'b64_decode_error'
+    if len(raw_bytes) != data_len:
+        return None, f'b64_len_mismatch: header={data_len}, actual={len(raw_bytes)}'
+    if data_len % 2 != 0:
+        return None, f'b64_odd_value_count: {data_len}'
+
+    # int8 reinterpretation, then firmware-equivalent gain compensation.
+    raw_data = [
+        int(gain * (byte - 256 if byte > 127 else byte))
+        for byte in raw_bytes
+    ]
+
+    frame = {
+        'format': 'b64',
+        'seq_or_id': seq,
+        'mac': mac,
+        'rssi': safe_int(rssi),
+        'rate': safe_int(rate),
+        'noise_floor': safe_int(noise_floor),
+        'fft_gain': safe_int(fft_gain),
+        'agc_gain': safe_int(agc_gain),
+        'channel': safe_int(channel),
+        'local_timestamp': safe_int(timestamp),
+        'sig_len': safe_int(sig_len),
+        'rx_state': safe_int(rx_state),
+        'data_len': data_len,
+        'first_word': safe_int(first_word),
         'raw_data': raw_data,
         'line': line,
     }
@@ -836,6 +953,14 @@ def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
                 print_mcs_change(record)
                 continue
 
+            if record['type'] == 'RATE_POLICY':
+                tag = color_text('[RATE_POLICY]', color='yellow', bold=True)
+                print(f'{tag} {record["raw"]}', flush=True)
+                send_log_fd.write(f'[{host_timestamp_ms()}] rate_policy\n')
+                send_log_fd.write(record['raw'] + '\n')
+                send_log_fd.flush()
+                continue
+
             if record['type'] == 'ACK_PDR':
                 ack_pdr_writer.writerow({
                     'host_time': host_timestamp_ms(),
@@ -977,6 +1102,8 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
 
     frame_count = 0
     bad_count = 0
+    crc_bad_count = 0
+    device_drop_total = 0
     ack_total = 0
     ack_delivered = 0
     segment_id = 0
@@ -993,10 +1120,23 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
             if not line:
                 continue
 
+            if line.startswith('CSI_B64_HEADER'):
+                continue
+
+            if line.startswith('CSI_DROP,'):
+                drop_fields = line.split(',')
+                drop_total = safe_int(drop_fields[2]) if len(drop_fields) >= 3 else None
+                if drop_total is not None:
+                    device_drop_total = drop_total
+                continue
+
             frame = None
             error = 'not_csi'
             if single_port_mode in ('auto', 'csi'):
-                frame, error = parse_csi_line(line)
+                if 'CSI_B64,' in line:
+                    frame, error = parse_csi_b64_line(line)
+                else:
+                    frame, error = parse_csi_line(line)
 
             if error is None and frame is not None:
                 stats = compute_stats(frame['raw_data'], sample_count)
@@ -1077,6 +1217,11 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
                         current_mcs_index = ack_record['new_mcs']
                         handle_mcs_change(ack_record)
                         print_mcs_change(ack_record)
+                        continue
+
+                    if ack_record['type'] == 'RATE_POLICY':
+                        rate_policy_tag = color_text('[RATE_POLICY]', color='yellow', bold=True)
+                        print(f'{rate_policy_tag} {ack_record["raw"]}', flush=True)
                         continue
 
                     if ack_record['type'] == 'ACK_PDR':
@@ -1187,6 +1332,8 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
 
             # CSI-like line but malformed.
             bad_count += 1
+            if error is not None and error.startswith('b64_crc_mismatch'):
+                crc_bad_count += 1
             log_file_fd.write(f'[{host_timestamp_ms()}] {error}\n')
             log_file_fd.write(line + '\n')
             log_file_fd.flush()
@@ -1200,6 +1347,8 @@ def csi_data_read_parse(port, baudrate, csv_writer, csv_file_fd, log_file_fd,
             print(f'ACK delivered: {ack_delivered}', flush=True)
             print(f'ACK running PDR: {100.0 * ack_delivered / ack_total:.2f}%', flush=True)
         print(f'Invalid/non-CSI lines logged: {bad_count}', flush=True)
+        print(f'CSI CRC mismatches: {crc_bad_count}', flush=True)
+        print(f'CSI frames dropped on device (queue full): {device_drop_total}', flush=True)
     finally:
         ser.close()
 
@@ -1339,10 +1488,12 @@ def main():
     stop_event = threading.Event()
     ack_thread = None
 
-    with open(args.store_file, 'w', newline='') as csv_fd, \
-            open(args.log_file, 'w') as log_fd, \
-            open(args.ack_store_file, 'w', newline='') as ack_fd, \
-            open(args.ack_pdr_store_file, 'w', newline='') as ack_pdr_fd:
+    # utf-8 with replacement keeps garbled serial noise from crashing the file
+    # writers on platforms whose default encoding is not UTF-8 (e.g. Windows).
+    with open(args.store_file, 'w', newline='', encoding='utf-8', errors='replace') as csv_fd, \
+            open(args.log_file, 'w', encoding='utf-8', errors='replace') as log_fd, \
+            open(args.ack_store_file, 'w', newline='', encoding='utf-8', errors='replace') as ack_fd, \
+            open(args.ack_pdr_store_file, 'w', newline='', encoding='utf-8', errors='replace') as ack_pdr_fd:
         csv_writer = csv.DictWriter(csv_fd, fieldnames=OUTPUT_COLUMNS)
         csv_writer.writeheader()
 
@@ -1355,7 +1506,7 @@ def main():
         if args.send_port:
             print(f'Sender log file: {args.send_log_file}', flush=True)
 
-            with open(args.send_log_file, 'w') as send_log_fd:
+            with open(args.send_log_file, 'w', encoding='utf-8', errors='replace') as send_log_fd:
                 ack_thread = threading.Thread(
                     target=ack_read_parse,
                     args=(

@@ -1,0 +1,56 @@
+{
+  "sender": {
+    "channel": 1,
+    "esp_now_rate": "WIFI_PHY_RATE_MCS0_LGI",
+    "send_frequency": 200,
+    "packet_pacing_enabled": 1,
+    "rate_switch_mode": 0,
+    "rate_switch_interval_sec": 10,
+    "rate_switch_packet_count": 1,
+    "payload_len": 128,
+    "tx_power": 8,
+    "live_mcs_selection_enabled": 0,
+    "live_mcs_algo": 0,
+    "live_mcs_min_index": 0,
+    "live_mcs_max_index": 7,
+    "minstrel_update_every_pkts": 20,
+    "minstrel_probe_every_pkts": 10,
+    "minstrel_ewma_alpha_num": 1,
+    "minstrel_ewma_alpha_den": 4,
+    "custom_policy_default_mcs": 3,
+    "live_mcs_decision_log_enabled": 1,
+    "remote_mcs_recommendation_enabled": 1,
+    "remote_mcs_min_confidence": 0,
+    "remote_mcs_max_age_ms": 300,
+    "dqn_remote_recommendation_enabled": 0,
+    "dqn_default_mcs": 4,
+    "dqn_remote_min_confidence": 0,
+    "dqn_remote_max_age_ms": 50,
+    "dqn_remote_max_seq_gap": 0,
+    "dqn_failure_stepdown_enabled": 0,
+    "dqn_failure_stepdown_count": 3,
+    "dqn_log_enabled": 1
+  },
+  "receiver": {
+    "channel": 1,
+    "esp_now_rate": "WIFI_PHY_RATE_MCS0_LGI",
+    "force_gain": 1,
+    "gain_control": 1,
+    "dqn_mcs_recommendation_enabled": 0,
+    "dqn_recommendation_every_n_packets": 1,
+    "dqn_warmup_packets": 100,
+    "dqn_control_interval_ms": 5,
+    "dqn_stale_max_age_packets": 64,
+    "dqn_log_enabled": 1
+  },
+  "shared": {
+    "sender_mac": "1a:00:00:00:00:10",
+    "receiver_mac": "1a:00:00:00:00:11"
+  },
+  "flash": {
+    "sender_port": "/dev/ttyACM0",
+    "receiver_port": "/dev/ttyACM1",
+    "baud": 921600,
+    "export_script": "$HOME/esp/esp-idf/export.sh"
+  }
+}

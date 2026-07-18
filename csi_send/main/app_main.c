@@ -26,6 +26,7 @@
 #include "esp_netif.h"
 #include "esp_now.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -38,7 +39,7 @@
 #define WIFI_BW_HT40 WIFI_BW40
 #endif
 
-#define CONFIG_LESS_INTERFERENCE_CHANNEL   1 
+#define CONFIG_LESS_INTERFERENCE_CHANNEL   1
 
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61 || (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0))
 #define CONFIG_WIFI_BAND_MODE               WIFI_BAND_MODE_2G_ONLY
@@ -51,7 +52,7 @@
 #endif
 
 #define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT20
-#define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS0_LGI 
+#define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS0_LGI
 /* Bitrate options (choose one for `CONFIG_ESP_NOW_RATE` - type `wifi_phy_rate_t`):
  *
  * Legacy (802.11b/g):
@@ -76,14 +77,29 @@
 #define CONFIG_SEND_FREQUENCY               200
 #define CONFIG_PACKET_PACING_ENABLED        1  // 1 = paced by CONFIG_SEND_FREQUENCY, 0 = max-rate (no fixed sleep)
 #define CONFIG_ACK_TIMING_MODE              2  // 1 = async pipeline, 2 = stop-and-wait (one packet in flight)
-#define CONFIG_RATE_SWITCH_MODE             0  // 0 = TIME_BASED, 1 = PACKET_BASED, 2 = STATIC (fixed rate, no switching)
+#define CONFIG_RATE_SWITCH_MODE             3  // 0 = TIME_BASED, 1 = PACKET_BASED, 2 = STATIC (fixed rate, no switching), 3 = RANDOM_SWEEP (shuffled round-robin, uniform per-packet MCS)
 #define CONFIG_RATE_SWITCH_INTERVAL_SEC     10 // Used when TIME_BASED
 #define CONFIG_RATE_SWITCH_PACKET_COUNT     1 // Used when PACKET_BASED
+#define CONFIG_RATE_SWEEP_GROUP_SIZE        1  // Used when RANDOM_SWEEP: packets per MCS step inside each shuffled 8-MCS window
+
+#if CONFIG_RATE_SWITCH_MODE < 0 || CONFIG_RATE_SWITCH_MODE > 3
+#error "CONFIG_RATE_SWITCH_MODE must be 0 (TIME_BASED), 1 (PACKET_BASED), 2 (STATIC), or 3 (RANDOM_SWEEP)"
+#endif
+#if CONFIG_RATE_SWITCH_MODE == 3
+#if CONFIG_RATE_SWEEP_GROUP_SIZE < 1
+#error "CONFIG_RATE_SWEEP_GROUP_SIZE must be >= 1"
+#endif
+#if CONFIG_ACK_TIMING_MODE != 2
+/* Stop-and-wait guarantees no packet is in flight when the rate changes, so
+ * the logged configured_rate is exactly the rate each packet was sent with. */
+#error "RANDOM_SWEEP requires CONFIG_ACK_TIMING_MODE == 2 for exact per-packet rate logging"
+#endif
+#endif
 #ifndef CONFIG_CSI_LIVE_MCS_SELECTION_ENABLED
 #define CONFIG_CSI_LIVE_MCS_SELECTION_ENABLED 1
 #endif
 #ifndef CONFIG_CSI_LIVE_MCS_ALGO
-#define CONFIG_CSI_LIVE_MCS_ALGO 1
+#define CONFIG_CSI_LIVE_MCS_ALGO 1 // 0 = Minstrel, 1 = Custom, 2 = DQN
 #endif
 #ifndef CONFIG_CSI_LIVE_MCS_MIN_INDEX
 #define CONFIG_CSI_LIVE_MCS_MIN_INDEX 0
@@ -142,7 +158,7 @@
 #ifndef CONFIG_CSI_DQN_LOG_ENABLED
 #define CONFIG_CSI_DQN_LOG_ENABLED 1
 #endif
-//test
+/* Short internal aliases for the CONFIG_CSI_* knobs managed by tools/device_menu.py. */
 #define CONFIG_LIVE_MCS_SELECTION_ENABLED   CONFIG_CSI_LIVE_MCS_SELECTION_ENABLED
 #define CONFIG_LIVE_MCS_ALGO                CONFIG_CSI_LIVE_MCS_ALGO
 #define CONFIG_LIVE_MCS_MIN_INDEX           CONFIG_CSI_LIVE_MCS_MIN_INDEX
@@ -342,6 +358,9 @@ static TaskHandle_t s_sender_task_handle = NULL;
 
 #if CONFIG_RATE_SWITCH_MODE == 0
 #define ACK_SERVICE_MEDIAN_MAX_SAMPLES  (CONFIG_SEND_FREQUENCY * CONFIG_RATE_SWITCH_INTERVAL_SEC * 2)
+#elif CONFIG_RATE_SWITCH_MODE == 3
+/* RANDOM_SWEEP has no per-segment resets; keep the same footprint as TIME_BASED. */
+#define ACK_SERVICE_MEDIAN_MAX_SAMPLES  (CONFIG_SEND_FREQUENCY * 20)
 #else
 #define ACK_SERVICE_MEDIAN_MAX_SAMPLES  CONFIG_RATE_SWITCH_PACKET_COUNT
 #endif
@@ -409,6 +428,19 @@ static const wifi_phy_rate_t s_esp_now_rate_cycle[] = {
 static const float s_mcs_rate_mbps[] = {
     6.5f, 13.0f, 19.5f, 26.0f, 39.0f, 52.0f, 58.5f, 65.0f,
 };
+#endif
+
+#if !CONFIG_LIVE_MCS_SELECTION_ENABLED && CONFIG_RATE_SWITCH_MODE == 3
+/* Fisher-Yates shuffle of the 8-entry MCS order using hardware randomness. */
+static void rate_sweep_shuffle(uint8_t order[8])
+{
+    for (size_t i = 7; i > 0; --i) {
+        size_t j = (size_t)(esp_random() % (uint32_t)(i + 1));
+        uint8_t tmp = order[i];
+        order[i] = order[j];
+        order[j] = tmp;
+    }
+}
 #endif
 
 typedef struct {
@@ -958,7 +990,7 @@ static void ack_record_status(uint32_t seq,
     (void)ack_log_enqueue(&event, 0);
 }
 
-#if !CONFIG_LIVE_MCS_SELECTION_ENABLED && CONFIG_RATE_SWITCH_MODE != 2
+#if !CONFIG_LIVE_MCS_SELECTION_ENABLED && CONFIG_RATE_SWITCH_MODE != 2 && CONFIG_RATE_SWITCH_MODE != 3
 /* Reset ACK counters and queue final PDR output before MCS/rate switch. */
 static void ack_reset_counters_for_rate_change(size_t new_mcs_index)
 {
@@ -1322,52 +1354,34 @@ static void wifi_init()
 #else
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(ESP_IF_WIFI_STA, CONFIG_WIFI_BANDWIDTH));
     ESP_ERROR_CHECK(esp_wifi_start());
-
 #endif
 
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-   
-   
-   
-    // TX power units are 0.25 dBm; 84 => 21 dBm (max on supported targets).
-    /*
-    Attention
 
-        3. Mapping Table {Power, max_tx_power} = {{8, 2}, {20, 5}, {28, 7}, {34, 8}, {44, 11}, {52, 13}, {56, 14}, {60, 15}, {66, 16}, {72, 18}, {80, 20}}.
-    Attention
-
-        4. Param power unit is 0.25dBm, range is [8, 84] corresponding to 2dBm - 20dBm.
-    Attention
-
-        5. Relationship between set value and actual value. As follows:
-         {set value range, actual value} = {{[8, 19],8}, {[20, 27],20}, {[28, 33],28}, {[34, 43],34}, {[44, 51],44}, {[52, 55],52}, {[56, 59],56}, {[60, 65],60}, {[66, 71],66}, {[72, 79],72}, {[80, 84],80}}.
-
-    */
+    // TX power units are 0.25 dBm; 84 => 21 dBm (see mapping at CONFIG_WIFI_TX_POWER).
     ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(CONFIG_WIFI_TX_POWER));
 
-
-
-    #if CONFIG_IDF_TARGET_ESP32C5
+#if CONFIG_IDF_TARGET_ESP32C5
     if ((CONFIG_WIFI_BAND_MODE == WIFI_BAND_MODE_2G_ONLY && CONFIG_WIFI_2G_BANDWIDTHS == WIFI_BW_HT20)
             || (CONFIG_WIFI_BAND_MODE == WIFI_BAND_MODE_5G_ONLY && CONFIG_WIFI_5G_BANDWIDTHS == WIFI_BW_HT20)) {
         ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_NONE));
     } else {
-            ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL,
-                                                 get_secondary_channel_for_ht40(CONFIG_LESS_INTERFERENCE_CHANNEL)));
+        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL,
+                                             get_secondary_channel_for_ht40(CONFIG_LESS_INTERFERENCE_CHANNEL)));
     }
 #elif (CONFIG_IDF_TARGET_ESP32C6 && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)) || CONFIG_IDF_TARGET_ESP32C61
     if (CONFIG_WIFI_BAND_MODE == WIFI_BAND_MODE_2G_ONLY && CONFIG_WIFI_2G_BANDWIDTHS == WIFI_BW_HT20) {
         ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_NONE));
     } else {
-            ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL,
-                                                 get_secondary_channel_for_ht40(CONFIG_LESS_INTERFERENCE_CHANNEL)));
+        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL,
+                                             get_secondary_channel_for_ht40(CONFIG_LESS_INTERFERENCE_CHANNEL)));
     }
 #else
     if (CONFIG_WIFI_BANDWIDTH == WIFI_BW_HT20) {
         ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_NONE));
     } else {
-            ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL,
-                                                 get_secondary_channel_for_ht40(CONFIG_LESS_INTERFERENCE_CHANNEL)));
+        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL,
+                                             get_secondary_channel_for_ht40(CONFIG_LESS_INTERFERENCE_CHANNEL)));
     }
 #endif
     ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, CONFIG_CSI_SEND_MAC));
@@ -1501,7 +1515,7 @@ void app_main()
     }
 #else
 
-#if CONFIG_RATE_SWITCH_MODE != 2
+#if CONFIG_RATE_SWITCH_MODE == 0 || CONFIG_RATE_SWITCH_MODE == 1
     size_t rate_index = 0;
 #endif
 
@@ -1515,10 +1529,10 @@ void app_main()
         int64_t now_us = esp_timer_get_time();
         if (now_us >= next_rate_switch_us) {
             rate_index = (rate_index + 1) % (sizeof(s_esp_now_rate_cycle) / sizeof(s_esp_now_rate_cycle[0]));
-            
+
             /* Reset counters and output final PDR for previous MCS before switching */
             ack_reset_counters_for_rate_change(rate_index);
-            
+
             esp_now_set_peer_rate(peer.peer_addr, s_esp_now_rate_cycle[rate_index]);
             ESP_LOGI(TAG, "ESP-NOW rate set: WIFI_PHY_RATE_MCS%u_LGI", (unsigned int)rate_index);
 
@@ -1537,6 +1551,58 @@ void app_main()
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         }
 #endif
+
+        tx_pacing_delay_us();
+    }
+#elif CONFIG_RATE_SWITCH_MODE == 3
+    /*
+     * RANDOM_SWEEP: shuffled round-robin, uniform per-packet MCS.
+     *
+     * Every window of 8 * CONFIG_RATE_SWEEP_GROUP_SIZE packets contains each
+     * MCS exactly GROUP_SIZE times in a freshly shuffled order, so the logged
+     * action is balanced, independent of the channel state, and has a known
+     * per-packet propensity of 1/8. This makes offline IPS/SNIPS evaluation
+     * and counterfactual reward modeling on the resulting dataset unbiased.
+     *
+     * No ACK counter resets happen in this mode: per-packet MCS is recovered
+     * from configured_rate in each ACK_STATUS row.
+     */
+    uint8_t sweep_order[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    size_t sweep_pos = 0;
+    uint32_t sweep_group_left = CONFIG_RATE_SWEEP_GROUP_SIZE;
+
+    rate_sweep_shuffle(sweep_order);
+    esp_now_set_peer_rate(peer.peer_addr, s_esp_now_rate_cycle[sweep_order[0]]);
+
+    ESP_LOGI(TAG, "ESP-NOW rate policy: RANDOM_SWEEP shuffled round-robin, group_size=%d",
+             CONFIG_RATE_SWEEP_GROUP_SIZE);
+    printf("RATE_POLICY,shuffled_round_robin,group_size=%d,actions=8,propensity=0.125000\n",
+           CONFIG_RATE_SWEEP_GROUP_SIZE);
+    fflush(stdout);
+
+    for (uint32_t count = 0; ; ++count) {
+        esp_err_t ret = esp_now_send_tracked(peer.peer_addr, count);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
+        }
+
+#if CONFIG_ACK_TIMING_MODE == 2
+        if (ret == ESP_OK) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        }
+#endif
+
+        /* The previous packet has terminated (stop-and-wait), so the rate
+         * change cannot affect a frame already in flight. */
+        if (--sweep_group_left == 0) {
+            sweep_group_left = CONFIG_RATE_SWEEP_GROUP_SIZE;
+            sweep_pos++;
+            if (sweep_pos == 8) {
+                sweep_pos = 0;
+                rate_sweep_shuffle(sweep_order);
+            }
+            esp_now_set_peer_rate(peer.peer_addr, s_esp_now_rate_cycle[sweep_order[sweep_pos]]);
+        }
 
         tx_pacing_delay_us();
     }
@@ -1565,10 +1631,10 @@ void app_main()
     for (uint32_t count = 0; ; ++count) {
         if (packets_attempted_in_current_rate >= CONFIG_RATE_SWITCH_PACKET_COUNT) {
             rate_index = (rate_index + 1) % (sizeof(s_esp_now_rate_cycle) / sizeof(s_esp_now_rate_cycle[0]));
-            
+
             /* Reset counters and output final PDR for previous MCS before switching */
             ack_reset_counters_for_rate_change(rate_index);
-            
+
             esp_now_set_peer_rate(peer.peer_addr, s_esp_now_rate_cycle[rate_index]);
             ESP_LOGI(TAG, "ESP-NOW rate set: WIFI_PHY_RATE_MCS%u_LGI", (unsigned int)rate_index);
             packets_attempted_in_current_rate = 0;

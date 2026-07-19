@@ -7,6 +7,25 @@ The receiver has two independent MCS recommendation paths:
   - `1` (default): two-head contextual bandit from `main/generated_bandit_model.h`, using the compact `link_v3c` (57-amplitude) state schema.
   - `0`: DQN Q-network from `main/generated_dqn_model.h`, using the `link_v2`..`link_v6` schema family.
 
+## Receiver App Partition
+
+The full-CSI canary requires ESP-IDF's 1500K single-app partition. This is
+selected in `sdkconfig.defaults`. If a host already has a generated
+`csi_recv/sdkconfig` that still selects the 1 MiB table, migrate it once before
+building:
+
+```bash
+cd csi_recv
+mv sdkconfig sdkconfig.before-large-partition
+. /home/$(id -un)/esp/esp-idf/export.sh
+idf.py reconfigure
+```
+
+The old configuration remains recoverable in
+`sdkconfig.before-large-partition`. The generated replacement should contain
+`CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y` and
+`CONFIG_PARTITION_TABLE_FILENAME="partitions_singleapp_large.csv"`.
+
 ## DQN Live Recommendations
 
 In the normal project workflow, configure this from the repository root with:

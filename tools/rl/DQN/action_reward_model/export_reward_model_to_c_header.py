@@ -11,6 +11,7 @@ Expected checkpoint format follows train_reward_model.py:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 
@@ -42,6 +43,7 @@ def _fmt_array(name: str, arr: np.ndarray, c_type: str = "float", per_line: int 
 
 
 def export_checkpoint(model_path: Path, output_header: Path) -> None:
+    checkpoint_sha256 = hashlib.sha256(model_path.read_bytes()).hexdigest()
     ckpt = torch.load(model_path, map_location="cpu")
 
     state_dim = int(ckpt["state_dim"])
@@ -132,6 +134,7 @@ def export_checkpoint(model_path: Path, output_header: Path) -> None:
     out.append("#define REWARD_MODEL_ACTION_FEATURE_DIM %d" % action_feature_dim)
     out.append("#define REWARD_MODEL_HIDDEN_DIM %d" % hidden_dim)
     out.append("#define REWARD_MODEL_INPUT_DIM %d" % input_dim)
+    out.append(f'#define REWARD_MODEL_CHECKPOINT_SHA256 "{checkpoint_sha256}"')
     out.append("#define REWARD_MODEL_OBJECTIVE_MINIMIZE %d" % objective_minimize)
     out.append("#define REWARD_MODEL_CONTEXT_IS_STATE_AGE_PACKETS %d" % (1 if state_context_feature == "state_age_packets" else 0))
     out.append("#define REWARD_MODEL_INCLUDES_STATE_MCS %d" % (1 if include_state_mcs else 0))

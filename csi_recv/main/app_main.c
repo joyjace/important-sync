@@ -34,13 +34,30 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
-#ifndef CONFIG_CSI_REWARD_MODEL_USE_V7C_CANARY
-#define CONFIG_CSI_REWARD_MODEL_USE_V7C_CANARY 0
+#ifndef CONFIG_CSI_REWARD_MODEL_VARIANT
+/* Reward-model artifacts are kept separate so switching modes never
+ * overwrites the rollback model:
+ *   0 = v2.6 link_v5 amplitude rollback/control
+ *   1 = v3.1 link_v7c full-CSI canary
+ *   2 = v3.2 broad-data link_v5 amplitude canary (seed 42)
+ */
+#define CONFIG_CSI_REWARD_MODEL_VARIANT 0
 #endif
-#if CONFIG_CSI_REWARD_MODEL_USE_V7C_CANARY
-#include "generated_reward_model_linkv7c_canary.h"
-#else
+
+#if CONFIG_CSI_REWARD_MODEL_VARIANT == 0
+#define CSI_REWARD_MODEL_VARIANT_ID "v2_6_linkv5_receiveronly_reward_model_holdout_f202_rooftop02"
 #include "generated_reward_model_v2.h"
+#elif CONFIG_CSI_REWARD_MODEL_VARIANT == 1
+#define CSI_REWARD_MODEL_VARIANT_ID "v3_1_linkv7c_phasereg075_c050_receiveronly_reward_model_holdout_f202_rooftop02"
+#include "generated_reward_model_linkv7c_canary.h"
+#elif CONFIG_CSI_REWARD_MODEL_VARIANT == 2
+#define CSI_REWARD_MODEL_VARIANT_ID "v3_2_broad_exact_reward_ablation_v1_seed42_amp"
+#include "generated_reward_model_linkv5_broad_canary.h"
+#else
+#error "CONFIG_CSI_REWARD_MODEL_VARIANT must be 0 (v2.6), 1 (v3.1 full CSI), or 2 (v3.2 broad amp)"
+#endif
+#ifndef REWARD_MODEL_CHECKPOINT_SHA256
+#define REWARD_MODEL_CHECKPOINT_SHA256 "unrecorded"
 #endif
 #include "csi_gain_compensation.h"
 #include "csi_link_v7c_features.h"
@@ -898,6 +915,10 @@ static void mcs_recommendation_task(void *arg)
 
 static void mcs_recommendation_init(void)
 {
+    printf("CSI_MODEL_VARIANT,reward_model,%s,%s,%u\n",
+           CSI_REWARD_MODEL_VARIANT_ID,
+           REWARD_MODEL_CHECKPOINT_SHA256,
+           (unsigned int)REWARD_MODEL_STATE_DIM);
 #if REWARD_MODEL_STATE_SCHEMA_LINK_V7C
     if (strcmp(REWARD_MODEL_CSI_FEATURE_CONTRACT_ID, CSI_LINK_V7C_CONTRACT_ID) != 0 ||
         strcmp(REWARD_MODEL_CSI_FEATURE_CONTRACT_SHA256, CSI_LINK_V7C_CONTRACT_SHA256) != 0 ||

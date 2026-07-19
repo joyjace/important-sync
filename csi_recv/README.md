@@ -97,18 +97,19 @@ Checkpoints trained before the schema rename stored the compact layout as
 
 ## Reward-Model Custom Recommendation Path
 
-The custom path is used by both the v2.6 amplitude control and the staged v3.1
-full-CSI canary. Its principal controls in `main/app_main.c` are:
+The custom path is shared by the v2.6 amplitude control, the v3.2 broad-data
+amplitude canary, and the staged v3.1 full-CSI canary. Its principal controls
+in `main/app_main.c` are:
 
 - `CONFIG_MCS_RECOMMENDATION_ENABLED`
 - `CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS`
 - `CONFIG_MCS_RECOMMENDATION_USE_MODEL`
-- `CONFIG_CSI_REWARD_MODEL_USE_V7C_CANARY`
+- `CONFIG_CSI_REWARD_MODEL_VARIANT`
 - `CONFIG_CSI_REWARD_MODEL_SNR_GUARD_ENABLED`
 
-With the canary selector off, the path includes
-`main/generated_reward_model_v2.h`; with it on, it includes
-`main/generated_reward_model_linkv7c_canary.h`. It uses the custom-policy
+The variant is `0` for `main/generated_reward_model_v2.h`, `1` for
+`main/generated_reward_model_linkv7c_canary.h`, and `2` for
+`main/generated_reward_model_linkv5_broad_canary.h`. It uses the custom-policy
 feedback frame and is separate from the DQN/live-policy controller. Prefer the
 coupled presets in `tools/device_menu.py` so sender and receiver flags cannot
 drift apart.
@@ -134,10 +135,26 @@ Only after reviewing the generated header, install it with:
 cp "$REWARD_HEADER" csi_recv/main/generated_reward_model_v2.h
 ```
 
-Do not overwrite the v2.6 header to try the full-CSI checkpoint. Export v7c to
-the separate canary header and select the **v3.1 robust full-CSI reward-model
-canary** menu mode; the **v2.6 amplitude reward-model champion
-(rollback/control)** mode switches back without replacing either artifact.
+The selected broad-data model is seed 42 from the completed v3.2 ablation. It
+uses the same receiver-only `link_v5` schema as v2.6 but was trained on the
+broad LOS/NLOS/RapidSweep training set. Reproduce its checked deployment header
+without replacing v2.6:
+
+```bash
+tools/venv/bin/python3 \
+  tools/rl/DQN/action_reward_model/export_reward_model_to_c_header.py \
+  --model tools/rl/DQN/models/v3_2_broad_exact_reward_ablation_v1/seed_42/amp/action_reward_model.pth \
+  --output csi_recv/main/generated_reward_model_linkv5_broad_canary.h
+```
+
+The menu requires checkpoint SHA-256
+`b70a3dd63bbe6964b5128412d6325becc2ed00d15bbdfafeab97b949c4ba7964`
+for this mode. Select **v3.2 broad-data amplitude reward-model canary (seed
+42)** to stage it, **v3.1 robust full-CSI reward-model canary** for the phase
+model, or **v2.6 amplitude reward-model champion (rollback/control)** to return
+to the original model. These choices only change the selector; none overwrites
+another artifact. The receiver prints `CSI_MODEL_VARIANT` at startup to record
+the selected model in live captures.
 
 The worker emits a `REWARD_INFERENCE_HEADER` followed by bounded
 `REWARD_INFERENCE` health rows at most once per second during normal operation

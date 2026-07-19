@@ -41,6 +41,12 @@ LIVE_MCS_ALGO_CHOICES = [
     "RECEIVER_POLICY - receiver live-policy frames (bandit or DQN)",
 ]
 
+REWARD_MODEL_VARIANT_CHOICES = [
+    "v2.6 link_v5 amplitude rollback/control",
+    "v3.1 link_v7c full-CSI canary",
+    "v3.2 broad-data link_v5 amplitude canary (seed 42)",
+]
+
 DEPRECATED_SENDER_KEYS = (
     "custom_reward_throughput_weight",
     "custom_reward_delay_weight",
@@ -89,7 +95,7 @@ DEFAULT_PROFILE = {
         "force_gain": 1,
         "gain_control": 1,
         "custom_mcs_recommendation_enabled": 0,
-        "reward_model_use_v7c_canary": 0,
+        "reward_model_variant": 0,
         "reward_model_snr_guard_enabled": 1,
         "reward_model_low_snr_threshold_db": 15,
         "reward_model_low_snr_max_mcs": 1,
@@ -216,7 +222,7 @@ MODES = {
         },
         "receiver": {
             "custom_mcs_recommendation_enabled": 1,
-            "reward_model_use_v7c_canary": 0,
+            "reward_model_variant": 0,
             "reward_model_snr_guard_enabled": 1,
             "reward_model_low_snr_threshold_db": 15,
             "reward_model_low_snr_max_mcs": 1,
@@ -227,6 +233,40 @@ MODES = {
                 "csi_recv/main/generated_reward_model_v2.h",
                 "REWARD_MODEL_STATE_DIM",
                 "tools/rl/DQN/action_reward_model/export_reward_model_to_c_header.py",
+            ),
+        ],
+    },
+    "reward_model_broad_amp_canary": {
+        "label": "v3.2 broad-data amplitude reward-model canary (seed 42)",
+        "sender": {
+            "ack_timing_mode": 2,
+            "live_mcs_selection_enabled": 1,
+            "live_mcs_algo": 1,
+            "live_mcs_min_index": 0,
+            "live_mcs_max_index": 7,
+            "remote_mcs_recommendation_enabled": 1,
+            "dqn_remote_recommendation_enabled": 0,
+            "dqn_remote_max_seq_gap": 50,
+            "dqn_failure_stepdown_enabled": 1,
+            "dqn_failure_stepdown_count": 8,
+        },
+        "receiver": {
+            "custom_mcs_recommendation_enabled": 1,
+            "reward_model_variant": 2,
+            # The offline broad-data qualification was unguarded. The current
+            # firmware guard is v7c-only, but keep the preset explicit.
+            "reward_model_snr_guard_enabled": 0,
+            "reward_model_low_snr_threshold_db": 15,
+            "reward_model_low_snr_max_mcs": 1,
+            "dqn_mcs_recommendation_enabled": 0,
+        },
+        "headers": [
+            (
+                "csi_recv/main/generated_reward_model_linkv5_broad_canary.h",
+                'REWARD_MODEL_CHECKPOINT_SHA256 "b70a3dd63bbe6964b5128412d6325becc2ed00d15bbdfafeab97b949c4ba7964"',
+                "tools/venv/bin/python3 tools/rl/DQN/action_reward_model/export_reward_model_to_c_header.py "
+                "--model tools/rl/DQN/models/v3_2_broad_exact_reward_ablation_v1/seed_42/amp/action_reward_model.pth "
+                "--output csi_recv/main/generated_reward_model_linkv5_broad_canary.h",
             ),
         ],
     },
@@ -246,7 +286,7 @@ MODES = {
         },
         "receiver": {
             "custom_mcs_recommendation_enabled": 1,
-            "reward_model_use_v7c_canary": 1,
+            "reward_model_variant": 1,
             "reward_model_snr_guard_enabled": 1,
             "reward_model_low_snr_threshold_db": 15,
             "reward_model_low_snr_max_mcs": 1,
@@ -292,6 +332,7 @@ MODE_ORDER = [
     "bandit",
     "dqn",
     "reward_model",
+    "reward_model_broad_amp_canary",
     "reward_model_v7c_canary",
     "static",
     "random_sweep",
@@ -346,6 +387,15 @@ def load_profile() -> dict:
     for section in merged:
         if section in profile and isinstance(profile[section], dict):
             merged[section].update(profile[section])
+
+    # Migrate profiles written before the three-way reward-model selector.
+    # An old enabled v7c boolean maps to variant 1; otherwise preserve v2.6.
+    saved_receiver = profile.get("receiver", {})
+    if isinstance(saved_receiver, dict) and "reward_model_variant" not in saved_receiver:
+        merged["receiver"]["reward_model_variant"] = (
+            1 if saved_receiver.get("reward_model_use_v7c_canary", 0) else 0
+        )
+    merged["receiver"].pop("reward_model_use_v7c_canary", None)
 
     for key in DEPRECATED_SENDER_KEYS:
         merged["sender"].pop(key, None)
@@ -429,6 +479,9 @@ def validate_receiver_profile(receiver: dict) -> None:
     if receiver.get("mcs_policy_model", 1) not in (0, 1):
         receiver["mcs_policy_model"] = 1
 
+    if receiver.get("reward_model_variant", 0) not in range(len(REWARD_MODEL_VARIANT_CHOICES)):
+        receiver["reward_model_variant"] = 0
+
     if receiver.get("reward_model_low_snr_max_mcs", 1) not in range(8):
         receiver["reward_model_low_snr_max_mcs"] = 1
 
@@ -493,7 +546,7 @@ def apply_profile_to_sources(profile: dict) -> None:
         "CONFIG_MCS_RECOMMENDATION_ENABLED",
         str(receiver["custom_mcs_recommendation_enabled"]),
     )
-    receiver_text = replace_define(receiver_text, "CONFIG_CSI_REWARD_MODEL_USE_V7C_CANARY", str(receiver["reward_model_use_v7c_canary"]))
+    receiver_text = replace_define(receiver_text, "CONFIG_CSI_REWARD_MODEL_VARIANT", str(receiver["reward_model_variant"]))
     receiver_text = replace_define(receiver_text, "CONFIG_CSI_REWARD_MODEL_SNR_GUARD_ENABLED", str(receiver["reward_model_snr_guard_enabled"]))
     receiver_text = replace_define(receiver_text, "CONFIG_CSI_REWARD_MODEL_LOW_SNR_THRESHOLD_DB", str(receiver["reward_model_low_snr_threshold_db"]))
     receiver_text = replace_define(receiver_text, "CONFIG_CSI_REWARD_MODEL_LOW_SNR_MAX_MCS", str(receiver["reward_model_low_snr_max_mcs"]))
@@ -589,12 +642,15 @@ def select_mode(profile: dict, local: dict) -> None:
         for section, field, old, new in changes:
             print(f"  {section}.{field}: {old} -> {new}")
 
+    if not check_mode_headers(mode):
+        print("Mode was not applied because its receiver model artifact is missing or does not match.")
+        return
+
     if not ask_yes_no("Apply this mode to the profile and C sources", True):
         return
 
     apply_mode_to_profile(profile, mode)
     save_profile(profile)
-    check_mode_headers(mode)
     try:
         apply_profile_to_sources(profile)
     except Exception as exc:
@@ -708,6 +764,22 @@ def ask_live_mcs_algo(default: int) -> int:
     default_index = default if 0 <= default < len(LIVE_MCS_ALGO_CHOICES) else 0
     selected = ask_choice("Live MCS algorithm", LIVE_MCS_ALGO_CHOICES, LIVE_MCS_ALGO_CHOICES[default_index])
     return LIVE_MCS_ALGO_CHOICES.index(selected)
+
+
+def reward_model_variant_label(value: int) -> str:
+    if 0 <= value < len(REWARD_MODEL_VARIANT_CHOICES):
+        return REWARD_MODEL_VARIANT_CHOICES[value]
+    return str(value)
+
+
+def ask_reward_model_variant(default: int) -> int:
+    default_index = default if 0 <= default < len(REWARD_MODEL_VARIANT_CHOICES) else 0
+    selected = ask_choice(
+        "Reward-model artifact",
+        REWARD_MODEL_VARIANT_CHOICES,
+        REWARD_MODEL_VARIANT_CHOICES[default_index],
+    )
+    return REWARD_MODEL_VARIANT_CHOICES.index(selected)
 
 
 def ask_mac(prompt: str, default: str) -> str:
@@ -957,7 +1029,7 @@ def edit_receiver_full(profile: dict) -> None:
     receiver["force_gain"] = 1 if ask_yes_no("Force gain", receiver["force_gain"] == 1) else 0
     receiver["gain_control"] = 1 if ask_yes_no("Enable gain control", receiver["gain_control"] == 1) else 0
     receiver["custom_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable reward-model recommendations", receiver["custom_mcs_recommendation_enabled"] == 1) else 0
-    receiver["reward_model_use_v7c_canary"] = 1 if ask_yes_no("Use staged v7c reward-model header", receiver["reward_model_use_v7c_canary"] == 1) else 0
+    receiver["reward_model_variant"] = ask_reward_model_variant(receiver["reward_model_variant"])
     receiver["reward_model_snr_guard_enabled"] = 1 if ask_yes_no("Enable reward-model low-SNR guard", receiver["reward_model_snr_guard_enabled"] == 1) else 0
     receiver["reward_model_low_snr_threshold_db"] = ask_int("Reward-model low-SNR threshold dB", receiver["reward_model_low_snr_threshold_db"], -20, 80)
     receiver["reward_model_low_snr_max_mcs"] = ask_int("Reward-model maximum MCS below threshold", receiver["reward_model_low_snr_max_mcs"], 0, 7)
@@ -1018,10 +1090,12 @@ def edit_receiver(profile: dict) -> None:
         print(f"3. force_gain: {receiver['force_gain']}")
         print(f"4. gain_control: {receiver['gain_control']}")
         print(f"5. custom_mcs_recommendation_enabled: {receiver['custom_mcs_recommendation_enabled']}")
-        print(f"6. dqn_mcs_recommendation_enabled: {receiver['dqn_mcs_recommendation_enabled']}")
-        print(f"7. mcs_policy_model: {receiver['mcs_policy_model']} (1=bandit, 0=DQN)")
-        print("8. Edit live-policy receiver fields")
-        print("9. Edit all receiver fields")
+        print(f"6. reward_model_variant: {receiver['reward_model_variant']} "
+              f"({reward_model_variant_label(receiver['reward_model_variant'])})")
+        print(f"7. dqn_mcs_recommendation_enabled: {receiver['dqn_mcs_recommendation_enabled']}")
+        print(f"8. mcs_policy_model: {receiver['mcs_policy_model']} (1=bandit, 0=DQN)")
+        print("9. Edit live-policy receiver fields")
+        print("10. Edit all receiver fields")
         print("0. Back")
         choice = input("Select receiver field: ").strip()
 
@@ -1036,13 +1110,15 @@ def edit_receiver(profile: dict) -> None:
         elif choice == "5":
             receiver["custom_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable reward-model recommendations", receiver["custom_mcs_recommendation_enabled"] == 1) else 0
         elif choice == "6":
-            receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver live-policy recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
+            receiver["reward_model_variant"] = ask_reward_model_variant(receiver["reward_model_variant"])
         elif choice == "7":
-            receiver["mcs_policy_model"] = ask_int("Live policy model (1=bandit link_v3c, 0=DQN Q-network)", receiver["mcs_policy_model"], 0, 1)
+            receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver live-policy recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
         elif choice == "8":
+            receiver["mcs_policy_model"] = ask_int("Live policy model (1=bandit link_v3c, 0=DQN Q-network)", receiver["mcs_policy_model"], 0, 1)
+        elif choice == "9":
             edit_receiver_dqn(profile)
             continue
-        elif choice == "9":
+        elif choice == "10":
             edit_receiver_full(profile)
         elif choice == "0":
             return

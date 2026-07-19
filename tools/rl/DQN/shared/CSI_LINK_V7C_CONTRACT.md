@@ -286,7 +286,7 @@ settings:
   and the full MCS0..MCS7 range are pinned by the preset.
 - Receiver: `CONFIG_MCS_RECOMMENDATION_ENABLED=1`,
   `CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED=0`, and
-  `CONFIG_CSI_REWARD_MODEL_USE_V7C_CANARY=1`.
+  `CONFIG_CSI_REWARD_MODEL_VARIANT=1`.
 - Guard: `CONFIG_CSI_REWARD_MODEL_SNR_GUARD_ENABLED=1`, with the 15 dB
   threshold and MCS1 low-SNR cap used for offline qualification.
 

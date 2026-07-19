@@ -24,9 +24,10 @@ shared profile, and rewrites both C sources:
 | 2 | `bandit` | Contextual bandit (receiver live policy, contract checked in firmware) | `RECEIVER_POLICY` (`dqn_reco` frames) with blackout safeguards | live-policy path, contract-checked `link_v3c` bandit |
 | 3 | `dqn` | DQN Q-network (receiver live policy) | `RECEIVER_POLICY` (`dqn_reco` frames) with blackout safeguards | live-policy path, DQN Q-network |
 | 4 | `reward_model` | v2.6 amplitude reward-model champion (rollback/control) | `CUSTOM_POLICY` (`mcs_reco` frames) | custom reward-model path, v2.6 amplitude header |
-| 5 | `reward_model_v7c_canary` | v3.1 robust full-CSI reward-model canary | `CUSTOM_POLICY` (`mcs_reco` frames) with age/sequence/failure safeguards | custom reward-model path, v7c staging header and low-SNR guard |
-| 6 | `static` | Static MCS baseline (fixed rate, no adaptation) | fixed MCS (asks which), no adaptation | pure CSI logger |
-| 7 | `random_sweep` | RANDOM_SWEEP data collection (uniform per-packet MCS, propensity 1/8) | randomized collection (asks group size) | pure CSI logger |
+| 5 | `reward_model_broad_amp_canary` | v3.2 broad-data amplitude reward-model canary (seed 42) | `CUSTOM_POLICY` (`mcs_reco` frames) with age/sequence/failure safeguards | custom reward-model path, exact-hash-checked broad-data `link_v5` header |
+| 6 | `reward_model_v7c_canary` | v3.1 robust full-CSI reward-model canary | `CUSTOM_POLICY` (`mcs_reco` frames) with age/sequence/failure safeguards | custom reward-model path, v7c staging header and low-SNR guard |
+| 7 | `static` | Static MCS baseline (fixed rate, no adaptation) | fixed MCS (asks which), no adaptation | pure CSI logger |
+| 8 | `random_sweep` | RANDOM_SWEEP data collection (uniform per-packet MCS, propensity 1/8) | randomized collection (asks group size) | pure CSI logger |
 
 Before applying, the menu shows exactly which values will change. For model
 modes it verifies the required generated header is present and has the expected
@@ -59,8 +60,8 @@ TX power, all `CONFIG_CSI_LIVE_MCS_*` / `CONFIG_CSI_MINSTREL_*` /
 `CONFIG_CSI_REMOTE_MCS_*` / `CONFIG_CSI_DQN_*` knobs, and both MAC arrays.
 
 Receiver (`csi_recv/main/app_main.c`): channel, ESP-NOW rate, gain options,
-`CONFIG_MCS_RECOMMENDATION_ENABLED` (custom reward-model path used by both the
-v2.6 control and v3.1 canary), the v7c header selector and low-SNR guard,
+`CONFIG_MCS_RECOMMENDATION_ENABLED` (custom reward-model path), the three-way
+`CONFIG_CSI_REWARD_MODEL_VARIANT` selector and low-SNR guard,
 `CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED` (live-policy path),
 `CONFIG_CSI_MCS_POLICY_MODEL` (`1` = bandit, `0` = DQN Q-network), the
 live-policy cadence/warmup/staleness knobs, and both MAC arrays.
@@ -72,22 +73,25 @@ compile error otherwise); the menu enforces this.
 
 - `live_mcs_algo = 0` — MINSTREL_LIKE: sender-local ACK EWMA + probing.
 - `live_mcs_algo = 1` — CUSTOM_POLICY: reward-model receiver recommendations
-  (`mcs_reco` frames). Both the v2.6 rollback/control and v3.1 full-CSI canary
-  use this path.
+  (`mcs_reco` frames). The v2.6 rollback, v3.2 broad-data amplitude canary, and
+  v3.1 full-CSI canary all use this path.
 - `live_mcs_algo = 2` — RECEIVER_POLICY: follows the receiver's live-policy
   frames (`dqn_reco` frames). The receiver-side model behind those frames is
   chosen by `mcs_policy_model` (bandit or DQN) — this is the mode both the
   bandit and DQN presets use.
 
-The v3.1 canary does **not** use the DQN recommendation path. Its preset enables
-the receiver custom reward-model path, selects the v7c staging header, and caps
-recommendations at MCS1 when SNR is below 15 dB. On the sender it enables the
-CUSTOM_POLICY recommendation-age check, the shared sequence-gap guard, and an
-emergency stepdown after eight consecutive failures. Selecting the v2.6 preset
-restores the amplitude model as the rollback/control without overwriting either
-generated header. Both reward-model presets pin stop-and-wait ACK timing and the
-MCS0..MCS7 range so a stale custom profile cannot bypass the low-SNR or
-non-finite-score safety stepdown.
+The reward-model variant values are `0` = v2.6 rollback, `1` = v3.1 full CSI,
+and `2` = v3.2 broad-data amplitude. Each has its own generated header; changing
+the mode never overwrites another model. The v3.2 mode checks the exact seed-42
+checkpoint SHA-256 before it can be applied and uses the same deployed `link_v5`
+state builder as v2.6. Its offline qualification was unguarded, so its preset
+leaves the v7c-only SNR guard off.
+
+The v3.1 preset selects the v7c staging header and caps recommendations at MCS1
+when SNR is below 15 dB. All reward-model presets pin stop-and-wait ACK timing,
+MCS0..MCS7, recommendation-age/sequence checks, and emergency stepdown after
+eight consecutive failures. At startup, the receiver emits
+`CSI_MODEL_VARIANT` so a capture records which artifact was flashed.
 
 ## Comparing algorithms
 

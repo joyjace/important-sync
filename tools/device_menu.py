@@ -37,7 +37,7 @@ RATE_CHOICES = [
 
 LIVE_MCS_ALGO_CHOICES = [
     "MINSTREL_LIKE - sender ACK EWMA + probing",
-    "CUSTOM_POLICY - legacy reward-model receiver recommendations",
+    "CUSTOM_POLICY - reward-model receiver recommendations",
     "RECEIVER_POLICY - receiver live-policy frames (bandit or DQN)",
 ]
 
@@ -89,6 +89,10 @@ DEFAULT_PROFILE = {
         "force_gain": 1,
         "gain_control": 1,
         "custom_mcs_recommendation_enabled": 0,
+        "reward_model_use_v7c_canary": 0,
+        "reward_model_snr_guard_enabled": 1,
+        "reward_model_low_snr_threshold_db": 15,
+        "reward_model_low_snr_max_mcs": 1,
         "dqn_mcs_recommendation_enabled": 0,
         "mcs_policy_model": 1,
         "dqn_recommendation_every_n_packets": 1,
@@ -128,6 +132,7 @@ MODES = {
     "minstrel": {
         "label": "Minstrel-like (sender-local ACK statistics, no receiver feedback)",
         "sender": {
+            "ack_timing_mode": 2,
             "live_mcs_selection_enabled": 1,
             "live_mcs_algo": 0,
             "remote_mcs_recommendation_enabled": 0,
@@ -140,8 +145,9 @@ MODES = {
         "headers": [],
     },
     "bandit": {
-        "label": "Contextual bandit (receiver live policy, link_v3c model)",
+        "label": "Contextual bandit (receiver live policy, contract checked in firmware)",
         "sender": {
+            "ack_timing_mode": 2,
             "live_mcs_selection_enabled": 1,
             "live_mcs_algo": 2,
             "remote_mcs_recommendation_enabled": 0,
@@ -162,7 +168,7 @@ MODES = {
         "headers": [
             (
                 "csi_recv/main/generated_bandit_model.h",
-                "BANDIT_MODEL_STATE_SCHEMA_LINK_V3C",
+                "BANDIT_MODEL_STATE_DIM",
                 "tools/rl/DQN/action_reward_model/export_bandit_model_to_c_header.py",
             ),
         ],
@@ -170,6 +176,7 @@ MODES = {
     "dqn": {
         "label": "DQN Q-network (receiver live policy)",
         "sender": {
+            "ack_timing_mode": 2,
             "live_mcs_selection_enabled": 1,
             "live_mcs_algo": 2,
             "remote_mcs_recommendation_enabled": 0,
@@ -192,21 +199,63 @@ MODES = {
         ],
     },
     "reward_model": {
-        "label": "Legacy reward-model custom policy (receiver recommendations)",
+        "label": "v2.6 amplitude reward-model champion (rollback/control)",
         "sender": {
+            "ack_timing_mode": 2,
             "live_mcs_selection_enabled": 1,
             "live_mcs_algo": 1,
+            "live_mcs_min_index": 0,
+            "live_mcs_max_index": 7,
             "remote_mcs_recommendation_enabled": 1,
             "dqn_remote_recommendation_enabled": 0,
+            # The generic receiver-policy blackout guard is shared with the
+            # reward path even though the historical config names say DQN.
+            "dqn_remote_max_seq_gap": 50,
+            "dqn_failure_stepdown_enabled": 1,
+            "dqn_failure_stepdown_count": 8,
         },
         "receiver": {
             "custom_mcs_recommendation_enabled": 1,
+            "reward_model_use_v7c_canary": 0,
+            "reward_model_snr_guard_enabled": 1,
+            "reward_model_low_snr_threshold_db": 15,
+            "reward_model_low_snr_max_mcs": 1,
             "dqn_mcs_recommendation_enabled": 0,
         },
         "headers": [
             (
                 "csi_recv/main/generated_reward_model_v2.h",
                 "REWARD_MODEL_STATE_DIM",
+                "tools/rl/DQN/action_reward_model/export_reward_model_to_c_header.py",
+            ),
+        ],
+    },
+    "reward_model_v7c_canary": {
+        "label": "v3.1 robust full-CSI reward-model canary",
+        "sender": {
+            "ack_timing_mode": 2,
+            "live_mcs_selection_enabled": 1,
+            "live_mcs_algo": 1,
+            "live_mcs_min_index": 0,
+            "live_mcs_max_index": 7,
+            "remote_mcs_recommendation_enabled": 1,
+            "dqn_remote_recommendation_enabled": 0,
+            "dqn_remote_max_seq_gap": 50,
+            "dqn_failure_stepdown_enabled": 1,
+            "dqn_failure_stepdown_count": 8,
+        },
+        "receiver": {
+            "custom_mcs_recommendation_enabled": 1,
+            "reward_model_use_v7c_canary": 1,
+            "reward_model_snr_guard_enabled": 1,
+            "reward_model_low_snr_threshold_db": 15,
+            "reward_model_low_snr_max_mcs": 1,
+            "dqn_mcs_recommendation_enabled": 0,
+        },
+        "headers": [
+            (
+                "csi_recv/main/generated_reward_model_linkv7c_canary.h",
+                "REWARD_MODEL_STATE_SCHEMA_LINK_V7C 1",
                 "tools/rl/DQN/action_reward_model/export_reward_model_to_c_header.py",
             ),
         ],
@@ -238,7 +287,15 @@ MODES = {
     },
 }
 
-MODE_ORDER = ["minstrel", "bandit", "dqn", "reward_model", "static", "random_sweep"]
+MODE_ORDER = [
+    "minstrel",
+    "bandit",
+    "dqn",
+    "reward_model",
+    "reward_model_v7c_canary",
+    "static",
+    "random_sweep",
+]
 
 
 def read_text(path: Path) -> str:
@@ -372,6 +429,9 @@ def validate_receiver_profile(receiver: dict) -> None:
     if receiver.get("mcs_policy_model", 1) not in (0, 1):
         receiver["mcs_policy_model"] = 1
 
+    if receiver.get("reward_model_low_snr_max_mcs", 1) not in range(8):
+        receiver["reward_model_low_snr_max_mcs"] = 1
+
     # Both recommendation paths on at once is a firmware compile error.
     if receiver.get("custom_mcs_recommendation_enabled", 0) and receiver.get("dqn_mcs_recommendation_enabled", 0):
         print("NOTE: custom and DQN recommendation paths are mutually exclusive; disabling the custom path.")
@@ -433,6 +493,10 @@ def apply_profile_to_sources(profile: dict) -> None:
         "CONFIG_MCS_RECOMMENDATION_ENABLED",
         str(receiver["custom_mcs_recommendation_enabled"]),
     )
+    receiver_text = replace_define(receiver_text, "CONFIG_CSI_REWARD_MODEL_USE_V7C_CANARY", str(receiver["reward_model_use_v7c_canary"]))
+    receiver_text = replace_define(receiver_text, "CONFIG_CSI_REWARD_MODEL_SNR_GUARD_ENABLED", str(receiver["reward_model_snr_guard_enabled"]))
+    receiver_text = replace_define(receiver_text, "CONFIG_CSI_REWARD_MODEL_LOW_SNR_THRESHOLD_DB", str(receiver["reward_model_low_snr_threshold_db"]))
+    receiver_text = replace_define(receiver_text, "CONFIG_CSI_REWARD_MODEL_LOW_SNR_MAX_MCS", str(receiver["reward_model_low_snr_max_mcs"]))
     receiver_text = replace_define(receiver_text, "CONFIG_CSI_MCS_POLICY_MODEL", str(receiver["mcs_policy_model"]))
     receiver_text = replace_define(receiver_text, "CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED", str(receiver["dqn_mcs_recommendation_enabled"]))
     receiver_text = replace_define(receiver_text, "CONFIG_CSI_DQN_RECOMMENDATION_EVERY_N_PACKETS", str(receiver["dqn_recommendation_every_n_packets"]))
@@ -892,7 +956,11 @@ def edit_receiver_full(profile: dict) -> None:
     receiver["esp_now_rate"] = ask_choice("ESP-NOW PHY rate", RATE_CHOICES, receiver["esp_now_rate"])
     receiver["force_gain"] = 1 if ask_yes_no("Force gain", receiver["force_gain"] == 1) else 0
     receiver["gain_control"] = 1 if ask_yes_no("Enable gain control", receiver["gain_control"] == 1) else 0
-    receiver["custom_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable legacy reward-model recommendations", receiver["custom_mcs_recommendation_enabled"] == 1) else 0
+    receiver["custom_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable reward-model recommendations", receiver["custom_mcs_recommendation_enabled"] == 1) else 0
+    receiver["reward_model_use_v7c_canary"] = 1 if ask_yes_no("Use staged v7c reward-model header", receiver["reward_model_use_v7c_canary"] == 1) else 0
+    receiver["reward_model_snr_guard_enabled"] = 1 if ask_yes_no("Enable reward-model low-SNR guard", receiver["reward_model_snr_guard_enabled"] == 1) else 0
+    receiver["reward_model_low_snr_threshold_db"] = ask_int("Reward-model low-SNR threshold dB", receiver["reward_model_low_snr_threshold_db"], -20, 80)
+    receiver["reward_model_low_snr_max_mcs"] = ask_int("Reward-model maximum MCS below threshold", receiver["reward_model_low_snr_max_mcs"], 0, 7)
     receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver live-policy recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
     receiver["mcs_policy_model"] = ask_int("Live policy model (1=bandit link_v3c, 0=DQN Q-network)", receiver["mcs_policy_model"], 0, 1)
     receiver["dqn_recommendation_every_n_packets"] = ask_int("Live policy recommendation every N packets", receiver["dqn_recommendation_every_n_packets"], 1, 1000000)
@@ -966,7 +1034,7 @@ def edit_receiver(profile: dict) -> None:
         elif choice == "4":
             receiver["gain_control"] = 1 if ask_yes_no("Enable gain control", receiver["gain_control"] == 1) else 0
         elif choice == "5":
-            receiver["custom_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable legacy reward-model recommendations", receiver["custom_mcs_recommendation_enabled"] == 1) else 0
+            receiver["custom_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable reward-model recommendations", receiver["custom_mcs_recommendation_enabled"] == 1) else 0
         elif choice == "6":
             receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver live-policy recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
         elif choice == "7":

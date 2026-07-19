@@ -1,0 +1,95 @@
+{
+  "status": "staged_canary_requires_live_ab",
+  "active_champion_replaced": false,
+  "model": {
+    "checkpoint_sha256": "8472e769f2bba57cb1978c20f733e65ff0cced480cdc2471bfa66ecdcd134e22",
+    "header_sha256": "8d0d8c023bc12f24b091e75e5820949f93a46e8549b5795426e7643c05ec4459",
+    "state_schema": "link_v7c",
+    "state_dim": 181,
+    "hidden_dim": 128,
+    "best_eval_loss": 0.06064750999212265,
+    "phase_dropout": 0.75,
+    "phase_consistency_weight": 0.5
+  },
+  "contracts": {
+    "csi_id": "link_v7c_ht20_v1",
+    "csi_sha256": "df4f262b3fdf57f2f693b40b8584c08d5193ba092290d7f771e1a52575c8603a",
+    "state_id": "link_v7c_receiveronly_v1",
+    "state_sha256": "8c88cd04a5e2c28366f567a5928e8df6df685f05284e5683a6a4d3cfd0beb790"
+  },
+  "datasets": {
+    "train_sha256": "7711709a60f0b572f5ff63556907f5f9e2bbd545024ad184a10ec751fe78584a",
+    "healthy_holdout_sha256": "efc8bd62b5b2b41d716aa3ebcf33adb89add56dd2fef8b0a5d1130f6c7caa826",
+    "failure_holdout_sha256": "bf8ad371c3288cfa013e450df2577803ef9227f9520c306b1f44e35c7d369cb0",
+    "all_deployment_candidate": true
+  },
+  "live_policy_guard": {
+    "enabled": true,
+    "condition": "snr_db < 15",
+    "maximum_mcs": 1
+  },
+  "empirical_propensity_holdout_metrics": {
+    "healthy": {
+      "rows": 14658,
+      "coverage": 0.1145,
+      "snips_reward": 0.7994,
+      "snips_p95_service_ms": 4.633,
+      "snips_capped_mean_service_ms": 1.0022,
+      "composite": 0.8189
+    },
+    "failure_guarded": {
+      "rows": 8984,
+      "coverage": 0.1573,
+      "snips_reward": 0.81,
+      "snips_p95_service_ms": 4.185,
+      "snips_capped_mean_service_ms": 0.9926,
+      "composite": 0.9867
+    }
+  },
+  "phase_zero_ablation": {
+    "method": "replace all phase-derived raw state indices 56:166 (differential values, valid fraction, and coherence) with checkpoint training means before normalization",
+    "incremental_phase_value_proven": false,
+    "artifacts": {
+      "healthy_predictions": "predictions/v3_1_linkv7c_phasereg075_c050_receiveronly_reward_model_holdout_f202_rooftop02/action_reward_recommendations_LOS_1m_F202_run02_fresh_guard_snr15_mcs1_phase_masked.csv",
+      "healthy_predictions_sha256": "7932c3241ade74674e37b49f2cd03c136993786c2a252f0de7ee618a58c1a8cc",
+      "healthy_evaluation": "predictions/v3_1_linkv7c_phasereg075_c050_receiveronly_reward_model_holdout_f202_rooftop02/eval_LOS_1m_F202_run02_fresh_guard_snr15_mcs1_phase_masked.json",
+      "healthy_evaluation_sha256": "5a3d9741b31f5de607c8204146089e1ee288d0a5581b06e7ca14ece1eb95b83d",
+      "failure_predictions": "predictions/v3_1_linkv7c_phasereg075_c050_receiveronly_reward_model_holdout_f202_rooftop02/action_reward_recommendations_LOS_5m_Aymen_rooftop_run02_fresh_guard_snr15_mcs1_phase_masked.csv",
+      "failure_predictions_sha256": "ba99feb93039689494876cc94469e97ed54f8a7e4e49b4952e4cba02c8cf7e3c",
+      "failure_evaluation": "predictions/v3_1_linkv7c_phasereg075_c050_receiveronly_reward_model_holdout_f202_rooftop02/eval_LOS_5m_Aymen_rooftop_run02_fresh_guard_snr15_mcs1_phase_masked.json",
+      "failure_evaluation_sha256": "a0b5cee5e6b28eefd90dc8e8beee34062e1cdff25eb3236ddbdec5ea8ccffe63"
+    },
+    "healthy_phase_masked": {
+      "rows": 14658,
+      "coverage": 0.1377,
+      "action_change_fraction_vs_full": 0.3277,
+      "snips_reward": 0.7966,
+      "snips_p95_service_ms": 4.831,
+      "snips_capped_mean_service_ms": 1.0206,
+      "composite": 0.7715
+    },
+    "failure_guarded_phase_masked": {
+      "rows": 8984,
+      "coverage": 0.1633,
+      "action_change_fraction_vs_full": 0.1616,
+      "snips_reward": 0.8185,
+      "snips_p95_service_ms": 3.691,
+      "snips_capped_mean_service_ms": 0.9247,
+      "composite": 0.9988
+    },
+    "conclusion": "mixed: full phase improves the healthy holdout but phase masking improves the failure holdout; incremental phase value is not yet general"
+  },
+  "firmware": {
+    "canary_binary_size_hex": "0xf25c0",
+    "default_partition_size_hex": "0x100000",
+    "free_bytes_hex": "0xda40",
+    "sender_binary_size_hex": "0xdb1f0",
+    "sender_free_bytes_hex": "0x24e10",
+    "startup_contract_line": "CSI_MODEL,reward_model,link_v7c_ht20_v1,link_v7c_receiveronly_v1,166,181"
+  },
+  "promotion_blockers": [
+    "No paired live canary/A-B run has been completed yet",
+    "Healthy holdout reward is slightly below v2.6 even though its tail and composite metrics pass",
+    "Phase-zero ablation is mixed and does not yet establish general incremental value from phase"
+  ]
+}

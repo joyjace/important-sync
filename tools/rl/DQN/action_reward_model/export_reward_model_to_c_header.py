@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Export action-conditioned reward model checkpoint (.pth) to a C header.
+
+Expected checkpoint format follows train_reward_model.py:
+- model_state (PyTorch state dict for ActionRewardNetwork)
+- state_dim, action_dim, action_feature_dim, hidden_dim
+- state_mean, state_std
+- objective
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DQN_MODEL_DIR = SCRIPT_DIR.parent / "dqn_model"
+sys.path.insert(0, str(DQN_MODEL_DIR))
+
+from train_dqn import feature_contract_metadata, state_feature_names
+
+
+def _to_numpy(tensor_or_list):
+    if isinstance(tensor_or_list, torch.Tensor):
+        return tensor_or_list.detach().cpu().numpy()
+    return np.asarray(tensor_or_list)
+
+
+def _fmt_array(name: str, arr: np.ndarray, c_type: str = "float", per_line: int = 8) -> str:
+    flat = arr.reshape(-1)
+    lines = [f"static const {c_type} {name}[{flat.size}] = {{"]
+    for idx in range(0, flat.size, per_line):
+        chunk = flat[idx : idx + per_line]
+        vals = ", ".join(f"{float(v):.8e}f" for v in chunk)
+        lines.append(f"    {vals},")
+    lines.append("};")
+    return "\n".join(lines)
+
+
+def export_checkpoint(model_path: Path, output_header: Path) -> None:
+    ckpt = torch.load(model_path, map_location="cpu")
+
+    state_dim = int(ckpt["state_dim"])
+    action_dim = int(ckpt["action_dim"])
+    action_feature_dim = int(ckpt.get("action_feature_dim", 9))
+    hidden_dim = int(ckpt.get("hidden_dim", 128))
+    objective = str(ckpt.get("objective", "maximize"))
+    objective_minimize = 1 if objective == "minimize" else 0
+    state_schema = str(ckpt.get("state_schema", "legacy_v1"))
+    state_context_feature = str(ckpt.get("state_context_feature", "sig_len"))
+    include_state_mcs = bool(ckpt.get("include_state_mcs", state_dim in {136, 140, 143, 262}))
+
+    if action_dim != 8 or action_feature_dim != 9:
+        raise ValueError(
+            "Firmware reward export requires action_dim=8 and action_feature_dim=9; "
+            f"got {action_dim} and {action_feature_dim}"
+        )
+    if objective not in {"maximize", "minimize"}:
+        raise ValueError(f"Unsupported reward-model objective: {objective!r}")
+
+    model_state = ckpt["model_state"]
+
+    w1 = _to_numpy(model_state["net.0.weight"]).astype(np.float32)
+    b1 = _to_numpy(model_state["net.0.bias"]).astype(np.float32)
+    w2 = _to_numpy(model_state["net.2.weight"]).astype(np.float32)
+    b2 = _to_numpy(model_state["net.2.bias"]).astype(np.float32)
+    w3 = _to_numpy(model_state["net.4.weight"]).astype(np.float32)
+    b3 = _to_numpy(model_state["net.4.bias"]).astype(np.float32)
+
+    state_mean = _to_numpy(ckpt["state_mean"]).astype(np.float32)
+    state_std = _to_numpy(ckpt["state_std"]).astype(np.float32)
+    if state_mean.shape != (state_dim,) or state_std.shape != (state_dim,):
+        raise ValueError(
+            f"Normalizer shapes must both be {(state_dim,)}; "
+            f"got mean={state_mean.shape}, std={state_std.shape}"
+        )
+    state_std = np.where(np.abs(state_std) < 1e-6, 1.0, state_std).astype(np.float32)
+
+    input_dim = state_dim + action_feature_dim
+    expected_state_dim = len(state_feature_names(state_schema, include_state_mcs))
+    if state_dim != expected_state_dim:
+        raise ValueError(
+            f"Checkpoint state_dim={state_dim} does not match schema "
+            f"{state_schema} include_state_mcs={include_state_mcs} "
+            f"(expected {expected_state_dim})"
+        )
+
+    contract_metadata = feature_contract_metadata(state_schema)
+    for key, expected in contract_metadata.items():
+        if ckpt.get(key) != expected:
+            raise ValueError(
+                f"Checkpoint {key}={ckpt.get(key)!r} does not match expected {expected!r}"
+            )
+
+    if w1.shape != (hidden_dim, input_dim):
+        raise ValueError(f"Unexpected w1 shape: {w1.shape}, expected {(hidden_dim, input_dim)}")
+    if w2.shape != (hidden_dim, hidden_dim):
+        raise ValueError(f"Unexpected w2 shape: {w2.shape}, expected {(hidden_dim, hidden_dim)}")
+    if w3.shape != (1, hidden_dim):
+        raise ValueError(f"Unexpected w3 shape: {w3.shape}, expected {(1, hidden_dim)}")
+    if b1.shape != (hidden_dim,) or b2.shape != (hidden_dim,) or b3.shape != (1,):
+        raise ValueError(
+            "Unexpected bias shapes: "
+            f"b1={b1.shape}, b2={b2.shape}, b3={b3.shape}"
+        )
+    for name, values in (
+        ("state_mean", state_mean),
+        ("state_std", state_std),
+        ("w1", w1),
+        ("b1", b1),
+        ("w2", w2),
+        ("b2", b2),
+        ("w3", w3),
+        ("b3", b3),
+    ):
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Checkpoint {name} contains NaN or infinity")
+
+    guard = "GENERATED_REWARD_MODEL_H"
+
+    out = []
+    out.append("/* Auto-generated by export_reward_model_to_c_header.py. */")
+    out.append(f"#ifndef {guard}")
+    out.append(f"#define {guard}")
+    out.append("")
+    out.append("#define REWARD_MODEL_STATE_DIM %d" % state_dim)
+    out.append("#define REWARD_MODEL_ACTION_DIM %d" % action_dim)
+    out.append("#define REWARD_MODEL_ACTION_FEATURE_DIM %d" % action_feature_dim)
+    out.append("#define REWARD_MODEL_HIDDEN_DIM %d" % hidden_dim)
+    out.append("#define REWARD_MODEL_INPUT_DIM %d" % input_dim)
+    out.append("#define REWARD_MODEL_OBJECTIVE_MINIMIZE %d" % objective_minimize)
+    out.append("#define REWARD_MODEL_CONTEXT_IS_STATE_AGE_PACKETS %d" % (1 if state_context_feature == "state_age_packets" else 0))
+    out.append("#define REWARD_MODEL_INCLUDES_STATE_MCS %d" % (1 if include_state_mcs else 0))
+    out.append("#define REWARD_MODEL_STATE_SCHEMA_LINK_V2 %d" % (1 if state_schema == "link_v2" else 0))
+    out.append("#define REWARD_MODEL_STATE_SCHEMA_LINK_V3 %d" % (1 if state_schema == "link_v3" else 0))
+    out.append("#define REWARD_MODEL_STATE_SCHEMA_LINK_V4 %d" % (1 if state_schema == "link_v4" else 0))
+    out.append("#define REWARD_MODEL_STATE_SCHEMA_LINK_V5 %d" % (1 if state_schema == "link_v5" else 0))
+    out.append("#define REWARD_MODEL_STATE_SCHEMA_LINK_V6 %d" % (1 if state_schema == "link_v6" else 0))
+    out.append("#define REWARD_MODEL_STATE_SCHEMA_LINK_V7C %d" % (1 if state_schema == "link_v7c" else 0))
+    out.append(
+        '#define REWARD_MODEL_CSI_FEATURE_CONTRACT_ID "%s"'
+        % contract_metadata.get("csi_feature_contract_id", "")
+    )
+    out.append(
+        '#define REWARD_MODEL_CSI_FEATURE_CONTRACT_SHA256 "%s"'
+        % contract_metadata.get("csi_feature_contract_sha256", "")
+    )
+    out.append(
+        "#define REWARD_MODEL_CSI_FEATURE_COUNT %d"
+        % contract_metadata.get("csi_feature_count", 0)
+    )
+    out.append(
+        '#define REWARD_MODEL_STATE_CONTRACT_ID "%s"'
+        % contract_metadata.get("state_contract_id", "")
+    )
+    out.append(
+        '#define REWARD_MODEL_STATE_CONTRACT_SHA256 "%s"'
+        % contract_metadata.get("state_contract_sha256", "")
+    )
+    out.append("")
+
+    out.append(_fmt_array("reward_model_state_mean", state_mean, "float"))
+    out.append("")
+    out.append(_fmt_array("reward_model_state_std", state_std, "float"))
+    out.append("")
+    out.append(_fmt_array("reward_model_w1", w1, "float"))
+    out.append("")
+    out.append(_fmt_array("reward_model_b1", b1, "float"))
+    out.append("")
+    out.append(_fmt_array("reward_model_w2", w2, "float"))
+    out.append("")
+    out.append(_fmt_array("reward_model_b2", b2, "float"))
+    out.append("")
+    out.append(_fmt_array("reward_model_w3", w3, "float"))
+    out.append("")
+    out.append(_fmt_array("reward_model_b3", b3, "float"))
+    out.append("")
+    out.append(f"#endif /* {guard} */")
+
+    output_header.parent.mkdir(parents=True, exist_ok=True)
+    output_header.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Export reward model checkpoint to C header")
+    parser.add_argument("--model", required=True, help="Path to .pth model")
+    parser.add_argument("--output", required=True, help="Output header path")
+    args = parser.parse_args()
+
+    export_checkpoint(Path(args.model), Path(args.output))

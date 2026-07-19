@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <float.h>
+#include <inttypes.h>
 
 #include "nvs_flash.h"
 
@@ -33,7 +34,17 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#ifndef CONFIG_CSI_REWARD_MODEL_USE_V7C_CANARY
+#define CONFIG_CSI_REWARD_MODEL_USE_V7C_CANARY 0
+#endif
+#if CONFIG_CSI_REWARD_MODEL_USE_V7C_CANARY
+#include "generated_reward_model_linkv7c_canary.h"
+#else
 #include "generated_reward_model_v2.h"
+#endif
+#include "csi_gain_compensation.h"
+#include "csi_link_v7c_features.h"
+#include "csi_link_v7c_state.h"
 
 #ifndef CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED
 #define CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED 0
@@ -91,14 +102,27 @@
  * (its Wi-Fi retry train costs ~5 data packets per recommendation, a
  * 15-22% uniform loss floor at N=20). Enable only for live-policy runs.
  */
-#define CONFIG_MCS_RECOMMENDATION_ENABLED 0 // 1 = enable MCS recommendation feature, 0 = disable
+#define CONFIG_MCS_RECOMMENDATION_ENABLED 1 // 1 = enable MCS recommendation feature, 0 = disable
 #define CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS 20  // 1=every packet, N=every N data packets
 #define CONFIG_MCS_RECOMMENDATION_USE_MODEL 1  // 1=use ML model, 0=use RSSI-based heuristic
 #ifndef CONFIG_MCS_RECOMMENDATION_SEND_ON_CHANGE
 #define CONFIG_MCS_RECOMMENDATION_SEND_ON_CHANGE 1
 #endif
 #ifndef CONFIG_MCS_RECOMMENDATION_KEEPALIVE_EVERY_N_PACKETS
-#define CONFIG_MCS_RECOMMENDATION_KEEPALIVE_EVERY_N_PACKETS 1000
+#define CONFIG_MCS_RECOMMENDATION_KEEPALIVE_EVERY_N_PACKETS 100
+#endif
+/* Deployment safety envelope for the contract-bound reward model. Existing
+ * captures show that below 15 dB SNR, MCS2+ creates a sharp retransmission
+ * tail. The model still controls every other state; this cap is deliberately
+ * narrow and is mirrored by predict_reward_model.py qualification runs. */
+#ifndef CONFIG_CSI_REWARD_MODEL_SNR_GUARD_ENABLED
+#define CONFIG_CSI_REWARD_MODEL_SNR_GUARD_ENABLED 1
+#endif
+#ifndef CONFIG_CSI_REWARD_MODEL_LOW_SNR_THRESHOLD_DB
+#define CONFIG_CSI_REWARD_MODEL_LOW_SNR_THRESHOLD_DB 15
+#endif
+#ifndef CONFIG_CSI_REWARD_MODEL_LOW_SNR_MAX_MCS
+#define CONFIG_CSI_REWARD_MODEL_LOW_SNR_MAX_MCS 1
 #endif
 #ifndef CONFIG_CSI_DQN_RECOMMENDATION_EVERY_N_PACKETS
 #define CONFIG_CSI_DQN_RECOMMENDATION_EVERY_N_PACKETS 1
@@ -167,6 +191,9 @@
 #endif
 #if CONFIG_MCS_RECOMMENDATION_KEEPALIVE_EVERY_N_PACKETS < 0
 #error "CONFIG_MCS_RECOMMENDATION_KEEPALIVE_EVERY_N_PACKETS must be >= 0"
+#endif
+#if CONFIG_CSI_REWARD_MODEL_LOW_SNR_MAX_MCS < 0 || CONFIG_CSI_REWARD_MODEL_LOW_SNR_MAX_MCS > 7
+#error "CONFIG_CSI_REWARD_MODEL_LOW_SNR_MAX_MCS must be in [0, 7]"
 #endif
 #endif
 
@@ -246,9 +273,21 @@ _Static_assert(sizeof(dqn_reco_msg_t) == 12, "DQN feedback protocol size changed
 #define MCS_RECO_TASK_STACK 6144
 #define MCS_RECO_TASK_PRIO (tskIDLE_PRIORITY + 1)
 #define MCS_RECO_CSI_VALUE_COUNT 234
+#ifndef CONFIG_MCS_RECOMMENDATION_HEALTH_INTERVAL_MS
+#define CONFIG_MCS_RECOMMENDATION_HEALTH_INTERVAL_MS 1000
+#endif
+#ifndef CONFIG_MCS_RECOMMENDATION_INFERENCE_WARN_US
+#define CONFIG_MCS_RECOMMENDATION_INFERENCE_WARN_US 5000
+#endif
 
 static QueueHandle_t s_mcs_reco_queue = NULL;
 static volatile uint32_t s_mcs_reco_drop_count = 0;
+static volatile uint32_t s_mcs_reco_invalid_input_count = 0;
+static volatile uint32_t s_mcs_reco_queue_full_count = 0;
+static volatile uint32_t s_mcs_reco_state_failure_count = 0;
+static volatile uint32_t s_mcs_reco_coalesced_count = 0;
+static volatile uint32_t s_mcs_reco_nonfinite_count = 0;
+static volatile uint32_t s_mcs_reco_inference_overrun_count = 0;
 static uint32_t s_mcs_data_pkt_count = 0;
 
 #ifndef REWARD_MODEL_CONTEXT_IS_STATE_AGE_PACKETS
@@ -272,12 +311,15 @@ static uint32_t s_mcs_data_pkt_count = 0;
 #ifndef REWARD_MODEL_STATE_SCHEMA_LINK_V6
 #define REWARD_MODEL_STATE_SCHEMA_LINK_V6 0
 #endif
+#ifndef REWARD_MODEL_STATE_SCHEMA_LINK_V7C
+#define REWARD_MODEL_STATE_SCHEMA_LINK_V7C 0
+#endif
 
 #if REWARD_MODEL_INCLUDES_STATE_MCS
 #error "Receiver reward-model path does not support source/current-MCS conditioned reward models"
 #endif
-#if (REWARD_MODEL_STATE_SCHEMA_LINK_V5 || REWARD_MODEL_STATE_SCHEMA_LINK_V6) && !REWARD_MODEL_CONTEXT_IS_STATE_AGE_PACKETS
-#error "link_v5/link_v6 reward model requires state_age_packets context"
+#if (REWARD_MODEL_STATE_SCHEMA_LINK_V5 || REWARD_MODEL_STATE_SCHEMA_LINK_V6 || REWARD_MODEL_STATE_SCHEMA_LINK_V7C) && !REWARD_MODEL_CONTEXT_IS_STATE_AGE_PACKETS
+#error "receiver-only reward model requires state_age_packets context"
 #endif
 #if REWARD_MODEL_STATE_SCHEMA_LINK_V5 && REWARD_MODEL_STATE_DIM != 132
 #error "link_v5 reward model without state_mcs requires REWARD_MODEL_STATE_DIM=132"
@@ -285,8 +327,14 @@ static uint32_t s_mcs_data_pkt_count = 0;
 #if REWARD_MODEL_STATE_SCHEMA_LINK_V6 && REWARD_MODEL_STATE_DIM != 254
 #error "link_v6 reward model without state_mcs requires REWARD_MODEL_STATE_DIM=254"
 #endif
+#if REWARD_MODEL_STATE_SCHEMA_LINK_V7C && REWARD_MODEL_STATE_DIM != CSI_LINK_V7C_STATE_FEATURE_COUNT
+#error "link_v7c reward model without state_mcs requires REWARD_MODEL_STATE_DIM=181"
+#endif
+#if REWARD_MODEL_STATE_SCHEMA_LINK_V7C && REWARD_MODEL_CSI_FEATURE_COUNT != CSI_LINK_V7C_FEATURE_COUNT
+#error "link_v7c reward model CSI feature count does not match firmware contract"
+#endif
 #if (REWARD_MODEL_STATE_SCHEMA_LINK_V2 || REWARD_MODEL_STATE_SCHEMA_LINK_V3 || REWARD_MODEL_STATE_SCHEMA_LINK_V4)
-#error "Receiver reward-model path currently supports legacy_v1, link_v5, or link_v6 headers only"
+#error "Receiver reward-model path supports legacy_v1, link_v5, link_v6, or link_v7c headers only"
 #endif
 
 typedef struct {
@@ -303,6 +351,7 @@ typedef struct {
     int8_t csi_values[MCS_RECO_CSI_VALUE_COUNT];
 } mcs_reco_job_t;
 
+#if !REWARD_MODEL_STATE_SCHEMA_LINK_V7C
 static float quantile_from_sorted(const float *sorted, int n, float q)
 {
     if (n <= 0) {
@@ -334,12 +383,43 @@ static void sort_small_array(float *arr, int n)
         arr[j + 1] = key;
     }
 }
+#endif
 
-static void build_model_state(const mcs_reco_job_t *job,
+static bool build_model_state(const mcs_reco_job_t *job,
                               float state[REWARD_MODEL_STATE_DIM])
 {
+    int16_t compensated[MCS_RECO_CSI_VALUE_COUNT] = {0};
     memset(state, 0, sizeof(float) * REWARD_MODEL_STATE_DIM);
 
+    if (job->csi_value_count > MCS_RECO_CSI_VALUE_COUNT ||
+        csi_gain_compensate_frame_i8(
+            job->compensate_gain,
+            job->csi_values,
+            job->csi_value_count,
+            compensated) != CSI_GAIN_STATUS_OK) {
+        return false;
+    }
+
+#if REWARD_MODEL_STATE_SCHEMA_LINK_V7C
+    const csi_link_v7c_state_metadata_t metadata = {
+        .rssi = (float)job->rssi,
+        .snr = (float)((int)job->rssi - (int)job->noise_floor),
+        .fft_gain = (float)job->fft_gain,
+        .agc_gain = (float)job->agc_gain,
+        .channel = (float)job->channel,
+        .sig_len = (float)job->sig_len,
+        .state_age_packets = 1u,
+        .state_packet_gap = 1u,
+        .state_missing_packets = 0u,
+        .state_is_stale = 0u,
+    };
+    return csi_link_v7c_build_receiver_state(
+        compensated,
+        job->csi_value_count,
+        &metadata,
+        state,
+        REWARD_MODEL_STATE_DIM) == CSI_LINK_V7C_STATE_STATUS_OK;
+#else
     float amps[117] = {0};
 #if REWARD_MODEL_STATE_SCHEMA_LINK_V6
     float phases[117] = {0};
@@ -351,8 +431,8 @@ static void build_model_state(const mcs_reco_job_t *job,
     }
 
     for (int i = 0; i < amp_count; ++i) {
-        float i_val = (float)((int16_t)(job->compensate_gain * (float)job->csi_values[2 * i]));
-        float q_val = (float)((int16_t)(job->compensate_gain * (float)job->csi_values[2 * i + 1]));
+        float i_val = (float)compensated[2 * i];
+        float q_val = (float)compensated[2 * i + 1];
         float amp = sqrtf(i_val * i_val + q_val * q_val);
         amps[i] = amp;
         state[i] = amp;
@@ -496,6 +576,8 @@ static void build_model_state(const mcs_reco_job_t *job,
     state[127] = iq_p90;
 #endif
 #endif
+    return true;
+#endif /* REWARD_MODEL_STATE_SCHEMA_LINK_V7C */
 }
 
 static float reward_model_score_action(const float state[REWARD_MODEL_STATE_DIM], uint8_t action)
@@ -539,31 +621,53 @@ static float reward_model_score_action(const float state[REWARD_MODEL_STATE_DIM]
     return out;
 }
 
-static uint8_t recommend_mcs_with_model(const float state[REWARD_MODEL_STATE_DIM], uint8_t *confidence_out)
+static uint8_t recommend_mcs_with_model(const float state[REWARD_MODEL_STATE_DIM],
+                                        uint8_t *confidence_out,
+                                        bool *scores_finite_out)
 {
     uint8_t best = 0;
     float best_score = reward_model_score_action(state, 0);
     float second_score = best_score;
+    bool have_second = false;
+    bool scores_finite = isfinite(best_score);
 
     for (uint8_t action = 1; action < REWARD_MODEL_ACTION_DIM; ++action) {
         float score = reward_model_score_action(state, action);
+        if (!isfinite(score)) {
+            scores_finite = false;
+            continue;
+        }
 #if REWARD_MODEL_OBJECTIVE_MINIMIZE
         if (score < best_score) {
             second_score = best_score;
+            have_second = true;
             best_score = score;
             best = action;
-        } else if (score < second_score || best == action - 1) {
+        } else if (!have_second || score < second_score) {
             second_score = score;
+            have_second = true;
         }
 #else
         if (score > best_score) {
             second_score = best_score;
+            have_second = true;
             best_score = score;
             best = action;
-        } else if (score > second_score || best == action - 1) {
+        } else if (!have_second || score > second_score) {
             second_score = score;
+            have_second = true;
         }
 #endif
+    }
+
+    if (!scores_finite) {
+        if (confidence_out != NULL) {
+            *confidence_out = 0;
+        }
+        if (scores_finite_out != NULL) {
+            *scores_finite_out = false;
+        }
+        return 0;
     }
 
     float margin = fabsf(best_score - second_score);
@@ -577,6 +681,9 @@ static uint8_t recommend_mcs_with_model(const float state[REWARD_MODEL_STATE_DIM
 
     if (confidence_out != NULL) {
         *confidence_out = (uint8_t)conf;
+    }
+    if (scores_finite_out != NULL) {
+        *scores_finite_out = true;
     }
     return best;
 }
@@ -593,6 +700,19 @@ static uint8_t recommend_mcs_from_rssi(int8_t rssi)
     return 0;
 }
 
+static uint8_t reward_model_apply_snr_guard(uint8_t recommended_mcs, int8_t snr)
+{
+#if REWARD_MODEL_STATE_SCHEMA_LINK_V7C && CONFIG_CSI_REWARD_MODEL_SNR_GUARD_ENABLED
+    if (snr < CONFIG_CSI_REWARD_MODEL_LOW_SNR_THRESHOLD_DB &&
+        recommended_mcs > CONFIG_CSI_REWARD_MODEL_LOW_SNR_MAX_MCS) {
+        return CONFIG_CSI_REWARD_MODEL_LOW_SNR_MAX_MCS;
+    }
+#else
+    (void)snr;
+#endif
+    return recommended_mcs;
+}
+
 static void mcs_recommendation_task(void *arg)
 {
     (void)arg;
@@ -602,6 +722,8 @@ static void mcs_recommendation_task(void *arg)
     uint8_t have_last_sent = 0;
     uint8_t last_sent_mcs = 0;
     uint32_t last_sent_seq = 0;
+    uint32_t last_logged_drop_count = 0;
+    int64_t last_health_log_us = 0;
 
     for (;;) {
         if (xQueueReceive(s_mcs_reco_queue, &incoming, portMAX_DELAY) != pdTRUE) {
@@ -610,15 +732,85 @@ static void mcs_recommendation_task(void *arg)
         job = incoming;
         while (xQueueReceive(s_mcs_reco_queue, &incoming, 0) == pdTRUE) {
             job = incoming;
+            __atomic_add_fetch(&s_mcs_reco_coalesced_count, 1U, __ATOMIC_RELAXED);
         }
 
+        const int64_t inference_start_us = esp_timer_get_time();
         uint8_t recommended_mcs = recommend_mcs_from_rssi(job.rssi);
+        uint8_t raw_recommended_mcs = recommended_mcs;
         uint8_t confidence = 100;
+        bool model_scores_finite = true;
 #if CONFIG_MCS_RECOMMENDATION_USE_MODEL
-        build_model_state(&job, state);
-        recommended_mcs = recommend_mcs_with_model(state, &confidence);
+        if (!build_model_state(&job, state)) {
+            const int64_t inference_us = esp_timer_get_time() - inference_start_us;
+            const uint32_t state_failures = __atomic_add_fetch(
+                &s_mcs_reco_state_failure_count,
+                1U,
+                __ATOMIC_RELAXED
+            );
+            const uint32_t total_drops = __atomic_add_fetch(
+                &s_mcs_reco_drop_count,
+                1U,
+                __ATOMIC_RELAXED
+            );
+            ESP_LOGW(TAG, "Skipping recommendation: invalid CSI/model state");
+            printf("REWARD_INFERENCE,%lu,%u,%u,%u,%lld,%u,%lu,%lu,%lu,%lu,%lu,%lu,%lu,state_invalid\n",
+                   (unsigned long)job.seq,
+                   (unsigned int)raw_recommended_mcs,
+                   (unsigned int)recommended_mcs,
+                   (unsigned int)confidence,
+                   (long long)inference_us,
+                   (unsigned int)uxQueueMessagesWaiting(s_mcs_reco_queue),
+                   (unsigned long)total_drops,
+                   (unsigned long)__atomic_load_n(&s_mcs_reco_invalid_input_count, __ATOMIC_RELAXED),
+                   (unsigned long)__atomic_load_n(&s_mcs_reco_queue_full_count, __ATOMIC_RELAXED),
+                   (unsigned long)state_failures,
+                   (unsigned long)__atomic_load_n(&s_mcs_reco_coalesced_count, __ATOMIC_RELAXED),
+                   (unsigned long)__atomic_load_n(&s_mcs_reco_nonfinite_count, __ATOMIC_RELAXED),
+                   (unsigned long)__atomic_load_n(&s_mcs_reco_inference_overrun_count, __ATOMIC_RELAXED));
+            fflush(stdout);
+            last_logged_drop_count = total_drops;
+            last_health_log_us = esp_timer_get_time();
+            continue;
+        }
+        raw_recommended_mcs = recommend_mcs_with_model(
+            state,
+            &confidence,
+            &model_scores_finite
+        );
+        if (!model_scores_finite) {
+            __atomic_add_fetch(&s_mcs_reco_nonfinite_count, 1U, __ATOMIC_RELAXED);
+        }
+        recommended_mcs = reward_model_apply_snr_guard(raw_recommended_mcs, job.snr);
+        if (recommended_mcs != raw_recommended_mcs) {
+            printf("MODEL_GUARD,%lu,%d,%u,%u\n",
+                   (unsigned long)job.seq,
+                   (int)job.snr,
+                   (unsigned int)raw_recommended_mcs,
+                   (unsigned int)recommended_mcs);
+        }
+#endif
+#if CONFIG_MCS_RECOMMENDATION_USE_MODEL
+        if (!model_scores_finite) {
+            /* Fail closed and force a fresh MCS0 feedback frame even if the
+             * last successfully transmitted recommendation was also MCS0. */
+            recommended_mcs = 0;
+            confidence = 0;
+        }
 #endif
 
+        const int64_t inference_us = esp_timer_get_time() - inference_start_us;
+        bool inference_overrun = false;
+#if CONFIG_MCS_RECOMMENDATION_INFERENCE_WARN_US > 0
+        inference_overrun = inference_us > CONFIG_MCS_RECOMMENDATION_INFERENCE_WARN_US;
+        if (inference_overrun) {
+            __atomic_add_fetch(
+                &s_mcs_reco_inference_overrun_count,
+                1U,
+                __ATOMIC_RELAXED
+            );
+        }
+#endif
         bool should_send = true;
 #if CONFIG_MCS_RECOMMENDATION_SEND_ON_CHANGE
         should_send = (!have_last_sent || recommended_mcs != last_sent_mcs);
@@ -629,34 +821,98 @@ static void mcs_recommendation_task(void *arg)
         }
 #endif
 #endif
-        if (!should_send) {
-            continue;
+#if CONFIG_MCS_RECOMMENDATION_USE_MODEL
+        if (!model_scores_finite) {
+            should_send = true;
+        }
+#endif
+
+        const uint32_t total_drops = __atomic_load_n(
+            &s_mcs_reco_drop_count,
+            __ATOMIC_RELAXED
+        );
+        bool periodic_health = false;
+#if CONFIG_MCS_RECOMMENDATION_HEALTH_INTERVAL_MS > 0
+        const int64_t health_now_us = esp_timer_get_time();
+        periodic_health = last_health_log_us == 0 ||
+            (health_now_us - last_health_log_us) >=
+                ((int64_t)CONFIG_MCS_RECOMMENDATION_HEALTH_INTERVAL_MS * 1000LL);
+#endif
+        const bool health_changed = total_drops != last_logged_drop_count;
+        const char *health_status = !model_scores_finite
+            ? "model_nonfinite"
+            : should_send ? "send_pending" : "held";
+        esp_err_t send_result = ESP_OK;
+
+        if (should_send) {
+            mcs_reco_msg_t msg = {
+                .magic = MCS_RECO_MAGIC,
+                .version = MCS_RECO_VERSION,
+                .recommended_mcs = recommended_mcs,
+                .confidence = confidence,
+                .seq = job.seq,
+                .rssi = job.rssi,
+                .snr = job.snr,
+                .reserved = {0, 0},
+            };
+
+            send_result = esp_now_send(CONFIG_CSI_SEND_MAC, (const uint8_t *)&msg, sizeof(msg));
+            if (send_result != ESP_OK) {
+                health_status = !model_scores_finite
+                    ? "model_nonfinite_send_error"
+                    : "send_error";
+                ESP_LOGD(TAG, "MCS recommendation send failed: %s", esp_err_to_name(send_result));
+            } else {
+                health_status = !model_scores_finite
+                    ? "model_nonfinite_safe_sent"
+                    : "sent";
+                have_last_sent = 1;
+                last_sent_mcs = recommended_mcs;
+                last_sent_seq = job.seq;
+            }
         }
 
-        mcs_reco_msg_t msg = {
-            .magic = MCS_RECO_MAGIC,
-            .version = MCS_RECO_VERSION,
-            .recommended_mcs = recommended_mcs,
-            .confidence = confidence,
-            .seq = job.seq,
-            .rssi = job.rssi,
-            .snr = job.snr,
-            .reserved = {0, 0},
-        };
-
-        esp_err_t ret = esp_now_send(CONFIG_CSI_SEND_MAC, (const uint8_t *)&msg, sizeof(msg));
-        if (ret != ESP_OK) {
-            ESP_LOGD(TAG, "MCS recommendation send failed: %s", esp_err_to_name(ret));
-            continue;
+        if (periodic_health || inference_overrun || health_changed ||
+            !model_scores_finite || send_result != ESP_OK) {
+            printf("REWARD_INFERENCE,%lu,%u,%u,%u,%lld,%u,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%s\n",
+                   (unsigned long)job.seq,
+                   (unsigned int)raw_recommended_mcs,
+                   (unsigned int)recommended_mcs,
+                   (unsigned int)confidence,
+                   (long long)inference_us,
+                   (unsigned int)uxQueueMessagesWaiting(s_mcs_reco_queue),
+                   (unsigned long)total_drops,
+                   (unsigned long)__atomic_load_n(&s_mcs_reco_invalid_input_count, __ATOMIC_RELAXED),
+                   (unsigned long)__atomic_load_n(&s_mcs_reco_queue_full_count, __ATOMIC_RELAXED),
+                   (unsigned long)__atomic_load_n(&s_mcs_reco_state_failure_count, __ATOMIC_RELAXED),
+                   (unsigned long)__atomic_load_n(&s_mcs_reco_coalesced_count, __ATOMIC_RELAXED),
+                   (unsigned long)__atomic_load_n(&s_mcs_reco_nonfinite_count, __ATOMIC_RELAXED),
+                   (unsigned long)__atomic_load_n(&s_mcs_reco_inference_overrun_count, __ATOMIC_RELAXED),
+                   health_status);
+            fflush(stdout);
+            last_logged_drop_count = total_drops;
+            last_health_log_us = esp_timer_get_time();
         }
-        have_last_sent = 1;
-        last_sent_mcs = recommended_mcs;
-        last_sent_seq = job.seq;
     }
 }
 
 static void mcs_recommendation_init(void)
 {
+#if REWARD_MODEL_STATE_SCHEMA_LINK_V7C
+    if (strcmp(REWARD_MODEL_CSI_FEATURE_CONTRACT_ID, CSI_LINK_V7C_CONTRACT_ID) != 0 ||
+        strcmp(REWARD_MODEL_CSI_FEATURE_CONTRACT_SHA256, CSI_LINK_V7C_CONTRACT_SHA256) != 0 ||
+        strcmp(REWARD_MODEL_STATE_CONTRACT_ID, CSI_LINK_V7C_STATE_CONTRACT_ID) != 0 ||
+        strcmp(REWARD_MODEL_STATE_CONTRACT_SHA256, CSI_LINK_V7C_STATE_CONTRACT_SHA256) != 0) {
+        ESP_LOGE(TAG, "link_v7c reward-model feature contract mismatch");
+        abort();
+    }
+    printf("CSI_MODEL,reward_model,%s,%s,%u,%u\n",
+           CSI_LINK_V7C_CONTRACT_ID,
+           CSI_LINK_V7C_STATE_CONTRACT_ID,
+           (unsigned int)CSI_LINK_V7C_FEATURE_COUNT,
+           (unsigned int)REWARD_MODEL_STATE_DIM);
+#endif
+    printf("REWARD_INFERENCE_HEADER,seq,raw_mcs,chosen_mcs,confidence,inference_us,queue_depth,total_drops,invalid_inputs,queue_full,state_failures,coalesced,model_nonfinite,inference_overruns,status\n");
     s_mcs_reco_queue = xQueueCreate(MCS_RECO_QUEUE_SIZE, sizeof(mcs_reco_job_t));
     if (s_mcs_reco_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create recommendation queue");
@@ -682,13 +938,26 @@ static void mcs_recommendation_init(void)
 #error "Live recommendation pipeline does not support packed force-LLTF CSI"
 #endif
 #if CONFIG_CSI_MCS_POLICY_MODEL == 1
+#ifndef BANDIT_MODEL_STATE_SCHEMA_LINK_V7C
+#define BANDIT_MODEL_STATE_SCHEMA_LINK_V7C 0
+#endif
 #if BANDIT_MODEL_ACTION_DIM != 8
 #error "Live recommendation pipeline requires an 8-action bandit model"
 #endif
 #if !BANDIT_MODEL_CONTEXT_IS_STATE_AGE_PACKETS
 #error "Live recommendation pipeline requires a causal bandit checkpoint"
 #endif
-#if defined(BANDIT_MODEL_STATE_SCHEMA_LINK_V5)
+#if BANDIT_MODEL_STATE_SCHEMA_LINK_V7C
+#if BANDIT_MODEL_INCLUDES_STATE_MCS
+#error "link_v7c bandit deployment is receiver-only; retrain with --ignore-state-mcs"
+#endif
+#if BANDIT_MODEL_STATE_DIM != CSI_LINK_V7C_STATE_FEATURE_COUNT
+#error "link_v7c receiver-only bandit requires BANDIT_MODEL_STATE_DIM=181"
+#endif
+#if BANDIT_MODEL_CSI_FEATURE_COUNT != CSI_LINK_V7C_FEATURE_COUNT
+#error "link_v7c bandit CSI feature count does not match firmware contract"
+#endif
+#elif defined(BANDIT_MODEL_STATE_SCHEMA_LINK_V5)
 #if BANDIT_MODEL_INCLUDES_STATE_MCS
 #error "link_v5 bandit deployment is receiver-only; retrain with --ignore-state-mcs"
 #endif
@@ -721,6 +990,9 @@ static void mcs_recommendation_init(void)
 #ifndef DQN_MODEL_STATE_SCHEMA_LINK_V6
 #define DQN_MODEL_STATE_SCHEMA_LINK_V6 0
 #endif
+#ifndef DQN_MODEL_STATE_SCHEMA_LINK_V7C
+#define DQN_MODEL_STATE_SCHEMA_LINK_V7C 0
+#endif
 
 #if (DQN_MODEL_STATE_SCHEMA_LINK_V3 || DQN_MODEL_STATE_SCHEMA_LINK_V4 || DQN_MODEL_STATE_SCHEMA_LINK_V5 || DQN_MODEL_STATE_SCHEMA_LINK_V6) && !DQN_MODEL_STATE_SCHEMA_LINK_V2
 /*
@@ -735,6 +1007,15 @@ static void mcs_recommendation_init(void)
 #endif
 #if DQN_MODEL_STATE_SCHEMA_LINK_V6 && !DQN_MODEL_INCLUDES_STATE_MCS && DQN_MODEL_STATE_DIM != 254
 #error "link_v6 DQN without state_mcs requires DQN_MODEL_STATE_DIM=254"
+#endif
+#if DQN_MODEL_STATE_SCHEMA_LINK_V7C && DQN_MODEL_INCLUDES_STATE_MCS
+#error "link_v7c DQN deployment is receiver-only; retrain with --ignore-state-mcs"
+#endif
+#if DQN_MODEL_STATE_SCHEMA_LINK_V7C && DQN_MODEL_STATE_DIM != CSI_LINK_V7C_STATE_FEATURE_COUNT
+#error "link_v7c receiver-only DQN requires DQN_MODEL_STATE_DIM=181"
+#endif
+#if DQN_MODEL_STATE_SCHEMA_LINK_V7C && DQN_MODEL_CSI_FEATURE_COUNT != CSI_LINK_V7C_FEATURE_COUNT
+#error "link_v7c DQN CSI feature count does not match firmware contract"
 #endif
 #if DQN_MODEL_STATE_SCHEMA_LINK_V5 && DQN_MODEL_INCLUDES_STATE_MCS && DQN_MODEL_STATE_DIM != 140
 #error "link_v5 DQN with state_mcs requires DQN_MODEL_STATE_DIM=140"
@@ -751,9 +1032,19 @@ static void mcs_recommendation_init(void)
 #define POLICY_MODEL_STATE_DIM DQN_MODEL_STATE_DIM
 #endif
 
+#if CONFIG_CSI_MCS_POLICY_MODEL == 1
+#define POLICY_MODEL_STATE_SCHEMA_LINK_V7C BANDIT_MODEL_STATE_SCHEMA_LINK_V7C
+#else
+#define POLICY_MODEL_STATE_SCHEMA_LINK_V7C DQN_MODEL_STATE_SCHEMA_LINK_V7C
+#endif
+
 #define DQN_CSI_VALUE_COUNT 234
 #define DQN_CSI_QUEUE_SIZE 8
+#if POLICY_MODEL_STATE_SCHEMA_LINK_V7C
+#define DQN_INFERENCE_TASK_STACK 10240
+#else
 #define DQN_INFERENCE_TASK_STACK 6144
+#endif
 #define DQN_INFERENCE_TASK_PRIO (tskIDLE_PRIORITY + 1)
 
 typedef struct {
@@ -778,6 +1069,7 @@ typedef struct {
 
 static QueueHandle_t s_dqn_csi_queue = NULL;
 static volatile uint32_t s_dqn_csi_drop_count = 0;
+static volatile uint32_t s_dqn_invalid_csi_count = 0;
 static uint32_t s_dqn_data_pkt_count = 0;
 
 #if CONFIG_CSI_DQN_UP_MOVE_VETO_LOSS_PCT > 0
@@ -849,6 +1141,7 @@ static uint8_t dqn_rx_mcs_index_from_ctrl(const wifi_pkt_rx_ctrl_t *rx_ctrl)
 #endif
 }
 
+#if !POLICY_MODEL_STATE_SCHEMA_LINK_V7C
 static void dqn_sort_small_array(float *values, int count)
 {
     for (int i = 1; i < count; ++i) {
@@ -879,17 +1172,35 @@ static float dqn_quantile_from_sorted(const float *values, int count, float quan
     float fraction = position - (float)lower;
     return values[lower] * (1.0f - fraction) + values[upper] * fraction;
 }
+#endif
 
 #if CONFIG_CSI_MCS_POLICY_MODEL == 1
-/* Build the bandit link_v3c state: 57 gain-compensated subcarrier amplitudes,
- * 15 link features, and a one-hot of the MCS that produced the CSI. Feature
- * order must match state_feature_names('link_v3c', include_state_mcs=True) in
- * tools/rl/DQN/dqn_model/train_dqn.py. Normalization happens inside the
- * generated bandit inference. */
-static void build_policy_state(const dqn_csi_job_t *job,
+/* Build the exact schema declared by the generated bandit header. */
+static bool build_policy_state(const dqn_csi_job_t *job,
                                float state[BANDIT_MODEL_STATE_DIM])
 {
     memset(state, 0, sizeof(float) * BANDIT_MODEL_STATE_DIM);
+
+#if BANDIT_MODEL_STATE_SCHEMA_LINK_V7C
+    const csi_link_v7c_state_metadata_t metadata = {
+        .rssi = (float)job->rssi,
+        .snr = (float)((int)job->rssi - (int)job->noise_floor),
+        .fft_gain = (float)job->fft_gain,
+        .agc_gain = (float)job->agc_gain,
+        .channel = (float)job->channel,
+        .sig_len = (float)job->sig_len,
+        .state_age_packets = job->state_age_packets,
+        .state_packet_gap = job->state_packet_gap,
+        .state_missing_packets = job->state_missing_packets,
+        .state_is_stale = job->state_is_stale,
+    };
+    return csi_link_v7c_build_receiver_state(
+        job->csi_values,
+        job->csi_value_count,
+        &metadata,
+        state,
+        BANDIT_MODEL_STATE_DIM) == CSI_LINK_V7C_STATE_STATUS_OK;
+#else
 
     int amplitude_count = (int)job->csi_value_count / 2;
     if (amplitude_count > BANDIT_MODEL_AMPLITUDE_COUNT) {
@@ -955,6 +1266,8 @@ static void build_policy_state(const dqn_csi_job_t *job,
     uint8_t state_mcs = job->state_mcs_index <= 7U ? job->state_mcs_index : 0U;
     state[base + 15 + state_mcs] = 1.0f;
 #endif
+    return true;
+#endif /* BANDIT_MODEL_STATE_SCHEMA_LINK_V7C */
 }
 
 static uint8_t policy_predict_mcs(const float state[BANDIT_MODEL_STATE_DIM],
@@ -964,15 +1277,38 @@ static uint8_t policy_predict_mcs(const float state[BANDIT_MODEL_STATE_DIM],
     return bandit_model_predict_best_mcs(state, best_out, second_out);
 }
 #else /* CONFIG_CSI_MCS_POLICY_MODEL == 0: Q-network */
+#if !DQN_MODEL_STATE_SCHEMA_LINK_V7C
 static float dqn_log1p_count_u16(uint16_t value)
 {
     return log1pf((float)value);
 }
+#endif
 
-static void build_dqn_state(const dqn_csi_job_t *job,
+static bool build_dqn_state(const dqn_csi_job_t *job,
                             float state[DQN_MODEL_STATE_DIM])
 {
     memset(state, 0, sizeof(float) * DQN_MODEL_STATE_DIM);
+
+#if DQN_MODEL_STATE_SCHEMA_LINK_V7C
+    const csi_link_v7c_state_metadata_t metadata = {
+        .rssi = (float)job->rssi,
+        .snr = (float)((int)job->rssi - (int)job->noise_floor),
+        .fft_gain = (float)job->fft_gain,
+        .agc_gain = (float)job->agc_gain,
+        .channel = (float)job->channel,
+        .sig_len = (float)job->sig_len,
+        .state_age_packets = job->state_age_packets,
+        .state_packet_gap = job->state_packet_gap,
+        .state_missing_packets = job->state_missing_packets,
+        .state_is_stale = job->state_is_stale,
+    };
+    return csi_link_v7c_build_receiver_state(
+        job->csi_values,
+        job->csi_value_count,
+        &metadata,
+        state,
+        DQN_MODEL_STATE_DIM) == CSI_LINK_V7C_STATE_STATUS_OK;
+#else
 
     int amplitude_count = (int)job->csi_value_count / 2;
     if (amplitude_count > 117) {
@@ -980,8 +1316,10 @@ static void build_dqn_state(const dqn_csi_job_t *job,
     }
 
     float amplitudes[117] = {0};
+#if DQN_MODEL_STATE_SCHEMA_LINK_V6
     float phases[117] = {0};
     float phase_residuals[117] = {0};
+#endif
     float sum = 0.0f;
     float sum_sq = 0.0f;
     for (int i = 0; i < amplitude_count; ++i) {
@@ -1011,11 +1349,13 @@ static void build_dqn_state(const dqn_csi_job_t *job,
     float iq_p10 = 0.0f;
     float iq_p50 = 0.0f;
     float iq_p90 = 0.0f;
+#if DQN_MODEL_STATE_SCHEMA_LINK_V6
     float phase_mean = 0.0f;
     float phase_std = 0.0f;
     float phase_p10 = 0.0f;
     float phase_p50 = 0.0f;
     float phase_p90 = 0.0f;
+#endif
     if (amplitude_count > 0) {
         iq_mean = sum / (float)amplitude_count;
         float variance = (sum_sq / (float)amplitude_count) - (iq_mean * iq_mean);
@@ -1211,6 +1551,8 @@ static void build_dqn_state(const dqn_csi_job_t *job,
     }
 #endif
 #endif
+    return true;
+#endif /* DQN_MODEL_STATE_SCHEMA_LINK_V7C */
 }
 
 static uint8_t dqn_predict_mcs(const float state[DQN_MODEL_STATE_DIM],
@@ -1334,7 +1676,12 @@ static void dqn_inference_task(void *arg)
         }
 
         int64_t start_us = esp_timer_get_time();
-        build_policy_state(&job, state);
+        if (!build_policy_state(&job, state)) {
+            s_dqn_invalid_csi_count++;
+            ESP_LOGW(TAG, "Skipping inference: CSI state contract validation failed");
+            have_state = false;
+            continue;
+        }
         float best_q = 0.0f;
         float second_q = 0.0f;
         uint8_t recommended_mcs = policy_predict_mcs(state, &best_q, &second_q);
@@ -1364,10 +1711,10 @@ static void dqn_inference_task(void *arg)
         /* Stale ticks re-run inference every control interval, but resending
          * an unchanged recommendation into a silent link only queues stale
          * frames in the Wi-Fi driver (they can arrive seconds late once the
-         * channel recovers). Send on fresh CSI, on a changed recommendation,
-         * or when the keepalive interval elapses. */
-        bool send_reco = got_new_csi
-                || (int)recommended_mcs != last_sent_mcs
+         * channel recovers). Inference may run on every fresh frame, but
+         * feedback is sent only when the action changes or the bounded
+         * keepalive interval elapses. */
+        bool send_reco = (int)recommended_mcs != last_sent_mcs
                 || (start_us - last_send_us)
                        >= (int64_t)CONFIG_CSI_DQN_STALE_RECO_MIN_INTERVAL_MS * 1000LL;
         if (send_reco) {
@@ -1424,6 +1771,33 @@ static void dqn_inference_task(void *arg)
 
 static void dqn_recommendation_init(void)
 {
+#if CONFIG_CSI_MCS_POLICY_MODEL == 1 && BANDIT_MODEL_STATE_SCHEMA_LINK_V7C
+    if (strcmp(BANDIT_MODEL_CSI_FEATURE_CONTRACT_ID, CSI_LINK_V7C_CONTRACT_ID) != 0 ||
+        strcmp(BANDIT_MODEL_CSI_FEATURE_CONTRACT_SHA256, CSI_LINK_V7C_CONTRACT_SHA256) != 0 ||
+        strcmp(BANDIT_MODEL_STATE_CONTRACT_ID, CSI_LINK_V7C_STATE_CONTRACT_ID) != 0 ||
+        strcmp(BANDIT_MODEL_STATE_CONTRACT_SHA256, CSI_LINK_V7C_STATE_CONTRACT_SHA256) != 0) {
+        ESP_LOGE(TAG, "link_v7c bandit feature/state contract mismatch");
+        abort();
+    }
+    printf("CSI_MODEL,bandit,%s,%s,%u,%u\n",
+           CSI_LINK_V7C_CONTRACT_ID,
+           CSI_LINK_V7C_STATE_CONTRACT_ID,
+           (unsigned int)CSI_LINK_V7C_FEATURE_COUNT,
+           (unsigned int)BANDIT_MODEL_STATE_DIM);
+#elif CONFIG_CSI_MCS_POLICY_MODEL == 0 && DQN_MODEL_STATE_SCHEMA_LINK_V7C
+    if (strcmp(DQN_MODEL_CSI_FEATURE_CONTRACT_ID, CSI_LINK_V7C_CONTRACT_ID) != 0 ||
+        strcmp(DQN_MODEL_CSI_FEATURE_CONTRACT_SHA256, CSI_LINK_V7C_CONTRACT_SHA256) != 0 ||
+        strcmp(DQN_MODEL_STATE_CONTRACT_ID, CSI_LINK_V7C_STATE_CONTRACT_ID) != 0 ||
+        strcmp(DQN_MODEL_STATE_CONTRACT_SHA256, CSI_LINK_V7C_STATE_CONTRACT_SHA256) != 0) {
+        ESP_LOGE(TAG, "link_v7c DQN feature/state contract mismatch");
+        abort();
+    }
+    printf("CSI_MODEL,dqn,%s,%s,%u,%u\n",
+           CSI_LINK_V7C_CONTRACT_ID,
+           CSI_LINK_V7C_STATE_CONTRACT_ID,
+           (unsigned int)CSI_LINK_V7C_FEATURE_COUNT,
+           (unsigned int)DQN_MODEL_STATE_DIM);
+#endif
     s_dqn_csi_queue = xQueueCreate(DQN_CSI_QUEUE_SIZE, sizeof(dqn_csi_job_t));
     if (s_dqn_csi_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create DQN CSI queue");
@@ -1639,9 +2013,12 @@ static uint32_t csi_out_rate_value(const wifi_pkt_rx_ctrl_t *rx_ctrl)
  *
  *   CSI_B64,<ver>,<seq>,<mac>,<rssi>,<rate>,<noise_floor>,<fft_gain>,
  *   <agc_gain>,<channel>,<timestamp>,<sig_len>,<rx_state>,<len>,
- *   <first_word_invalid>,<compensate_gain>,<encoding>,<base64 payload>,<crc16>
+ *   <first_word_invalid>,<gain_f32_hex>,<encoding>,<base64 payload>,<crc16>
  *
- * The payload is the raw int8 CSI buffer; the host applies compensate_gain.
+ * Version 2 transmits the exact IEEE-754 binary32 gain bits as eight hex
+ * digits. The payload is the raw int8 CSI buffer; the host applies that gain
+ * with binary32 multiplication and truncation toward zero. Version 1 decimal
+ * captures remain readable by the host but cannot provide exact parity.
  * One fwrite per line keeps other console output from splicing into frames.
  */
 static void csi_out_task(void *arg)
@@ -1652,7 +2029,7 @@ static void csi_out_task(void *arg)
     uint32_t reported_drops = 0;
 
     printf("CSI_B64_HEADER,version,seq,mac,rssi,rate,noise_floor,fft_gain,agc_gain,"
-           "channel,local_timestamp,sig_len,rx_state,len,first_word,gain,encoding,data_b64,crc16\n");
+           "channel,local_timestamp,sig_len,rx_state,len,first_word,gain_f32_hex,encoding,data_b64,crc16\n");
     fflush(stdout);
 
     for (;;) {
@@ -1660,15 +2037,16 @@ static void csi_out_task(void *arg)
             continue;
         }
 
+        uint32_t gain_bits = csi_gain_f32_bits(job.compensate_gain);
         int off = snprintf(line, sizeof(line),
-                           "CSI_B64,1,%lu," MACSTR ",%d,%lu,%d,%d,%u,%u,%lu,%u,%u,%u,%u,%.6f,i8,",
+                           "CSI_B64,2,%lu," MACSTR ",%d,%lu,%d,%d,%u,%u,%lu,%u,%u,%u,%u,%08" PRIX32 ",i8,",
                            (unsigned long)job.seq, MAC2STR(job.mac),
                            (int)job.rssi, (unsigned long)job.rate,
                            (int)job.noise_floor, (int)job.fft_gain,
                            (unsigned int)job.agc_gain, (unsigned int)job.channel,
                            (unsigned long)job.timestamp, (unsigned int)job.sig_len,
                            (unsigned int)job.rx_state, (unsigned int)job.len,
-                           (unsigned int)job.first_word_invalid, job.compensate_gain);
+                           (unsigned int)job.first_word_invalid, gain_bits);
         if (off < 0 || (size_t)off >= sizeof(line)) {
             continue;
         }
@@ -1795,6 +2173,15 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 
 #if CONFIG_MCS_RECOMMENDATION_ENABLED
     if ((s_mcs_data_pkt_count % CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS) == 0) {
+        bool reward_input_valid = true;
+#if REWARD_MODEL_STATE_SCHEMA_LINK_V7C && CONFIG_MCS_RECOMMENDATION_USE_MODEL
+        reward_input_valid = info->len == CSI_LINK_V7C_INPUT_SCALAR_COUNT &&
+                             !info->first_word_invalid;
+#endif
+        if (!reward_input_valid) {
+            __atomic_add_fetch(&s_mcs_reco_invalid_input_count, 1U, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&s_mcs_reco_drop_count, 1U, __ATOMIC_RELAXED);
+        } else {
         mcs_reco_job_t job = {
             .seq = rx_id,
             .rssi = rx_ctrl->rssi,
@@ -1815,7 +2202,9 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         memcpy(job.csi_values, info->buf, value_count);
 #endif
         if (s_mcs_reco_queue == NULL || xQueueSend(s_mcs_reco_queue, &job, 0) != pdTRUE) {
-            s_mcs_reco_drop_count++;
+            __atomic_add_fetch(&s_mcs_reco_queue_full_count, 1U, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&s_mcs_reco_drop_count, 1U, __ATOMIC_RELAXED);
+        }
         }
     }
     s_mcs_data_pkt_count++;
@@ -1827,6 +2216,21 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 #endif
     if (s_count >= CONFIG_CSI_DQN_WARMUP_PACKETS
             && (s_dqn_data_pkt_count % CONFIG_CSI_DQN_RECOMMENDATION_EVERY_N_PACKETS) == 0) {
+        bool policy_input_valid = true;
+#if POLICY_MODEL_STATE_SCHEMA_LINK_V7C
+        policy_input_valid = info->len == CSI_LINK_V7C_INPUT_SCALAR_COUNT &&
+                             !info->first_word_invalid;
+#endif
+        if (!policy_input_valid) {
+            uint32_t invalid_count = ++s_dqn_invalid_csi_count;
+            if (invalid_count == 1U || (invalid_count % 64U) == 0U) {
+                ESP_LOGW(TAG,
+                         "Rejected CSI for link_v7c: len=%u first_word=%u total=%lu",
+                         (unsigned int)info->len,
+                         info->first_word_invalid ? 1U : 0U,
+                         (unsigned long)invalid_count);
+            }
+        } else {
         dqn_csi_job_t job = {
             .seq = rx_id,
             .rssi = rx_ctrl->rssi,
@@ -1849,11 +2253,14 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
             value_count = DQN_CSI_VALUE_COUNT;
         }
         job.csi_value_count = (uint16_t)value_count;
-        for (size_t i = 0; i < value_count; ++i) {
-            job.csi_values[i] = (int16_t)(compensate_gain * info->buf[i]);
-        }
-        if (s_dqn_csi_queue == NULL || xQueueSend(s_dqn_csi_queue, &job, 0) != pdTRUE) {
+        csi_gain_status_t gain_status = csi_gain_compensate_frame_i8(
+            compensate_gain, info->buf, value_count, job.csi_values);
+        if (gain_status != CSI_GAIN_STATUS_OK) {
+            ESP_LOGW(TAG, "CSI gain compensation failed: %d", (int)gain_status);
             s_dqn_csi_drop_count++;
+        } else if (s_dqn_csi_queue == NULL || xQueueSend(s_dqn_csi_queue, &job, 0) != pdTRUE) {
+            s_dqn_csi_drop_count++;
+        }
         }
     }
     s_dqn_data_pkt_count++;

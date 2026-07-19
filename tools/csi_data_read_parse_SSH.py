@@ -15,6 +15,7 @@ import threading
 import argparse
 import os
 import base64
+import struct
 from collections import deque
 from io import StringIO
 from pathlib import Path
@@ -88,6 +89,10 @@ OUTPUT_COLUMNS = [
     'rx_state',
     'data_len',
     'first_word',
+    'b64_version',
+    'compensate_gain',
+    'compensate_gain_f32_hex',
+    'gain_compensation_exact',
     'iq_pairs',
     'mean_amp',
     'min_amp',
@@ -567,6 +572,11 @@ def parse_csi_line(line):
         'rx_state': safe_int(row.get('rx_state')),
         'data_len': data_len,
         'first_word': safe_int(row.get('first_word')),
+        # Legacy CSI_DATA values were compensated on-device before printing.
+        'b64_version': None,
+        'compensate_gain': None,
+        'compensate_gain_f32_hex': None,
+        'gain_compensation_exact': True,
         'raw_data': raw_data,
         'line': line,
     }
@@ -604,11 +614,12 @@ def parse_csi_b64_line(line):
 
     CSI_B64,<ver>,<seq>,<mac>,<rssi>,<rate>,<noise_floor>,<fft_gain>,<agc_gain>,
     <channel>,<timestamp>,<sig_len>,<rx_state>,<len>,<first_word_invalid>,
-    <compensate_gain>,<encoding>,<base64 payload>,<crc16 hex>
+    <gain>,<encoding>,<base64 payload>,<crc16 hex>
 
-    Returns: (frame_dict, error_string). The raw int8 payload is scaled by
-    compensate_gain with truncation toward zero, mirroring the firmware's
-    (int16_t)(compensate_gain * value) cast in the legacy CSI_DATA path.
+    Version 1 stores a decimal gain and is retained for historical captures.
+    Version 2 stores the exact IEEE-754 binary32 gain bits as eight hex digits.
+    The raw int8 payload is scaled with the matching version semantics and
+    truncation toward zero.
     """
     index = line.find('CSI_B64,')
     if index == -1:
@@ -635,15 +646,26 @@ def parse_csi_b64_line(line):
      channel, timestamp, sig_len, rx_state, data_len_text, first_word,
      gain_text, encoding, payload) = fields[:-1]
 
-    if version != '1':
+    if version not in {'1', '2'}:
         return None, f'b64_unknown_version: {version}'
     if encoding != 'i8':
         return None, f'b64_unknown_encoding: {encoding}'
 
     data_len = safe_int(data_len_text)
-    gain = safe_float(gain_text)
+    gain_f32_hex = None
+    if version == '1':
+        gain = safe_float(gain_text)
+        gain_exact = False
+    else:
+        if re.fullmatch(r'[0-9A-Fa-f]{8}', gain_text) is None:
+            return None, 'b64_invalid_gain_f32_hex'
+        gain_f32_hex = gain_text.upper()
+        gain = struct.unpack('>f', bytes.fromhex(gain_f32_hex))[0]
+        gain_exact = True
     if data_len is None or gain is None:
         return None, 'b64_invalid_len_or_gain'
+    if not math.isfinite(gain) or gain <= 0.0:
+        return None, 'b64_invalid_gain_value'
 
     try:
         raw_bytes = base64.b64decode(payload, validate=True)
@@ -655,10 +677,22 @@ def parse_csi_b64_line(line):
         return None, f'b64_odd_value_count: {data_len}'
 
     # int8 reinterpretation, then firmware-equivalent gain compensation.
-    raw_data = [
-        int(gain * (byte - 256 if byte > 127 else byte))
-        for byte in raw_bytes
-    ]
+    raw_data = []
+    for byte in raw_bytes:
+        signed_value = byte - 256 if byte > 127 else byte
+        scaled = gain * signed_value
+        if version == '2':
+            # Round the one multiplication to binary32 before the C-style cast.
+            try:
+                scaled = struct.unpack('>f', struct.pack('>f', scaled))[0]
+            except OverflowError:
+                return None, 'b64_compensated_value_overflow'
+        if not math.isfinite(scaled):
+            return None, 'b64_compensated_value_overflow'
+        compensated_value = int(scaled)  # truncation toward zero, as in C
+        if compensated_value < -32768 or compensated_value > 32767:
+            return None, 'b64_compensated_value_overflow'
+        raw_data.append(compensated_value)
 
     frame = {
         'format': 'b64',
@@ -675,6 +709,10 @@ def parse_csi_b64_line(line):
         'rx_state': safe_int(rx_state),
         'data_len': data_len,
         'first_word': safe_int(first_word),
+        'b64_version': int(version),
+        'compensate_gain': gain,
+        'compensate_gain_f32_hex': gain_f32_hex,
+        'gain_compensation_exact': gain_exact,
         'raw_data': raw_data,
         'line': line,
     }
@@ -744,6 +782,14 @@ def make_output_row(frame, stats):
         'rx_state': frame['rx_state'] if frame['rx_state'] is not None else '',
         'data_len': frame['data_len'],
         'first_word': frame['first_word'] if frame['first_word'] is not None else '',
+        'b64_version': frame.get('b64_version') if frame.get('b64_version') is not None else '',
+        'compensate_gain': frame.get('compensate_gain') if frame.get('compensate_gain') is not None else '',
+        'compensate_gain_f32_hex': frame.get('compensate_gain_f32_hex') or '',
+        'gain_compensation_exact': (
+            1 if frame.get('gain_compensation_exact') is True
+            else 0 if frame.get('gain_compensation_exact') is False
+            else ''
+        ),
         'iq_pairs': stats['iq_pairs'],
         'mean_amp': stats['mean_amp'],
         'min_amp': stats['min_amp'],

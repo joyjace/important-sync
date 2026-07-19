@@ -112,6 +112,24 @@
 #ifndef CONFIG_CSI_DQN_STALE_MAX_AGE_PACKETS
 #define CONFIG_CSI_DQN_STALE_MAX_AGE_PACKETS 64
 #endif
+/* While no fresh CSI arrives, only resend a recommendation when it changed or
+ * this many ms elapsed. The 5 ms control tick otherwise floods esp_now_send
+ * into an already-blocked medium and the driver queue delivers stale
+ * recommendations seconds late once the channel recovers. */
+#ifndef CONFIG_CSI_DQN_STALE_RECO_MIN_INTERVAL_MS
+#define CONFIG_CSI_DQN_STALE_RECO_MIN_INTERVAL_MS 100
+#endif
+/* Veto upward MCS recommendations while observed loss (from seq gaps across
+ * the last CONFIG_CSI_DQN_LOSS_WINDOW_FRAMES received frames) is at or above
+ * this percentage. A single delivered frame mid-fade looks fresh and strong to
+ * the snapshot model; this stops it from recommending above the sender's
+ * current rate until the link is actually delivering again. 0 disables. */
+#ifndef CONFIG_CSI_DQN_UP_MOVE_VETO_LOSS_PCT
+#define CONFIG_CSI_DQN_UP_MOVE_VETO_LOSS_PCT 20
+#endif
+#ifndef CONFIG_CSI_DQN_LOSS_WINDOW_FRAMES
+#define CONFIG_CSI_DQN_LOSS_WINDOW_FRAMES 32
+#endif
 #ifndef CONFIG_CSI_DQN_LOG_ENABLED
 #define CONFIG_CSI_DQN_LOG_ENABLED 1
 #endif
@@ -161,6 +179,15 @@
 #endif
 #if CONFIG_CSI_DQN_STALE_MAX_AGE_PACKETS <= 0
 #error "CONFIG_CSI_DQN_STALE_MAX_AGE_PACKETS must be > 0"
+#endif
+#if CONFIG_CSI_DQN_STALE_RECO_MIN_INTERVAL_MS < 0
+#error "CONFIG_CSI_DQN_STALE_RECO_MIN_INTERVAL_MS must be >= 0"
+#endif
+#if CONFIG_CSI_DQN_UP_MOVE_VETO_LOSS_PCT < 0 || CONFIG_CSI_DQN_UP_MOVE_VETO_LOSS_PCT > 100
+#error "CONFIG_CSI_DQN_UP_MOVE_VETO_LOSS_PCT must be in [0, 100]"
+#endif
+#if CONFIG_CSI_DQN_LOSS_WINDOW_FRAMES < 2 || CONFIG_CSI_DQN_LOSS_WINDOW_FRAMES > 256
+#error "CONFIG_CSI_DQN_LOSS_WINDOW_FRAMES must be in [2, 256]"
 #endif
 #if CONFIG_MCS_RECOMMENDATION_ENABLED
 #error "Legacy/Custom and DQN recommendations cannot both be enabled on csi_recv"
@@ -753,6 +780,51 @@ static QueueHandle_t s_dqn_csi_queue = NULL;
 static volatile uint32_t s_dqn_csi_drop_count = 0;
 static uint32_t s_dqn_data_pkt_count = 0;
 
+#if CONFIG_CSI_DQN_UP_MOVE_VETO_LOSS_PCT > 0
+/* Up-move veto delivery tracker: rx ids of the last
+ * CONFIG_CSI_DQN_LOSS_WINDOW_FRAMES received data frames. The frame count over
+ * the sender-seq span they cover yields the recent loss rate. Written only
+ * from the CSI callback; published as a percentage for the inference task. */
+static uint32_t s_dqn_rx_id_ring[CONFIG_CSI_DQN_LOSS_WINDOW_FRAMES];
+static uint16_t s_dqn_rx_id_ring_count = 0;
+static uint16_t s_dqn_rx_id_ring_next = 0;
+static volatile uint8_t s_dqn_recent_loss_pct = 0;
+
+static void dqn_loss_tracker_update(uint32_t rx_id)
+{
+    if (s_dqn_rx_id_ring_count > 0) {
+        uint16_t newest = (uint16_t)((s_dqn_rx_id_ring_next + CONFIG_CSI_DQN_LOSS_WINDOW_FRAMES - 1)
+                                     % CONFIG_CSI_DQN_LOSS_WINDOW_FRAMES);
+        if (rx_id == s_dqn_rx_id_ring[newest]) {
+            return; /* duplicate delivery of the same packet */
+        }
+        if (rx_id < s_dqn_rx_id_ring[newest]) {
+            /* Sender restarted and its sequence reset: start the window over. */
+            s_dqn_rx_id_ring_count = 0;
+            s_dqn_rx_id_ring_next = 0;
+            __atomic_store_n(&s_dqn_recent_loss_pct, 0, __ATOMIC_RELEASE);
+        }
+    }
+    s_dqn_rx_id_ring[s_dqn_rx_id_ring_next] = rx_id;
+    s_dqn_rx_id_ring_next = (uint16_t)((s_dqn_rx_id_ring_next + 1)
+                                       % CONFIG_CSI_DQN_LOSS_WINDOW_FRAMES);
+    if (s_dqn_rx_id_ring_count < CONFIG_CSI_DQN_LOSS_WINDOW_FRAMES) {
+        s_dqn_rx_id_ring_count++;
+    }
+    if (s_dqn_rx_id_ring_count >= 2) {
+        uint16_t oldest = (uint16_t)((s_dqn_rx_id_ring_next + CONFIG_CSI_DQN_LOSS_WINDOW_FRAMES
+                                      - s_dqn_rx_id_ring_count)
+                                     % CONFIG_CSI_DQN_LOSS_WINDOW_FRAMES);
+        uint32_t span = rx_id - s_dqn_rx_id_ring[oldest] + 1U;
+        uint8_t loss_pct = 0;
+        if (span > (uint32_t)s_dqn_rx_id_ring_count) {
+            loss_pct = (uint8_t)(((span - (uint32_t)s_dqn_rx_id_ring_count) * 100U) / span);
+        }
+        __atomic_store_n(&s_dqn_recent_loss_pct, loss_pct, __ATOMIC_RELEASE);
+    }
+}
+#endif /* CONFIG_CSI_DQN_UP_MOVE_VETO_LOSS_PCT */
+
 static uint8_t dqn_clamp_mcs_index(uint32_t value)
 {
     return (value <= 7U) ? (uint8_t)value : 0U;
@@ -1209,6 +1281,11 @@ static void dqn_inference_task(void *arg)
     dqn_csi_job_t incoming = {0};
     float state[POLICY_MODEL_STATE_DIM] = {0};
     bool have_state = false;
+#if CONFIG_CSI_DQN_UP_MOVE_VETO_LOSS_PCT > 0
+    uint8_t last_rx_mcs = 0;
+#endif
+    int last_sent_mcs = -1;
+    int64_t last_send_us = 0;
     TickType_t interval_ticks = pdMS_TO_TICKS(CONFIG_CSI_DQN_CONTROL_INTERVAL_MS);
     if (interval_ticks < 1) {
         interval_ticks = 1;
@@ -1224,6 +1301,11 @@ static void dqn_inference_task(void *arg)
             while (xQueueReceive(s_dqn_csi_queue, &incoming, 0) == pdTRUE) {
                 job = incoming;
             }
+#if CONFIG_CSI_DQN_UP_MOVE_VETO_LOSS_PCT > 0
+            /* The sender's current rate, before state_mcs_index is overwritten
+             * with the recommendation below. */
+            last_rx_mcs = job.state_mcs_index;
+#endif
         }
 
         if (!have_state) {
@@ -1256,6 +1338,16 @@ static void dqn_inference_task(void *arg)
         float best_q = 0.0f;
         float second_q = 0.0f;
         uint8_t recommended_mcs = policy_predict_mcs(state, &best_q, &second_q);
+#if CONFIG_CSI_DQN_UP_MOVE_VETO_LOSS_PCT > 0
+        /* While the link is measurably lossy, never recommend above the rate
+         * of the last received frame — a lone delivered frame mid-fade looks
+         * fresh and strong to the snapshot model. Down-moves always pass. */
+        uint8_t recent_loss_pct = __atomic_load_n(&s_dqn_recent_loss_pct, __ATOMIC_ACQUIRE);
+        if (recent_loss_pct >= CONFIG_CSI_DQN_UP_MOVE_VETO_LOSS_PCT
+                && recommended_mcs > last_rx_mcs) {
+            recommended_mcs = last_rx_mcs;
+        }
+#endif
         float margin = best_q - second_q;
         if (margin < 0.0f) {
             margin = 0.0f;
@@ -1269,50 +1361,63 @@ static void dqn_inference_task(void *arg)
             margin_milli = UINT16_MAX;
         }
 
-        dqn_reco_msg_t recommendation = {
-            .magic = DQN_RECO_MAGIC,
-            .version = DQN_RECO_VERSION,
-            .recommended_mcs = recommended_mcs,
-            .confidence = (uint8_t)confidence,
-            .seq = job.seq,
-            .rssi = job.rssi,
-            .snr = (int8_t)((int)job.rssi - (int)job.noise_floor),
-            .margin_milli = (uint16_t)margin_milli,
-        };
-        esp_err_t result = esp_now_send(
-            CONFIG_CSI_SEND_MAC,
-            (const uint8_t *)&recommendation,
-            sizeof(recommendation)
-        );
+        /* Stale ticks re-run inference every control interval, but resending
+         * an unchanged recommendation into a silent link only queues stale
+         * frames in the Wi-Fi driver (they can arrive seconds late once the
+         * channel recovers). Send on fresh CSI, on a changed recommendation,
+         * or when the keepalive interval elapses. */
+        bool send_reco = got_new_csi
+                || (int)recommended_mcs != last_sent_mcs
+                || (start_us - last_send_us)
+                       >= (int64_t)CONFIG_CSI_DQN_STALE_RECO_MIN_INTERVAL_MS * 1000LL;
+        if (send_reco) {
+            dqn_reco_msg_t recommendation = {
+                .magic = DQN_RECO_MAGIC,
+                .version = DQN_RECO_VERSION,
+                .recommended_mcs = recommended_mcs,
+                .confidence = (uint8_t)confidence,
+                .seq = job.seq,
+                .rssi = job.rssi,
+                .snr = (int8_t)((int)job.rssi - (int)job.noise_floor),
+                .margin_milli = (uint16_t)margin_milli,
+            };
+            esp_err_t result = esp_now_send(
+                CONFIG_CSI_SEND_MAC,
+                (const uint8_t *)&recommendation,
+                sizeof(recommendation)
+            );
+            last_sent_mcs = (int)recommended_mcs;
+            last_send_us = start_us;
 
 #if CONFIG_CSI_DQN_LOG_ENABLED
-        uint32_t dropped = __atomic_exchange_n(
-            &s_dqn_csi_drop_count,
-            0U,
-            __ATOMIC_ACQ_REL
-        );
-        printf("DQN_INFERENCE,%lu,%u,%.6f,%.6f,%.6f,%u,%lld,%d,%u,%u,%u,%u,%u,%u\n",
-               (unsigned long)job.seq,
-               (unsigned int)recommended_mcs,
-               best_q,
-               second_q,
-               margin,
-               (unsigned int)confidence,
-               (long long)(esp_timer_get_time() - start_us),
-               (int)result,
-               (unsigned int)job.state_age_packets,
-               (unsigned int)job.state_packet_gap,
-               (unsigned int)job.state_missing_packets,
-               (unsigned int)job.state_mcs_index,
-               (unsigned int)job.state_is_stale,
-               got_new_csi ? 1U : 0U);
-        if (dropped > 0) {
-            printf("DQN_QUEUE_DROPPED,%lu,%lu\n",
+            uint32_t dropped = __atomic_exchange_n(
+                &s_dqn_csi_drop_count,
+                0U,
+                __ATOMIC_ACQ_REL
+            );
+            printf("DQN_INFERENCE,%lu,%u,%.6f,%.6f,%.6f,%u,%lld,%d,%u,%u,%u,%u,%u,%u\n",
                    (unsigned long)job.seq,
-                   (unsigned long)dropped);
-        }
-        fflush(stdout);
+                   (unsigned int)recommended_mcs,
+                   best_q,
+                   second_q,
+                   margin,
+                   (unsigned int)confidence,
+                   (long long)(esp_timer_get_time() - start_us),
+                   (int)result,
+                   (unsigned int)job.state_age_packets,
+                   (unsigned int)job.state_packet_gap,
+                   (unsigned int)job.state_missing_packets,
+                   (unsigned int)job.state_mcs_index,
+                   (unsigned int)job.state_is_stale,
+                   got_new_csi ? 1U : 0U);
+            if (dropped > 0) {
+                printf("DQN_QUEUE_DROPPED,%lu,%lu\n",
+                       (unsigned long)job.seq,
+                       (unsigned long)dropped);
+            }
+            fflush(stdout);
 #endif
+        }
         job.state_mcs_index = recommended_mcs;
     }
 }
@@ -1717,6 +1822,9 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 #endif
 
 #if CONFIG_CSI_DQN_MCS_RECOMMENDATION_ENABLED
+#if CONFIG_CSI_DQN_UP_MOVE_VETO_LOSS_PCT > 0
+    dqn_loss_tracker_update(rx_id);
+#endif
     if (s_count >= CONFIG_CSI_DQN_WARMUP_PACKETS
             && (s_dqn_data_pkt_count % CONFIG_CSI_DQN_RECOMMENDATION_EVERY_N_PACKETS) == 0) {
         dqn_csi_job_t job = {

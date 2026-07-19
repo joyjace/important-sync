@@ -78,9 +78,9 @@ DEFAULT_PROFILE = {
         "dqn_default_mcs": 4,
         "dqn_remote_min_confidence": 0,
         "dqn_remote_max_age_ms": 50,
-        "dqn_remote_max_seq_gap": 0,
-        "dqn_failure_stepdown_enabled": 0,
-        "dqn_failure_stepdown_count": 3,
+        "dqn_remote_max_seq_gap": 50,
+        "dqn_failure_stepdown_enabled": 1,
+        "dqn_failure_stepdown_count": 8,
         "dqn_log_enabled": 1,
     },
     "receiver": {
@@ -146,6 +146,13 @@ MODES = {
             "live_mcs_algo": 2,
             "remote_mcs_recommendation_enabled": 0,
             "dqn_remote_recommendation_enabled": 1,
+            # Blackout safety: reject recos computed from stale CSI and ramp
+            # down locally on consecutive ACK failures. Enable both together —
+            # the seq-gap guard rejects stale-branch recos during outages, so
+            # the local stepdown is what steps the rate down.
+            "dqn_remote_max_seq_gap": 50,
+            "dqn_failure_stepdown_enabled": 1,
+            "dqn_failure_stepdown_count": 8,
         },
         "receiver": {
             "custom_mcs_recommendation_enabled": 0,
@@ -167,6 +174,9 @@ MODES = {
             "live_mcs_algo": 2,
             "remote_mcs_recommendation_enabled": 0,
             "dqn_remote_recommendation_enabled": 1,
+            "dqn_remote_max_seq_gap": 50,
+            "dqn_failure_stepdown_enabled": 1,
+            "dqn_failure_stepdown_count": 8,
         },
         "receiver": {
             "custom_mcs_recommendation_enabled": 0,

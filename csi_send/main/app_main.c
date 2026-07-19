@@ -146,14 +146,24 @@
 #ifndef CONFIG_CSI_DQN_REMOTE_MAX_AGE_MS
 #define CONFIG_CSI_DQN_REMOTE_MAX_AGE_MS 50
 #endif
+/* Reject recommendations computed from CSI older than ~250 ms (50 packets at
+ * 200 pkt/s). The 50 ms age check stamps arrival time at the sender, so a
+ * recommendation delayed in the receiver's Wi-Fi driver queue during an outage
+ * would otherwise still be applied seconds after the state it was based on
+ * (observed live 2026-07-18: blackout pinned at MCS7 by a late reco). Keep the
+ * failure stepdown enabled whenever this guard is on — stale-branch
+ * recommendations carry the old CSI seq, so during a blackout the seq-gap
+ * guard rejects them and the local stepdown is what ramps the rate down. */
 #ifndef CONFIG_CSI_DQN_REMOTE_MAX_SEQ_GAP
-#define CONFIG_CSI_DQN_REMOTE_MAX_SEQ_GAP 0
+#define CONFIG_CSI_DQN_REMOTE_MAX_SEQ_GAP 50
 #endif
 #ifndef CONFIG_CSI_DQN_FAILURE_STEPDOWN_ENABLED
-#define CONFIG_CSI_DQN_FAILURE_STEPDOWN_ENABLED 0
+#define CONFIG_CSI_DQN_FAILURE_STEPDOWN_ENABLED 1
 #endif
+/* 8 consecutive ACK failures per step: full MCS7->0 ramp in ~320 ms during a
+ * blackout, while random loss below ~40% almost never triggers it. */
 #ifndef CONFIG_CSI_DQN_FAILURE_STEPDOWN_COUNT
-#define CONFIG_CSI_DQN_FAILURE_STEPDOWN_COUNT 3
+#define CONFIG_CSI_DQN_FAILURE_STEPDOWN_COUNT 8
 #endif
 #ifndef CONFIG_CSI_DQN_LOG_ENABLED
 #define CONFIG_CSI_DQN_LOG_ENABLED 1

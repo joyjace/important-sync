@@ -126,14 +126,27 @@ def policy_exceedance_metrics(work: pd.DataFrame, thresholds_ms: list[float]) ->
     return metrics
 
 
-def minmax_component(values_by_name: dict[str, float], higher_is_better: bool) -> dict[str, float]:
+def minmax_component(
+    values_by_name: dict[str, float],
+    higher_is_better: bool,
+    anchor_names: set[str] | None = None,
+) -> dict[str, float]:
     finite = {name: value for name, value in values_by_name.items() if np.isfinite(value)}
-    if not finite:
+    anchors = {
+        name: value
+        for name, value in finite.items()
+        if anchor_names is None or name in anchor_names
+    }
+    if not anchors:
         return {name: float("nan") for name in values_by_name}
 
-    min_value = min(finite.values())
-    max_value = max(finite.values())
+    min_value = min(anchors.values())
+    max_value = max(anchors.values())
     if np.isclose(min_value, max_value):
+        if anchor_names is not None:
+            # Static anchors provide no scale for this component, so omit it
+            # instead of letting each learned policy define a different range.
+            return {name: float("nan") for name in values_by_name}
         return {name: (1.0 if np.isfinite(value) else float("nan")) for name, value in values_by_name.items()}
 
     scores = {}
@@ -154,6 +167,7 @@ def composite_scores(
     p95_weight: float,
     capped_mean_weight: float,
     loss_weight: float,
+    normalization_scope: str = "all_candidates",
 ) -> dict[str, dict[str, float]]:
     weights = {
         "reward_component": reward_weight,
@@ -165,27 +179,43 @@ def composite_scores(
     positive_weight_sum = sum(weight for weight in weights.values() if weight > 0)
     if positive_weight_sum <= 0:
         raise ValueError("At least one composite score weight must be positive")
+    if normalization_scope not in {"all_candidates", "static_candidates"}:
+        raise ValueError(
+            "composite normalization must be all_candidates or static_candidates"
+        )
+    anchor_names = (
+        None
+        if normalization_scope == "all_candidates"
+        else {name for name in candidates if name.startswith("static_MCS")}
+    )
+    if normalization_scope == "static_candidates" and not anchor_names:
+        raise ValueError("Static-candidate normalization requires static MCS baselines")
 
     raw_components = {
         "reward_component": minmax_component(
             {name: metrics.get("mean_reward", float("nan")) for name, metrics in candidates.items()},
             higher_is_better=True,
+            anchor_names=anchor_names,
         ),
         "median_component": minmax_component(
             {name: metrics.get("median_service_ms", float("nan")) for name, metrics in candidates.items()},
             higher_is_better=False,
+            anchor_names=anchor_names,
         ),
         "p95_component": minmax_component(
             {name: metrics.get("p95_service_ms", float("nan")) for name, metrics in candidates.items()},
             higher_is_better=False,
+            anchor_names=anchor_names,
         ),
         "capped_mean_component": minmax_component(
             {name: metrics.get("capped_mean_service_ms", float("nan")) for name, metrics in candidates.items()},
             higher_is_better=False,
+            anchor_names=anchor_names,
         ),
         "loss_component": minmax_component(
             {name: metrics.get("loss_rate", float("nan")) for name, metrics in candidates.items()},
             higher_is_better=False,
+            anchor_names=anchor_names,
         ),
     }
 
@@ -215,6 +245,7 @@ def evaluate_predictions(
     score_p95_weight: float,
     score_capped_mean_weight: float,
     score_loss_weight: float,
+    composite_normalization: str = "all_candidates",
 ) -> dict[str, object]:
     required = {"predicted_mcs", "actual_mcs", "service_ms"}
     missing = sorted(required - set(df.columns))
@@ -239,11 +270,22 @@ def evaluate_predictions(
 
     replay = work[work["match"]].copy()
     coverage = float(work["match"].mean())
+    importance_weights = work["weight"].to_numpy(dtype=np.float64)
+    weight_sum = float(np.sum(importance_weights))
+    squared_weight_sum = float(np.sum(np.square(importance_weights)))
+    effective_sample_size = (
+        float(weight_sum * weight_sum / squared_weight_sum)
+        if squared_weight_sum > 0.0
+        else 0.0
+    )
     cap_value = float(work["service_ms"].quantile(cap_quantile))
 
     result = {
         "rows": int(len(work)),
         "coverage": coverage,
+        "matched_rows": int(len(replay)),
+        "importance_weight_effective_sample_size": effective_sample_size,
+        "effective_sample_fraction": effective_sample_size / float(len(work)),
         "logged_propensity_mode": propensity_mode,
         "cap_quantile": float(cap_quantile),
         "cap_value_service_ms": cap_value,
@@ -317,6 +359,7 @@ def evaluate_predictions(
         "capped_mean": score_capped_mean_weight,
         "loss": score_loss_weight,
     }
+    result["composite_score_normalization"] = composite_normalization
     result["composite_candidates"] = composite_scores(
         candidates,
         reward_weight=score_reward_weight,
@@ -324,6 +367,7 @@ def evaluate_predictions(
         p95_weight=score_p95_weight,
         capped_mean_weight=score_capped_mean_weight,
         loss_weight=score_loss_weight,
+        normalization_scope=composite_normalization,
     )
     result["composite_ranking"] = [
         name
@@ -358,6 +402,15 @@ def main():
     parser.add_argument("--score-capped-mean-weight", type=float, default=0.10, help="Composite score weight for capped mean service time")
     parser.add_argument("--score-loss-weight", type=float, default=0.0, help="Composite score weight for packet loss rate")
     parser.add_argument(
+        "--composite-normalization",
+        choices=["all_candidates", "static_candidates"],
+        default="all_candidates",
+        help=(
+            "Min-max anchors for composite components. static_candidates gives "
+            "separately evaluated learned policies a shared scale on one dataset."
+        ),
+    )
+    parser.add_argument(
         "--exceedance-thresholds-ms",
         default="1,5,10",
         help="Comma-separated service_ms thresholds to report as exceedance rates",
@@ -376,6 +429,7 @@ def main():
         score_p95_weight=args.score_p95_weight,
         score_capped_mean_weight=args.score_capped_mean_weight,
         score_loss_weight=args.score_loss_weight,
+        composite_normalization=args.composite_normalization,
     )
 
     print("[Policy Delay Evaluation]")

@@ -229,9 +229,10 @@ python3 action_reward_model/train_reward_model.py \
   --seed 42
 ```
 
-Phase dropout replaces all 108 normalized differential-phase values with their
-training mean for a random fraction of frames. The consistency loss limits the
-score change between full and phase-masked states. These are safeguards against
+Phase dropout replaces all 110 normalized phase-derived values—the 108
+differential-phase values plus valid fraction and coherence—with their training
+mean for a random fraction of frames. The consistency loss limits the score
+change between full and phase-masked states. These are safeguards against
 scenario-specific phase shortcuts, not evidence that phase adds value; the
 held-out and phase-ablation gates above remain mandatory.
 

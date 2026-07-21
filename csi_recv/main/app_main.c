@@ -40,6 +40,8 @@
  *   0 = v2.6 link_v5 amplitude rollback/control
  *   1 = v3.1 link_v7c full-CSI canary
  *   2 = v3.2 broad-data link_v5 amplitude canary (seed 42)
+ *   3 = v3.3 expanded matched link_v5 amplitude (seed 11)
+ *   4 = v3.3 expanded matched link_v7c full CSI (seed 11)
  */
 #define CONFIG_CSI_REWARD_MODEL_VARIANT 0
 #endif
@@ -53,8 +55,14 @@
 #elif CONFIG_CSI_REWARD_MODEL_VARIANT == 2
 #define CSI_REWARD_MODEL_VARIANT_ID "v3_2_broad_exact_reward_ablation_v1_seed42_amp"
 #include "generated_reward_model_linkv5_broad_canary.h"
+#elif CONFIG_CSI_REWARD_MODEL_VARIANT == 3
+#define CSI_REWARD_MODEL_VARIANT_ID "v3_3_expanded_matched_batchtrace_v1_seed11_amp"
+#include "generated_reward_model_v3_3_amp_seed11.h"
+#elif CONFIG_CSI_REWARD_MODEL_VARIANT == 4
+#define CSI_REWARD_MODEL_VARIANT_ID "v3_3_expanded_matched_batchtrace_v1_seed11_full"
+#include "generated_reward_model_v3_3_full_seed11.h"
 #else
-#error "CONFIG_CSI_REWARD_MODEL_VARIANT must be 0 (v2.6), 1 (v3.1 full CSI), or 2 (v3.2 broad amp)"
+#error "CONFIG_CSI_REWARD_MODEL_VARIANT must be 0..4 (v2.6, v3.1, v3.2, or a v3.3 seed-11 variant)"
 #endif
 #ifndef REWARD_MODEL_CHECKPOINT_SHA256
 #define REWARD_MODEL_CHECKPOINT_SHA256 "unrecorded"

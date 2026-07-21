@@ -206,9 +206,8 @@ def predict_reward_model(
             raise ValueError("--mask-v7c-phase requires a link_v7c checkpoint")
         # Replace every phase-derived feature, including valid fraction and
         # coherence, with its checkpoint mean.  This makes normalized indices
-        # 56:166 exactly zero and is a true phase-vs-amplitude ablation.  The
-        # training regularizer intentionally masks only the 108 differential
-        # values (56:164), so this qualification path is deliberately stricter.
+        # 56:166 exactly zero and matches the current training-time phase
+        # dropout/consistency intervention.
         phase_slice = slice(
             LINK_V7C_PHASE_DERIVED_START,
             LINK_V7C_PHASE_DERIVED_STOP,

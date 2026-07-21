@@ -98,7 +98,8 @@ Checkpoints trained before the schema rename stored the compact layout as
 ## Reward-Model Custom Recommendation Path
 
 The custom path is shared by the v2.6 amplitude control, the v3.2 broad-data
-amplitude canary, and the staged v3.1 full-CSI canary. Its principal controls
+amplitude canary, the staged v3.1 full-CSI canary, and the separate v3.3
+amplitude/FullCSI seed-11 candidates. Its principal controls
 in `main/app_main.c` are:
 
 - `CONFIG_MCS_RECOMMENDATION_ENABLED`
@@ -109,7 +110,9 @@ in `main/app_main.c` are:
 
 The variant is `0` for `main/generated_reward_model_v2.h`, `1` for
 `main/generated_reward_model_linkv7c_canary.h`, and `2` for
-`main/generated_reward_model_linkv5_broad_canary.h`. It uses the custom-policy
+`main/generated_reward_model_linkv5_broad_canary.h`. Variant `3` selects
+`main/generated_reward_model_v3_3_amp_seed11.h`, and variant `4` selects
+`main/generated_reward_model_v3_3_full_seed11.h`. It uses the custom-policy
 feedback frame and is separate from the DQN/live-policy controller. Prefer the
 coupled presets in `tools/device_menu.py` so sender and receiver flags cannot
 drift apart.
@@ -151,9 +154,12 @@ The menu requires checkpoint SHA-256
 `b70a3dd63bbe6964b5128412d6325becc2ed00d15bbdfafeab97b949c4ba7964`
 for this mode. Select **v3.2 broad-data amplitude reward-model canary (seed
 42)** to stage it, **v3.1 robust full-CSI reward-model canary** for the phase
-model, or **v2.6 amplitude reward-model champion (rollback/control)** to return
-to the original model. These choices only change the selector; none overwrites
-another artifact. The receiver prints `CSI_MODEL_VARIANT` at startup to record
+model, **v3.3 expanded matched amplitude reward model (seed 11)** or **v3.3
+expanded matched FullCSI reward model (seed 11)** for the new paired candidates,
+or **v2.6 amplitude reward-model champion (rollback/control)** to return to the
+original model. These choices only change the selector; none overwrites another
+artifact. Both v3.3 presets leave the SNR guard disabled to match their offline
+paired evaluation. The receiver prints `CSI_MODEL_VARIANT` at startup to record
 the selected model in live captures.
 
 The worker emits a `REWARD_INFERENCE_HEADER` followed by bounded

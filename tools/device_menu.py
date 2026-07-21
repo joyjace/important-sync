@@ -45,6 +45,8 @@ REWARD_MODEL_VARIANT_CHOICES = [
     "v2.6 link_v5 amplitude rollback/control",
     "v3.1 link_v7c full-CSI canary",
     "v3.2 broad-data link_v5 amplitude canary (seed 42)",
+    "v3.3 expanded matched link_v5 amplitude (seed 11)",
+    "v3.3 expanded matched link_v7c FullCSI (seed 11)",
 ]
 
 DEPRECATED_SENDER_KEYS = (
@@ -300,6 +302,72 @@ MODES = {
             ),
         ],
     },
+    "reward_model_v3_3_amp_seed11": {
+        "label": "v3.3 expanded matched amplitude reward model (seed 11)",
+        "sender": {
+            "ack_timing_mode": 2,
+            "live_mcs_selection_enabled": 1,
+            "live_mcs_algo": 1,
+            "live_mcs_min_index": 0,
+            "live_mcs_max_index": 7,
+            "remote_mcs_recommendation_enabled": 1,
+            "dqn_remote_recommendation_enabled": 0,
+            "dqn_remote_max_seq_gap": 50,
+            "dqn_failure_stepdown_enabled": 1,
+            "dqn_failure_stepdown_count": 8,
+        },
+        "receiver": {
+            "custom_mcs_recommendation_enabled": 1,
+            "reward_model_variant": 3,
+            # Match the unguarded offline v3.3 evaluation exactly.
+            "reward_model_snr_guard_enabled": 0,
+            "reward_model_low_snr_threshold_db": 15,
+            "reward_model_low_snr_max_mcs": 1,
+            "dqn_mcs_recommendation_enabled": 0,
+        },
+        "headers": [
+            (
+                "csi_recv/main/generated_reward_model_v3_3_amp_seed11.h",
+                'REWARD_MODEL_CHECKPOINT_SHA256 "39d0d0426e34fad87ec37d5247a07e59d5a809a39af380b974c944b47a060bc8"',
+                "tools/venv/bin/python3 tools/rl/DQN/action_reward_model/export_reward_model_to_c_header.py "
+                "--model tools/rl/DQN/experiments/v3_3_expanded_matched_batchtrace_v1/models/seed_11/amp/action_reward_model.pth "
+                "--output csi_recv/main/generated_reward_model_v3_3_amp_seed11.h",
+            ),
+        ],
+    },
+    "reward_model_v3_3_full_seed11": {
+        "label": "v3.3 expanded matched FullCSI reward model (seed 11)",
+        "sender": {
+            "ack_timing_mode": 2,
+            "live_mcs_selection_enabled": 1,
+            "live_mcs_algo": 1,
+            "live_mcs_min_index": 0,
+            "live_mcs_max_index": 7,
+            "remote_mcs_recommendation_enabled": 1,
+            "dqn_remote_recommendation_enabled": 0,
+            "dqn_remote_max_seq_gap": 50,
+            "dqn_failure_stepdown_enabled": 1,
+            "dqn_failure_stepdown_count": 8,
+        },
+        "receiver": {
+            "custom_mcs_recommendation_enabled": 1,
+            "reward_model_variant": 4,
+            # Match the unguarded offline v3.3 evaluation exactly.
+            "reward_model_snr_guard_enabled": 0,
+            "reward_model_low_snr_threshold_db": 15,
+            "reward_model_low_snr_max_mcs": 1,
+            "dqn_mcs_recommendation_enabled": 0,
+        },
+        "headers": [
+            (
+                "csi_recv/main/generated_reward_model_v3_3_full_seed11.h",
+                'REWARD_MODEL_CHECKPOINT_SHA256 "acb069a3af0e9af740345e89ad8b21d235b441c418ca6b5ce9880a0e268e81cf"',
+                "tools/venv/bin/python3 tools/rl/DQN/action_reward_model/export_reward_model_to_c_header.py "
+                "--model tools/rl/DQN/experiments/v3_3_expanded_matched_batchtrace_v1/models/seed_11/full/action_reward_model.pth "
+                "--output csi_recv/main/generated_reward_model_v3_3_full_seed11.h",
+            ),
+        ],
+    },
     "static": {
         "label": "Static MCS baseline (fixed rate, no adaptation)",
         "sender": {
@@ -334,6 +402,8 @@ MODE_ORDER = [
     "reward_model",
     "reward_model_broad_amp_canary",
     "reward_model_v7c_canary",
+    "reward_model_v3_3_amp_seed11",
+    "reward_model_v3_3_full_seed11",
     "static",
     "random_sweep",
 ]

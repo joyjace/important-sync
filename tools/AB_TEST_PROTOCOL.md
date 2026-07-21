@@ -76,7 +76,7 @@ Capture each run exactly like a collection run:
 
 ```bash
 python3 tools/csi_data_read_parse_SSH.py \
-  -p <recv_port> -b 921600 -sp <send_port> -sb 115200 \
+  -p <recv_port> -b 921600 -sp <send_port> -sb 921600 \
   -s runs/<scenario>_<arm>_<i>/csi_data.csv \
   -l runs/<scenario>_<arm>_<i>/csi_log.txt \
   -a runs/<scenario>_<arm>_<i>/ack_data.csv \

@@ -1584,6 +1584,7 @@ void app_main()
         (unsigned int)CONFIG_DQN_FAILURE_STEPDOWN_COUNT
     );
 #endif
+    printf("SERIAL_CONFIG,sender_console_baud,%d\n", (int)CONFIG_ESP_CONSOLE_UART_BAUDRATE);
     printf("ACK_STATUS_HEADER,seq,delivered,termination_event,ack_ts_us,send_ts_us,service_us,configured_rate,actual_rate,tx_status,data_len\n");
     printf("ACK_SERVICE_HEADER,total,delivered,avg_service_us,median_service_us,goodput_mbps,ts_us\n");
 #if CONFIG_LIVE_MCS_SELECTION_ENABLED && CONFIG_LIVE_MCS_DECISION_LOG_ENABLED

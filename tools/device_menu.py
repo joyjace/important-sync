@@ -18,9 +18,23 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SENDER_MAIN = ROOT / "csi_send" / "main" / "app_main.c"
+SENDER_SDKCONFIG = ROOT / "csi_send" / "sdkconfig"
 RECEIVER_MAIN = ROOT / "csi_recv" / "main" / "app_main.c"
 PROFILE_PATH = Path(__file__).resolve().parent / "device_menu_profile.json"
 LOCAL_PATH = Path(__file__).resolve().parent / "device_menu_local.json"
+
+SENDER_CONSOLE_BAUD = 921600
+SENDER_CONSOLE_SDKCONFIG_VALUES = {
+    "CONFIG_ESPTOOLPY_MONITOR_BAUD": str(SENDER_CONSOLE_BAUD),
+    "CONFIG_ESP_CONSOLE_UART_DEFAULT": None,
+    "CONFIG_ESP_CONSOLE_UART_CUSTOM": "y",
+    "CONFIG_ESP_CONSOLE_UART_BAUDRATE": str(SENDER_CONSOLE_BAUD),
+    # ESP-IDF compatibility aliases retained in generated sdkconfig files.
+    "CONFIG_MONITOR_BAUD": str(SENDER_CONSOLE_BAUD),
+    "CONFIG_CONSOLE_UART_DEFAULT": None,
+    "CONFIG_CONSOLE_UART_CUSTOM": "y",
+    "CONFIG_CONSOLE_UART_BAUDRATE": str(SENDER_CONSOLE_BAUD),
+}
 
 IS_WINDOWS = os.name == "nt"
 
@@ -748,6 +762,49 @@ def select_mode(profile: dict, local: dict) -> None:
 # Build / flash (host-local)
 # ---------------------------------------------------------------------------
 
+def ensure_sender_console_baud(sdkconfig_path: Path = None) -> bool:
+    """Migrate an existing generated sender sdkconfig to the logging baud.
+
+    sdkconfig.defaults governs clean builds, but ESP-IDF deliberately keeps an
+    existing sdkconfig. Updating only the console-related entries here lets the
+    menu build safely migrate an established Pi checkout without resetting its
+    other local Kconfig choices.
+    """
+
+    path = SENDER_SDKCONFIG if sdkconfig_path is None else Path(sdkconfig_path)
+    if not path.exists():
+        return False
+
+    original = path.read_text(encoding="utf-8")
+    lines = original.splitlines()
+
+    for key, value in SENDER_CONSOLE_SDKCONFIG_VALUES.items():
+        replacement = f"{key}={value}" if value is not None else f"# {key} is not set"
+        pattern = re.compile(rf"^(?:{re.escape(key)}=.*|# {re.escape(key)} is not set)$")
+        matches = [index for index, line in enumerate(lines) if pattern.match(line)]
+        if matches:
+            lines[matches[0]] = replacement
+            for index in reversed(matches[1:]):
+                del lines[index]
+        else:
+            lines.append(replacement)
+
+    updated = "\n".join(lines) + "\n"
+    if updated == original:
+        return False
+
+    path.write_text(updated, encoding="utf-8")
+    return True
+
+
+def prepare_sender_console_config() -> None:
+    if ensure_sender_console_baud():
+        print(
+            f"Updated existing sender sdkconfig console/monitor baud to "
+            f"{SENDER_CONSOLE_BAUD}."
+        )
+
+
 def run_idf(target_dir: Path, command: str, local: dict) -> int:
     build_dir = str(local.get("build_dir", "")).strip()
     build_arg = f"-B {build_dir} " if build_dir else ""
@@ -765,6 +822,7 @@ def run_idf(target_dir: Path, command: str, local: dict) -> int:
 
 
 def run_build_sender(local: dict) -> None:
+    prepare_sender_console_config()
     code = run_idf(ROOT / "csi_send", "build", local)
     print("Sender build OK" if code == 0 else f"Sender build failed with exit code {code}")
 
@@ -775,6 +833,7 @@ def run_build_receiver(local: dict) -> None:
 
 
 def run_flash_sender(local: dict) -> None:
+    prepare_sender_console_config()
     command = f'flash -b {local["baud"]} -p {local["sender_port"]}'
     code = run_idf(ROOT / "csi_send", command, local)
     print("Sender flash OK" if code == 0 else f"Sender flash failed with exit code {code}")

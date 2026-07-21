@@ -868,11 +868,10 @@ def handle_mcs_change(record):
 
 
 def infer_single_port_mode(baudrate):
-    # Typical setup: sender console at 115200, receiver CSI stream at 921600.
-    # Allow auto mode to infer likely stream type from baudrate.
-    if baudrate <= 230400:
-        return 'ack'
-    return 'csi'
+    # Both the sender and receiver consoles use 921600. Keep auto genuinely
+    # content-based instead of guessing the stream type from its baud rate.
+    del baudrate
+    return 'auto'
 
 
 def ack_read_parse(send_port, send_baudrate, ack_writer, ack_file_fd,
@@ -1492,8 +1491,8 @@ def main():
         choices=['auto', 'csi', 'ack'],
         default='auto',
         help=(
-            'Parsing mode when only -p is used: auto infers from -b '
-            '(<=230400 -> ack, otherwise csi).'
+            'Parsing mode when only -p is used: auto recognizes CSI and ACK '
+            'records from their content.'
         )
     )
     parser.add_argument(
@@ -1597,7 +1596,7 @@ def main():
             if selected_mode == 'auto':
                 selected_mode = infer_single_port_mode(args.baud)
                 print(
-                    f'Single-port mode auto-selected from baud {args.baud}: {selected_mode}',
+                    'Single-port content-based auto detection enabled',
                     flush=True,
                 )
             else:

@@ -42,6 +42,13 @@ After applying, it offers to build+flash **the board attached to this host**
 sources to both Pis (git or `sync_selected_files.sh` → `important-sync`), then
 on each Pi build+flash only its own device.
 
+Both application consoles run at 921600 baud. Clean sender builds obtain that
+setting from `csi_send/sdkconfig.defaults`; before a sender build or flash, the
+menu also migrates only the console/monitor entries in an existing generated
+`csi_send/sdkconfig`. This is necessary because ESP-IDF otherwise keeps an old
+115200 setting instead of applying changed defaults. The host-local `baud`
+field remains the separate esptool flashing baud.
+
 ## Shared vs host-local configuration
 
 - `tools/device_menu_profile.json` — the device configuration (channel, rates,

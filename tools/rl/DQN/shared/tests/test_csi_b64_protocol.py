@@ -194,6 +194,9 @@ def _active_amplitude_summary(amplitudes: Sequence[float]) -> np.ndarray:
 
 
 class TestCsiB64Protocol(unittest.TestCase):
+    def test_single_port_auto_detection_is_content_based_at_921600(self) -> None:
+        self.assertEqual(collector.infer_single_port_mode(921600), "auto")
+
     def test_crc_reference_and_standard_check_value(self) -> None:
         self.assertEqual(_reference_crc16_ccitt(b"123456789"), 0x29B1)
         self.assertEqual(collector.crc16_ccitt(b"123456789"), 0x29B1)

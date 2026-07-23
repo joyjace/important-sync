@@ -34,6 +34,18 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+
+/* These selectors must be available before choosing model headers. Keeping
+ * the RSSI branch independent of generated model artifacts lets that preset
+ * build even when no learned reward-model header is installed. */
+#ifndef CONFIG_MCS_RECOMMENDATION_ENABLED
+#define CONFIG_MCS_RECOMMENDATION_ENABLED 1
+#endif
+#ifndef CONFIG_MCS_RECOMMENDATION_USE_MODEL
+#define CONFIG_MCS_RECOMMENDATION_USE_MODEL 1
+#endif
+
+#if CONFIG_MCS_RECOMMENDATION_ENABLED && CONFIG_MCS_RECOMMENDATION_USE_MODEL
 #ifndef CONFIG_CSI_REWARD_MODEL_VARIANT
 /* Reward-model artifacts are kept separate so switching modes never
  * overwrites the rollback model:
@@ -64,6 +76,7 @@
 #else
 #error "CONFIG_CSI_REWARD_MODEL_VARIANT must be 0..4 (v2.6, v3.1, v3.2, or a v3.3 seed-11 variant)"
 #endif
+#endif /* CONFIG_MCS_RECOMMENDATION_ENABLED && CONFIG_MCS_RECOMMENDATION_USE_MODEL */
 #ifndef REWARD_MODEL_CHECKPOINT_SHA256
 #define REWARD_MODEL_CHECKPOINT_SHA256 "unrecorded"
 #endif
@@ -77,7 +90,7 @@
 
 /* Model used by the live recommendation task when it is enabled:
  * 0 = generated_dqn_model.h (Q-network), 1 = generated_bandit_model.h
- * (two-head bandit; preferred). */
+ * (two-head bandit). */
 #ifndef CONFIG_CSI_MCS_POLICY_MODEL
 #define CONFIG_CSI_MCS_POLICY_MODEL 1
 #endif
@@ -127,9 +140,7 @@
  * (its Wi-Fi retry train costs ~5 data packets per recommendation, a
  * 15-22% uniform loss floor at N=20). Enable only for live-policy runs.
  */
-#define CONFIG_MCS_RECOMMENDATION_ENABLED 1 // 1 = enable MCS recommendation feature, 0 = disable
 #define CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS 20  // 1=every packet, N=every N data packets
-#define CONFIG_MCS_RECOMMENDATION_USE_MODEL 1  // 1=use ML model, 0=use RSSI-based heuristic
 #ifndef CONFIG_MCS_RECOMMENDATION_SEND_ON_CHANGE
 #define CONFIG_MCS_RECOMMENDATION_SEND_ON_CHANGE 1
 #endif
@@ -211,6 +222,9 @@
 #endif
 
 #if CONFIG_MCS_RECOMMENDATION_ENABLED
+#if CONFIG_MCS_RECOMMENDATION_USE_MODEL != 0 && CONFIG_MCS_RECOMMENDATION_USE_MODEL != 1
+#error "CONFIG_MCS_RECOMMENDATION_USE_MODEL must be 0 (RSSI) or 1 (reward model)"
+#endif
 #if CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS <= 0
 #error "CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS must be > 0"
 #endif
@@ -315,6 +329,7 @@ static volatile uint32_t s_mcs_reco_nonfinite_count = 0;
 static volatile uint32_t s_mcs_reco_inference_overrun_count = 0;
 static uint32_t s_mcs_data_pkt_count = 0;
 
+#if CONFIG_MCS_RECOMMENDATION_USE_MODEL
 #ifndef REWARD_MODEL_CONTEXT_IS_STATE_AGE_PACKETS
 #define REWARD_MODEL_CONTEXT_IS_STATE_AGE_PACKETS 0
 #endif
@@ -361,6 +376,7 @@ static uint32_t s_mcs_data_pkt_count = 0;
 #if (REWARD_MODEL_STATE_SCHEMA_LINK_V2 || REWARD_MODEL_STATE_SCHEMA_LINK_V3 || REWARD_MODEL_STATE_SCHEMA_LINK_V4)
 #error "Receiver reward-model path supports legacy_v1, link_v5, link_v6, or link_v7c headers only"
 #endif
+#endif /* CONFIG_MCS_RECOMMENDATION_USE_MODEL */
 
 typedef struct {
     uint32_t seq;
@@ -376,6 +392,7 @@ typedef struct {
     int8_t csi_values[MCS_RECO_CSI_VALUE_COUNT];
 } mcs_reco_job_t;
 
+#if CONFIG_MCS_RECOMMENDATION_USE_MODEL
 #if !REWARD_MODEL_STATE_SCHEMA_LINK_V7C
 static float quantile_from_sorted(const float *sorted, int n, float q)
 {
@@ -712,6 +729,7 @@ static uint8_t recommend_mcs_with_model(const float state[REWARD_MODEL_STATE_DIM
     }
     return best;
 }
+#endif /* CONFIG_MCS_RECOMMENDATION_USE_MODEL */
 
 static uint8_t recommend_mcs_from_rssi(int8_t rssi)
 {
@@ -725,6 +743,7 @@ static uint8_t recommend_mcs_from_rssi(int8_t rssi)
     return 0;
 }
 
+#if CONFIG_MCS_RECOMMENDATION_USE_MODEL
 static uint8_t reward_model_apply_snr_guard(uint8_t recommended_mcs, int8_t snr)
 {
 #if REWARD_MODEL_STATE_SCHEMA_LINK_V7C && CONFIG_CSI_REWARD_MODEL_SNR_GUARD_ENABLED
@@ -737,13 +756,16 @@ static uint8_t reward_model_apply_snr_guard(uint8_t recommended_mcs, int8_t snr)
 #endif
     return recommended_mcs;
 }
+#endif
 
 static void mcs_recommendation_task(void *arg)
 {
     (void)arg;
     mcs_reco_job_t job;
     mcs_reco_job_t incoming;
+#if CONFIG_MCS_RECOMMENDATION_USE_MODEL
     float state[REWARD_MODEL_STATE_DIM] = {0};
+#endif
     uint8_t have_last_sent = 0;
     uint8_t last_sent_mcs = 0;
     uint32_t last_sent_seq = 0;
@@ -923,6 +945,7 @@ static void mcs_recommendation_task(void *arg)
 
 static void mcs_recommendation_init(void)
 {
+#if CONFIG_MCS_RECOMMENDATION_USE_MODEL
     printf("CSI_MODEL_VARIANT,reward_model,%s,%s,%u\n",
            CSI_REWARD_MODEL_VARIANT_ID,
            REWARD_MODEL_CHECKPOINT_SHA256,
@@ -941,6 +964,15 @@ static void mcs_recommendation_init(void)
            (unsigned int)CSI_LINK_V7C_FEATURE_COUNT,
            (unsigned int)REWARD_MODEL_STATE_DIM);
 #endif
+#else
+    /* Stable, machine-readable identity for paired experiment provenance.
+     * Thresholds are listed for MCS7 down through MCS1; lower RSSI selects
+     * MCS0. This branch has no learned checkpoint or model artifact. */
+    printf("CSI_MODEL_VARIANT,rssi_heuristic,rssi_thresholds_v1,no_checkpoint,0\n");
+    printf("CSI_RSSI_THRESHOLDS_DBM,-45,-50,-55,-60,-66,-72,-78\n");
+#endif
+    /* This telemetry name predates the RSSI preset and is retained so current
+     * capture parsers continue to recognize the shared recommendation worker. */
     printf("REWARD_INFERENCE_HEADER,seq,raw_mcs,chosen_mcs,confidence,inference_us,queue_depth,total_drops,invalid_inputs,queue_full,state_failures,coalesced,model_nonfinite,inference_overruns,status\n");
     s_mcs_reco_queue = xQueueCreate(MCS_RECO_QUEUE_SIZE, sizeof(mcs_reco_job_t));
     if (s_mcs_reco_queue == NULL) {
@@ -970,6 +1002,29 @@ static void mcs_recommendation_init(void)
 #ifndef BANDIT_MODEL_STATE_SCHEMA_LINK_V7C
 #define BANDIT_MODEL_STATE_SCHEMA_LINK_V7C 0
 #endif
+#ifndef BANDIT_MODEL_CHECKPOINT_SHA256
+#define BANDIT_MODEL_CHECKPOINT_SHA256 "legacy_unrecorded"
+#endif
+#ifndef BANDIT_MODEL_CHECKPOINT_SCHEMA
+#define BANDIT_MODEL_CHECKPOINT_SCHEMA "legacy_unspecified"
+#endif
+#ifndef BANDIT_MODEL_OBJECTIVE_CONTRACT
+#define BANDIT_MODEL_OBJECTIVE_CONTRACT "legacy_unspecified"
+#endif
+#ifndef BANDIT_MODEL_TRAINING_EXACT_FRESH_ONLY
+#define BANDIT_MODEL_TRAINING_EXACT_FRESH_ONLY 0
+#endif
+#ifndef BANDIT_MODEL_REQUIRED_CSI_INPUT_SCALAR_COUNT
+#if BANDIT_MODEL_STATE_SCHEMA_LINK_V7C
+/* Backward-compatible safe default for older link_v7c generated headers. */
+#define BANDIT_MODEL_REQUIRED_CSI_INPUT_SCALAR_COUNT CSI_LINK_V7C_INPUT_SCALAR_COUNT
+#else
+#define BANDIT_MODEL_REQUIRED_CSI_INPUT_SCALAR_COUNT 0
+#endif
+#endif
+#ifndef BANDIT_MODEL_REQUIRES_VALID_FIRST_WORD
+#define BANDIT_MODEL_REQUIRES_VALID_FIRST_WORD BANDIT_MODEL_STATE_SCHEMA_LINK_V7C
+#endif
 #if BANDIT_MODEL_ACTION_DIM != 8
 #error "Live recommendation pipeline requires an 8-action bandit model"
 #endif
@@ -986,6 +1041,12 @@ static void mcs_recommendation_init(void)
 #if BANDIT_MODEL_CSI_FEATURE_COUNT != CSI_LINK_V7C_FEATURE_COUNT
 #error "link_v7c bandit CSI feature count does not match firmware contract"
 #endif
+#if BANDIT_MODEL_REQUIRED_CSI_INPUT_SCALAR_COUNT != CSI_LINK_V7C_INPUT_SCALAR_COUNT
+#error "link_v7c bandit CSI input scalar count does not match firmware contract"
+#endif
+#if !BANDIT_MODEL_REQUIRES_VALID_FIRST_WORD
+#error "link_v7c bandit requires valid first-word CSI input"
+#endif
 #elif defined(BANDIT_MODEL_STATE_SCHEMA_LINK_V5)
 #if BANDIT_MODEL_INCLUDES_STATE_MCS
 #error "link_v5 bandit deployment is receiver-only; retrain with --ignore-state-mcs"
@@ -993,11 +1054,37 @@ static void mcs_recommendation_init(void)
 #if BANDIT_MODEL_STATE_DIM != 132
 #error "link_v5 receiver-only bandit requires BANDIT_MODEL_STATE_DIM=132"
 #endif
+#if BANDIT_MODEL_TRAINING_EXACT_FRESH_ONLY && \
+    BANDIT_MODEL_REQUIRED_CSI_INPUT_SCALAR_COUNT != CSI_LINK_V7C_INPUT_SCALAR_COUNT
+#error "exact-fresh link_v5 bandit requires exactly 114 CSI input scalars"
+#endif
+#if BANDIT_MODEL_TRAINING_EXACT_FRESH_ONLY && !BANDIT_MODEL_REQUIRES_VALID_FIRST_WORD
+#error "exact-fresh link_v5 bandit requires valid first-word CSI input"
+#endif
 #elif !defined(BANDIT_MODEL_STATE_SCHEMA_LINK_V3C)
 #error "Firmware bandit path expects the link_v5 or link_v3c state schema"
 #endif
 #define POLICY_MODEL_STATE_DIM BANDIT_MODEL_STATE_DIM
+#define POLICY_MODEL_EXACT_FRESH_ONLY BANDIT_MODEL_TRAINING_EXACT_FRESH_ONLY
 #else
+#ifndef DQN_MODEL_CHECKPOINT_SHA256
+#define DQN_MODEL_CHECKPOINT_SHA256 "legacy_unrecorded"
+#endif
+#ifndef DQN_MODEL_CHECKPOINT_SCHEMA
+#define DQN_MODEL_CHECKPOINT_SCHEMA "legacy_unrecorded"
+#endif
+#ifndef DQN_MODEL_TRANSITION_CONTRACT
+#define DQN_MODEL_TRANSITION_CONTRACT "legacy_unrecorded"
+#endif
+#ifndef DQN_MODEL_TRAINING_EXACT_FRESH_ONLY
+#define DQN_MODEL_TRAINING_EXACT_FRESH_ONLY 0
+#endif
+#ifndef DQN_MODEL_REQUIRED_CSI_INPUT_SCALAR_COUNT
+#define DQN_MODEL_REQUIRED_CSI_INPUT_SCALAR_COUNT 0
+#endif
+#ifndef DQN_MODEL_REQUIRES_VALID_FIRST_WORD
+#define DQN_MODEL_REQUIRES_VALID_FIRST_WORD 0
+#endif
 #if DQN_MODEL_ACTION_DIM != 8
 #error "DQN firmware pipeline requires an 8-output model"
 #endif
@@ -1059,12 +1146,21 @@ static void mcs_recommendation_init(void)
 #error "link_v4 DQN without state_mcs requires DQN_MODEL_STATE_DIM=135"
 #endif
 #define POLICY_MODEL_STATE_DIM DQN_MODEL_STATE_DIM
+#define POLICY_MODEL_EXACT_FRESH_ONLY DQN_MODEL_TRAINING_EXACT_FRESH_ONLY
 #endif
 
 #if CONFIG_CSI_MCS_POLICY_MODEL == 1
 #define POLICY_MODEL_STATE_SCHEMA_LINK_V7C BANDIT_MODEL_STATE_SCHEMA_LINK_V7C
 #else
 #define POLICY_MODEL_STATE_SCHEMA_LINK_V7C DQN_MODEL_STATE_SCHEMA_LINK_V7C
+#endif
+
+#if CONFIG_CSI_MCS_POLICY_MODEL == 1
+#define POLICY_MODEL_REQUIRED_CSI_INPUT_SCALAR_COUNT BANDIT_MODEL_REQUIRED_CSI_INPUT_SCALAR_COUNT
+#define POLICY_MODEL_REQUIRES_VALID_FIRST_WORD BANDIT_MODEL_REQUIRES_VALID_FIRST_WORD
+#else
+#define POLICY_MODEL_REQUIRED_CSI_INPUT_SCALAR_COUNT DQN_MODEL_REQUIRED_CSI_INPUT_SCALAR_COUNT
+#define POLICY_MODEL_REQUIRES_VALID_FIRST_WORD DQN_MODEL_REQUIRES_VALID_FIRST_WORD
 #endif
 
 #define DQN_CSI_VALUE_COUNT 234
@@ -1664,7 +1760,9 @@ static void dqn_inference_task(void *arg)
 
     for (;;) {
         bool got_new_csi = false;
-        TickType_t wait_ticks = have_state ? interval_ticks : portMAX_DELAY;
+        TickType_t wait_ticks = (have_state && !POLICY_MODEL_EXACT_FRESH_ONLY)
+                                ? interval_ticks
+                                : portMAX_DELAY;
         if (xQueueReceive(s_dqn_csi_queue, &incoming, wait_ticks) == pdTRUE) {
             job = incoming;
             got_new_csi = true;
@@ -1683,6 +1781,13 @@ static void dqn_inference_task(void *arg)
             continue;
         }
         if (!got_new_csi) {
+#if POLICY_MODEL_EXACT_FRESH_ONLY
+            /* This checkpoint was qualified only on real, exact-fresh CSI.
+             * During a blackout the sender's recommendation-age/sequence
+             * guards and ACK-failure stepdown provide the safe fallback. */
+            have_state = false;
+            continue;
+#else
             if (job.state_age_packets < CONFIG_CSI_DQN_STALE_MAX_AGE_PACKETS) {
                 job.state_age_packets++;
             }
@@ -1702,6 +1807,7 @@ static void dqn_inference_task(void *arg)
             job.state_prev_delivered = 1U;
             job.state_consecutive_losses = 0U;
             job.state_recent_loss_rate_8 = 0.0f;
+#endif
         }
 
         int64_t start_us = esp_timer_get_time();
@@ -1800,6 +1906,22 @@ static void dqn_inference_task(void *arg)
 
 static void dqn_recommendation_init(void)
 {
+#if CONFIG_CSI_MCS_POLICY_MODEL == 1
+    printf("CSI_MODEL_VARIANT,bandit,%s,%s,%s,%u,%u\n",
+           BANDIT_MODEL_CHECKPOINT_SHA256,
+           BANDIT_MODEL_CHECKPOINT_SCHEMA,
+           BANDIT_MODEL_OBJECTIVE_CONTRACT,
+           (unsigned int)BANDIT_MODEL_STATE_DIM,
+           (unsigned int)BANDIT_MODEL_TRAINING_EXACT_FRESH_ONLY);
+#endif
+#if CONFIG_CSI_MCS_POLICY_MODEL == 0
+    printf("CSI_MODEL_VARIANT,dqn,%s,%s,%s,%u,%u\n",
+           DQN_MODEL_CHECKPOINT_SHA256,
+           DQN_MODEL_CHECKPOINT_SCHEMA,
+           DQN_MODEL_TRANSITION_CONTRACT,
+           (unsigned int)DQN_MODEL_STATE_DIM,
+           (unsigned int)DQN_MODEL_TRAINING_EXACT_FRESH_ONLY);
+#endif
 #if CONFIG_CSI_MCS_POLICY_MODEL == 1 && BANDIT_MODEL_STATE_SCHEMA_LINK_V7C
     if (strcmp(BANDIT_MODEL_CSI_FEATURE_CONTRACT_ID, CSI_LINK_V7C_CONTRACT_ID) != 0 ||
         strcmp(BANDIT_MODEL_CSI_FEATURE_CONTRACT_SHA256, CSI_LINK_V7C_CONTRACT_SHA256) != 0 ||
@@ -2246,16 +2368,18 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     if (s_count >= CONFIG_CSI_DQN_WARMUP_PACKETS
             && (s_dqn_data_pkt_count % CONFIG_CSI_DQN_RECOMMENDATION_EVERY_N_PACKETS) == 0) {
         bool policy_input_valid = true;
-#if POLICY_MODEL_STATE_SCHEMA_LINK_V7C
-        policy_input_valid = info->len == CSI_LINK_V7C_INPUT_SCALAR_COUNT &&
-                             !info->first_word_invalid;
+#if POLICY_MODEL_REQUIRED_CSI_INPUT_SCALAR_COUNT > 0
+        policy_input_valid =
+            info->len == POLICY_MODEL_REQUIRED_CSI_INPUT_SCALAR_COUNT &&
+            (!POLICY_MODEL_REQUIRES_VALID_FIRST_WORD || !info->first_word_invalid);
 #endif
         if (!policy_input_valid) {
             uint32_t invalid_count = ++s_dqn_invalid_csi_count;
             if (invalid_count == 1U || (invalid_count % 64U) == 0U) {
                 ESP_LOGW(TAG,
-                         "Rejected CSI for link_v7c: len=%u first_word=%u total=%lu",
+                         "Rejected CSI for policy contract: len=%u expected=%u first_word=%u total=%lu",
                          (unsigned int)info->len,
+                         (unsigned int)POLICY_MODEL_REQUIRED_CSI_INPUT_SCALAR_COUNT,
                          info->first_word_invalid ? 1U : 0U,
                          (unsigned long)invalid_count);
             }

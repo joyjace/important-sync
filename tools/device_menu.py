@@ -8,6 +8,7 @@ script, build directory) live in device_menu_local.json, which stays local
 to each machine. A mode preset edits BOTH firmware sources consistently;
 each host then builds/flashes only the board attached to it.
 """
+import hashlib
 import json
 import os
 import re
@@ -20,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SENDER_MAIN = ROOT / "csi_send" / "main" / "app_main.c"
 SENDER_SDKCONFIG = ROOT / "csi_send" / "sdkconfig"
 RECEIVER_MAIN = ROOT / "csi_recv" / "main" / "app_main.c"
+RECEIVER_SDKCONFIG = ROOT / "csi_recv" / "sdkconfig"
 PROFILE_PATH = Path(__file__).resolve().parent / "device_menu_profile.json"
 LOCAL_PATH = Path(__file__).resolve().parent / "device_menu_local.json"
 
@@ -34,6 +36,15 @@ SENDER_CONSOLE_SDKCONFIG_VALUES = {
     "CONFIG_CONSOLE_UART_DEFAULT": None,
     "CONFIG_CONSOLE_UART_CUSTOM": "y",
     "CONFIG_CONSOLE_UART_BAUDRATE": str(SENDER_CONSOLE_BAUD),
+}
+
+RECEIVER_PARTITION_SDKCONFIG_VALUES = {
+    "CONFIG_PARTITION_TABLE_SINGLE_APP": None,
+    "CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE": "y",
+    "CONFIG_PARTITION_TABLE_TWO_OTA": None,
+    "CONFIG_PARTITION_TABLE_TWO_OTA_LARGE": None,
+    "CONFIG_PARTITION_TABLE_CUSTOM": None,
+    "CONFIG_PARTITION_TABLE_FILENAME": '"partitions_singleapp_large.csv"',
 }
 
 IS_WINDOWS = os.name == "nt"
@@ -51,7 +62,7 @@ RATE_CHOICES = [
 
 LIVE_MCS_ALGO_CHOICES = [
     "MINSTREL_LIKE - sender ACK EWMA + probing",
-    "CUSTOM_POLICY - reward-model receiver recommendations",
+    "CUSTOM_POLICY - reward-model or RSSI receiver recommendations",
     "RECEIVER_POLICY - receiver live-policy frames (bandit or DQN)",
 ]
 
@@ -111,6 +122,7 @@ DEFAULT_PROFILE = {
         "force_gain": 1,
         "gain_control": 1,
         "custom_mcs_recommendation_enabled": 0,
+        "mcs_recommendation_use_model": 1,
         "reward_model_variant": 0,
         "reward_model_snr_guard_enabled": 1,
         "reward_model_low_snr_threshold_db": 15,
@@ -136,6 +148,7 @@ if IS_WINDOWS:
         "baud": 921600,
         "export_script": str(Path.home() / "esp" / "esp-idf-v5.5.2" / "export.bat"),
         "build_dir": "build_win",
+        "post_flash_command": "",
     }
 else:
     DEFAULT_LOCAL = {
@@ -144,12 +157,14 @@ else:
         "baud": 921600,
         "export_script": "$HOME/esp/esp-idf/export.sh",
         "build_dir": "build",
+        "post_flash_command": "",
     }
 
 # Algorithm mode presets. Applying one rewrites the sender AND receiver
 # profile sections so the pair stays consistent; each host then builds and
-# flashes only its own attached board. "headers" lists generated model
-# headers the receiver build needs: (relative path, required text, hint).
+# flashes only its own attached board. The legacy "headers" key lists generated
+# deployment artifacts the receiver build needs: (relative path, required text,
+# hint, optional exact file SHA-256).
 MODES = {
     "minstrel": {
         "label": "Minstrel-like (sender-local ACK statistics, no receiver feedback)",
@@ -157,23 +172,37 @@ MODES = {
             "ack_timing_mode": 2,
             "live_mcs_selection_enabled": 1,
             "live_mcs_algo": 0,
+            "live_mcs_min_index": 0,
+            "live_mcs_max_index": 7,
+            "minstrel_update_every_pkts": 20,
+            "minstrel_probe_every_pkts": 10,
+            "minstrel_ewma_alpha_num": 1,
+            "minstrel_ewma_alpha_den": 4,
+            "live_mcs_decision_log_enabled": 1,
             "remote_mcs_recommendation_enabled": 0,
             "dqn_remote_recommendation_enabled": 0,
         },
         "receiver": {
             "custom_mcs_recommendation_enabled": 0,
+            "mcs_recommendation_use_model": 1,
             "dqn_mcs_recommendation_enabled": 0,
         },
         "headers": [],
     },
     "bandit": {
-        "label": "Contextual bandit (receiver live policy, contract checked in firmware)",
+        "label": "v3.3 matched two-head bandit (seed 11, fresh CSI only)",
         "sender": {
             "ack_timing_mode": 2,
             "live_mcs_selection_enabled": 1,
             "live_mcs_algo": 2,
+            "live_mcs_min_index": 0,
+            "live_mcs_max_index": 7,
+            "live_mcs_decision_log_enabled": 1,
             "remote_mcs_recommendation_enabled": 0,
             "dqn_remote_recommendation_enabled": 1,
+            "dqn_default_mcs": 4,
+            "dqn_remote_min_confidence": 0,
+            "dqn_remote_max_age_ms": 50,
             # Blackout safety: reject recos computed from stale CSI and ramp
             # down locally on consecutive ACK failures. Enable both together —
             # the seq-gap guard rejects stale-branch recos during outages, so
@@ -181,42 +210,84 @@ MODES = {
             "dqn_remote_max_seq_gap": 50,
             "dqn_failure_stepdown_enabled": 1,
             "dqn_failure_stepdown_count": 8,
+            "dqn_log_enabled": 1,
         },
         "receiver": {
             "custom_mcs_recommendation_enabled": 0,
+            "mcs_recommendation_use_model": 1,
             "dqn_mcs_recommendation_enabled": 1,
             "mcs_policy_model": 1,
+            "dqn_recommendation_every_n_packets": 1,
+            "dqn_warmup_packets": 100,
+            "dqn_control_interval_ms": 5,
+            "dqn_stale_max_age_packets": 64,
+            "dqn_log_enabled": 1,
         },
         "headers": [
             (
                 "csi_recv/main/generated_bandit_model.h",
-                "BANDIT_MODEL_STATE_DIM",
-                "tools/rl/DQN/action_reward_model/export_bandit_model_to_c_header.py",
+                'BANDIT_MODEL_CHECKPOINT_SHA256 "4f6d4021a47f85f19742673e675ab4952607f76c45875abbfaae0e5375ce2886"',
+                ".venv/bin/python tools/rl/DQN/action_reward_model/export_bandit_model_to_c_header.py "
+                "--model tools/rl/DQN/experiments/v3_3_expanded_matched_bandit_v1/models/seed_11/bandit_model.pth "
+                "--output csi_recv/main/generated_bandit_model.h "
+                "--verify-dataset tools/rl/DQN/datasets/v3_3_expanded_matched_v1/holdout/"
+                "validation_phase_run2_plus_broad9_disjoint_exact_fresh_link_v7c_ht20_v1_utility.csv "
+                "--verify-rows 512 "
+                "--candidate-selection tools/rl/DQN/experiments/v3_3_expanded_matched_bandit_v1/candidate_selection.json "
+                "--qualification-complete tools/rl/DQN/experiments/v3_3_expanded_matched_bandit_v1/qualification_v1/qualification_complete.json "
+                "--allow-exact-fresh-only-export",
+                "6bc793b157dcd7274cbf789818f7c538acf5579ad10233a07a64a8d65613332b",
+            ),
+            (
+                "csi_recv/main/generated_bandit_model.h.deployment.json",
+                '"schema": "bandit_firmware_deployment/v1"',
+                "the same qualification-gated bandit export command",
+                "02633beec49e180d7f95b1c10155247435bea4ec43e88b7474c39e86602926b3",
             ),
         ],
     },
     "dqn": {
-        "label": "DQN Q-network (receiver live policy)",
+        "label": "v3.3 matched gamma-zero DQN (seed 11, fresh CSI only)",
         "sender": {
             "ack_timing_mode": 2,
             "live_mcs_selection_enabled": 1,
             "live_mcs_algo": 2,
+            "live_mcs_min_index": 0,
+            "live_mcs_max_index": 7,
+            "live_mcs_decision_log_enabled": 1,
             "remote_mcs_recommendation_enabled": 0,
             "dqn_remote_recommendation_enabled": 1,
+            "dqn_default_mcs": 4,
+            "dqn_remote_min_confidence": 0,
+            "dqn_remote_max_age_ms": 50,
             "dqn_remote_max_seq_gap": 50,
             "dqn_failure_stepdown_enabled": 1,
             "dqn_failure_stepdown_count": 8,
+            "dqn_log_enabled": 1,
         },
         "receiver": {
             "custom_mcs_recommendation_enabled": 0,
+            "mcs_recommendation_use_model": 1,
             "dqn_mcs_recommendation_enabled": 1,
             "mcs_policy_model": 0,
+            "dqn_recommendation_every_n_packets": 1,
+            "dqn_warmup_packets": 100,
+            "dqn_control_interval_ms": 5,
+            "dqn_stale_max_age_packets": 64,
+            "dqn_log_enabled": 1,
         },
         "headers": [
             (
                 "csi_recv/main/generated_dqn_model.h",
-                "DQN_MODEL_STATE_DIM",
-                "tools/rl/DQN/dqn_model/export_dqn_to_c_header.py",
+                'DQN_MODEL_CHECKPOINT_SHA256 "8e865618b96b5efd11f6033b6fe150a3443f227eb0f07378b19a02bf45c3ac43"',
+                ".venv/bin/python tools/rl/DQN/dqn_model/export_dqn_to_c_header.py "
+                "--model tools/rl/DQN/experiments/v3_3_expanded_matched_dqn_gamma0_v1/models/seed_11/dqn_model.pth "
+                "--output csi_recv/main/generated_dqn_model.h "
+                "--verify-dataset tools/rl/DQN/datasets/v3_3_expanded_matched_v1/holdout/"
+                "validation_phase_run2_plus_broad9_disjoint_exact_fresh_link_v7c_ht20_v1_utility.csv "
+                "--verify-rows 512 "
+                "--allow-exact-fresh-only-export",
+                "74ae4bbdd3beb8def2627a5e88137548dca58d7a0fd236a58d73eaa8bf68040a",
             ),
         ],
     },
@@ -228,7 +299,11 @@ MODES = {
             "live_mcs_algo": 1,
             "live_mcs_min_index": 0,
             "live_mcs_max_index": 7,
+            "custom_policy_default_mcs": 0,
+            "live_mcs_decision_log_enabled": 1,
             "remote_mcs_recommendation_enabled": 1,
+            "remote_mcs_min_confidence": 0,
+            "remote_mcs_max_age_ms": 300,
             "dqn_remote_recommendation_enabled": 0,
             # The generic receiver-policy blackout guard is shared with the
             # reward path even though the historical config names say DQN.
@@ -238,6 +313,7 @@ MODES = {
         },
         "receiver": {
             "custom_mcs_recommendation_enabled": 1,
+            "mcs_recommendation_use_model": 1,
             "reward_model_variant": 0,
             "reward_model_snr_guard_enabled": 1,
             "reward_model_low_snr_threshold_db": 15,
@@ -260,7 +336,11 @@ MODES = {
             "live_mcs_algo": 1,
             "live_mcs_min_index": 0,
             "live_mcs_max_index": 7,
+            "custom_policy_default_mcs": 0,
+            "live_mcs_decision_log_enabled": 1,
             "remote_mcs_recommendation_enabled": 1,
+            "remote_mcs_min_confidence": 0,
+            "remote_mcs_max_age_ms": 300,
             "dqn_remote_recommendation_enabled": 0,
             "dqn_remote_max_seq_gap": 50,
             "dqn_failure_stepdown_enabled": 1,
@@ -268,6 +348,7 @@ MODES = {
         },
         "receiver": {
             "custom_mcs_recommendation_enabled": 1,
+            "mcs_recommendation_use_model": 1,
             "reward_model_variant": 2,
             # The offline broad-data qualification was unguarded. The current
             # firmware guard is v7c-only, but keep the preset explicit.
@@ -294,7 +375,11 @@ MODES = {
             "live_mcs_algo": 1,
             "live_mcs_min_index": 0,
             "live_mcs_max_index": 7,
+            "custom_policy_default_mcs": 0,
+            "live_mcs_decision_log_enabled": 1,
             "remote_mcs_recommendation_enabled": 1,
+            "remote_mcs_min_confidence": 0,
+            "remote_mcs_max_age_ms": 300,
             "dqn_remote_recommendation_enabled": 0,
             "dqn_remote_max_seq_gap": 50,
             "dqn_failure_stepdown_enabled": 1,
@@ -302,6 +387,7 @@ MODES = {
         },
         "receiver": {
             "custom_mcs_recommendation_enabled": 1,
+            "mcs_recommendation_use_model": 1,
             "reward_model_variant": 1,
             "reward_model_snr_guard_enabled": 1,
             "reward_model_low_snr_threshold_db": 15,
@@ -324,7 +410,11 @@ MODES = {
             "live_mcs_algo": 1,
             "live_mcs_min_index": 0,
             "live_mcs_max_index": 7,
+            "custom_policy_default_mcs": 0,
+            "live_mcs_decision_log_enabled": 1,
             "remote_mcs_recommendation_enabled": 1,
+            "remote_mcs_min_confidence": 0,
+            "remote_mcs_max_age_ms": 300,
             "dqn_remote_recommendation_enabled": 0,
             "dqn_remote_max_seq_gap": 50,
             "dqn_failure_stepdown_enabled": 1,
@@ -332,6 +422,7 @@ MODES = {
         },
         "receiver": {
             "custom_mcs_recommendation_enabled": 1,
+            "mcs_recommendation_use_model": 1,
             "reward_model_variant": 3,
             # Match the unguarded offline v3.3 evaluation exactly.
             "reward_model_snr_guard_enabled": 0,
@@ -357,7 +448,11 @@ MODES = {
             "live_mcs_algo": 1,
             "live_mcs_min_index": 0,
             "live_mcs_max_index": 7,
+            "custom_policy_default_mcs": 0,
+            "live_mcs_decision_log_enabled": 1,
             "remote_mcs_recommendation_enabled": 1,
+            "remote_mcs_min_confidence": 0,
+            "remote_mcs_max_age_ms": 300,
             "dqn_remote_recommendation_enabled": 0,
             "dqn_remote_max_seq_gap": 50,
             "dqn_failure_stepdown_enabled": 1,
@@ -365,6 +460,7 @@ MODES = {
         },
         "receiver": {
             "custom_mcs_recommendation_enabled": 1,
+            "mcs_recommendation_use_model": 1,
             "reward_model_variant": 4,
             # Match the unguarded offline v3.3 evaluation exactly.
             "reward_model_snr_guard_enabled": 0,
@@ -390,6 +486,7 @@ MODES = {
         },
         "receiver": {
             "custom_mcs_recommendation_enabled": 0,
+            "mcs_recommendation_use_model": 1,
             "dqn_mcs_recommendation_enabled": 0,
         },
         "headers": [],
@@ -403,6 +500,34 @@ MODES = {
         },
         "receiver": {
             "custom_mcs_recommendation_enabled": 0,
+            "mcs_recommendation_use_model": 1,
+            "dqn_mcs_recommendation_enabled": 0,
+        },
+        "headers": [],
+    },
+    "rssi_heuristic": {
+        "label": "RSSI threshold heuristic (receiver recommendations, no learned model)",
+        "sender": {
+            "ack_timing_mode": 2,
+            "live_mcs_selection_enabled": 1,
+            "live_mcs_algo": 1,
+            "live_mcs_min_index": 0,
+            "live_mcs_max_index": 7,
+            "custom_policy_default_mcs": 0,
+            "live_mcs_decision_log_enabled": 1,
+            "remote_mcs_recommendation_enabled": 1,
+            "remote_mcs_min_confidence": 0,
+            "remote_mcs_max_age_ms": 300,
+            "dqn_remote_recommendation_enabled": 0,
+            "dqn_remote_max_seq_gap": 50,
+            "dqn_failure_stepdown_enabled": 1,
+            "dqn_failure_stepdown_count": 8,
+        },
+        "receiver": {
+            "custom_mcs_recommendation_enabled": 1,
+            "mcs_recommendation_use_model": 0,
+            "reward_model_variant": 0,
+            "reward_model_snr_guard_enabled": 0,
             "dqn_mcs_recommendation_enabled": 0,
         },
         "headers": [],
@@ -420,6 +545,8 @@ MODE_ORDER = [
     "reward_model_v3_3_full_seed11",
     "static",
     "random_sweep",
+    # Keep the original option numbers stable; RSSI is intentionally appended.
+    "rssi_heuristic",
 ]
 
 
@@ -548,6 +675,9 @@ def validate_sender_profile(sender: dict) -> None:
 
 
 def validate_receiver_profile(receiver: dict) -> None:
+    if receiver.get("mcs_recommendation_use_model", 1) not in (0, 1):
+        receiver["mcs_recommendation_use_model"] = 1
+
     if receiver["dqn_recommendation_every_n_packets"] <= 0:
         receiver["dqn_recommendation_every_n_packets"] = 1
 
@@ -630,6 +760,11 @@ def apply_profile_to_sources(profile: dict) -> None:
         "CONFIG_MCS_RECOMMENDATION_ENABLED",
         str(receiver["custom_mcs_recommendation_enabled"]),
     )
+    receiver_text = replace_define(
+        receiver_text,
+        "CONFIG_MCS_RECOMMENDATION_USE_MODEL",
+        str(receiver["mcs_recommendation_use_model"]),
+    )
     receiver_text = replace_define(receiver_text, "CONFIG_CSI_REWARD_MODEL_VARIANT", str(receiver["reward_model_variant"]))
     receiver_text = replace_define(receiver_text, "CONFIG_CSI_REWARD_MODEL_SNR_GUARD_ENABLED", str(receiver["reward_model_snr_guard_enabled"]))
     receiver_text = replace_define(receiver_text, "CONFIG_CSI_REWARD_MODEL_LOW_SNR_THRESHOLD_DB", str(receiver["reward_model_low_snr_threshold_db"]))
@@ -672,7 +807,11 @@ def apply_mode_to_profile(profile: dict, mode: dict) -> None:
 
 def check_mode_headers(mode: dict) -> bool:
     ok = True
-    for rel_path, required_text, hint in mode.get("headers", []):
+    for header_spec in mode.get("headers", []):
+        if len(header_spec) not in (3, 4):
+            raise ValueError("Deployment artifact specs must have three or four fields")
+        rel_path, required_text, hint = header_spec[:3]
+        expected_sha256 = header_spec[3] if len(header_spec) == 4 else None
         path = ROOT / rel_path
         if not path.exists():
             print(f"WARNING: {rel_path} is missing. Export it with {hint}")
@@ -681,7 +820,48 @@ def check_mode_headers(mode: dict) -> bool:
             print(f"WARNING: {rel_path} does not contain {required_text}.")
             print(f"         Re-export a matching checkpoint with {hint}")
             ok = False
+        elif expected_sha256 is not None:
+            # read_text() normalizes CRLF/LF so Windows and Pi checkouts verify
+            # the same generated model content.
+            actual_sha256 = hashlib.sha256(read_text(path).encode("utf-8")).hexdigest()
+            if actual_sha256 != expected_sha256:
+                print(
+                    f"WARNING: {rel_path} SHA-256 is {actual_sha256}, "
+                    f"expected {expected_sha256}."
+                )
+                print(f"         Re-export the pinned artifact with {hint}")
+                ok = False
     return ok
+
+
+def receiver_artifact_mode(profile: dict):
+    """Return the model preset whose receiver artifact the profile will compile."""
+
+    receiver = profile["receiver"]
+    if receiver.get("dqn_mcs_recommendation_enabled", 0):
+        return "bandit" if receiver.get("mcs_policy_model", 1) == 1 else "dqn"
+    if (
+        receiver.get("custom_mcs_recommendation_enabled", 0)
+        and receiver.get("mcs_recommendation_use_model", 1)
+    ):
+        return {
+            0: "reward_model",
+            1: "reward_model_v7c_canary",
+            2: "reward_model_broad_amp_canary",
+            3: "reward_model_v3_3_amp_seed11",
+            4: "reward_model_v3_3_full_seed11",
+        }.get(receiver.get("reward_model_variant", 0))
+    return None
+
+
+def check_receiver_artifacts(profile: dict) -> bool:
+    mode_key = receiver_artifact_mode(profile)
+    if mode_key is None:
+        return True
+    if check_mode_headers(MODES[mode_key]):
+        return True
+    print(f"Receiver build/flash blocked: artifact check failed for mode '{mode_key}'.")
+    return False
 
 
 def guess_current_mode(profile: dict) -> str:
@@ -727,7 +907,7 @@ def select_mode(profile: dict, local: dict) -> None:
             print(f"  {section}.{field}: {old} -> {new}")
 
     if not check_mode_headers(mode):
-        print("Mode was not applied because its receiver model artifact is missing or does not match.")
+        print("Mode was not applied because a receiver deployment artifact is missing or does not match.")
         return
 
     if not ask_yes_no("Apply this mode to the profile and C sources", True):
@@ -752,10 +932,10 @@ def select_mode(profile: dict, local: dict) -> None:
     if choice == "1":
         run_flash_sender(local)
     elif choice == "2":
-        run_flash_receiver(local)
+        run_flash_receiver(local, profile)
     elif choice == "3":
         run_flash_sender(local)
-        run_flash_receiver(local)
+        run_flash_receiver(local, profile)
 
 
 # ---------------------------------------------------------------------------
@@ -805,6 +985,48 @@ def prepare_sender_console_config() -> None:
         )
 
 
+def ensure_receiver_large_partition(sdkconfig_path: Path = None) -> bool:
+    """Give generated receiver sdkconfigs the model-size headroom in defaults."""
+
+    path = RECEIVER_SDKCONFIG if sdkconfig_path is None else Path(sdkconfig_path)
+    if not path.exists():
+        return False
+
+    original = path.read_text(encoding="utf-8")
+    if not re.search(
+        r"^CONFIG_PARTITION_TABLE_(?:SINGLE_APP|SINGLE_APP_LARGE)=y$",
+        original,
+        re.MULTILINE,
+    ):
+        # Do not silently replace an intentional OTA, custom, TEE, or
+        # encrypted-NVS layout. The repository/Pi workflow uses single-app.
+        return False
+    lines = original.splitlines()
+
+    for key, value in RECEIVER_PARTITION_SDKCONFIG_VALUES.items():
+        replacement = f"{key}={value}" if value is not None else f"# {key} is not set"
+        pattern = re.compile(rf"^(?:{re.escape(key)}=.*|# {re.escape(key)} is not set)$")
+        matches = [index for index, line in enumerate(lines) if pattern.match(line)]
+        if matches:
+            lines[matches[0]] = replacement
+            for index in reversed(matches[1:]):
+                del lines[index]
+        else:
+            lines.append(replacement)
+
+    updated = "\n".join(lines) + "\n"
+    if updated == original:
+        return False
+
+    path.write_text(updated, encoding="utf-8")
+    return True
+
+
+def prepare_receiver_partition_config() -> None:
+    if ensure_receiver_large_partition():
+        print("Updated existing receiver sdkconfig to the 1.5 MiB single-app partition.")
+
+
 def run_idf(target_dir: Path, command: str, local: dict) -> int:
     build_dir = str(local.get("build_dir", "")).strip()
     build_arg = f"-B {build_dir} " if build_dir else ""
@@ -827,9 +1049,46 @@ def run_build_sender(local: dict) -> None:
     print("Sender build OK" if code == 0 else f"Sender build failed with exit code {code}")
 
 
-def run_build_receiver(local: dict) -> None:
+def run_build_receiver(local: dict, profile: dict = None) -> bool:
+    if profile is not None and not check_receiver_artifacts(profile):
+        return False
+    prepare_receiver_partition_config()
     code = run_idf(ROOT / "csi_recv", "build", local)
     print("Receiver build OK" if code == 0 else f"Receiver build failed with exit code {code}")
+    return code == 0
+
+
+def run_post_flash_command(local: dict) -> None:
+    """Run this host's configured post-flash command (e.g. run_and_send.sh)
+    immediately after a successful flash, so capture starts before any
+    packets the freshly-rebooted board sends are missed. Host-local and
+    opt-in: empty/unset in device_menu_local.json means do nothing."""
+    command = str(local.get("post_flash_command", "")).strip()
+    if not command:
+        return
+    print(f"\n[auto] Flash OK -- launching post-flash command:\n  {command}\n")
+    argv = ["cmd", "/c", command] if IS_WINDOWS else ["bash", "-lc", command]
+    proc = subprocess.Popen(argv)
+    try:
+        code = proc.wait()
+    except KeyboardInterrupt:
+        # Ctrl+C here reaches this whole foreground process group at once --
+        # including this process, not just the child. If the post-flash
+        # command is a live capture that catches its own KeyboardInterrupt
+        # (stops cleanly, then e.g. rsyncs the files), that chain keeps
+        # running and finishes normally; Python only surfaces the interrupt
+        # here once the child has actually exited. So: report it and return
+        # to the menu, rather than let it propagate up and exit the whole
+        # program (its actual pre-existing behavior on an uncaught
+        # KeyboardInterrupt) before the menu is shown again.
+        code = proc.poll()
+        if code is None:
+            code = proc.wait()
+        print(f"\n[auto] Post-flash command stopped via Ctrl+C (exited with code {code}) "
+              f"-- back to the menu.")
+        return
+    if code != 0:
+        print(f"[auto] Post-flash command exited with code {code}")
 
 
 def run_flash_sender(local: dict) -> None:
@@ -837,12 +1096,20 @@ def run_flash_sender(local: dict) -> None:
     command = f'flash -b {local["baud"]} -p {local["sender_port"]}'
     code = run_idf(ROOT / "csi_send", command, local)
     print("Sender flash OK" if code == 0 else f"Sender flash failed with exit code {code}")
+    if code == 0:
+        run_post_flash_command(local)
 
 
-def run_flash_receiver(local: dict) -> None:
+def run_flash_receiver(local: dict, profile: dict = None) -> bool:
+    if profile is not None and not check_receiver_artifacts(profile):
+        return False
+    prepare_receiver_partition_config()
     command = f'flash -b {local["baud"]} -p {local["receiver_port"]}'
     code = run_idf(ROOT / "csi_recv", command, local)
     print("Receiver flash OK" if code == 0 else f"Receiver flash failed with exit code {code}")
+    if code == 0:
+        run_post_flash_command(local)
+    return code == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1157,13 +1424,14 @@ def edit_receiver_full(profile: dict) -> None:
     receiver["esp_now_rate"] = ask_choice("ESP-NOW PHY rate", RATE_CHOICES, receiver["esp_now_rate"])
     receiver["force_gain"] = 1 if ask_yes_no("Force gain", receiver["force_gain"] == 1) else 0
     receiver["gain_control"] = 1 if ask_yes_no("Enable gain control", receiver["gain_control"] == 1) else 0
-    receiver["custom_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable reward-model recommendations", receiver["custom_mcs_recommendation_enabled"] == 1) else 0
+    receiver["custom_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable custom-path recommendations", receiver["custom_mcs_recommendation_enabled"] == 1) else 0
+    receiver["mcs_recommendation_use_model"] = 1 if ask_yes_no("Use learned reward model (No selects RSSI thresholds)", receiver["mcs_recommendation_use_model"] == 1) else 0
     receiver["reward_model_variant"] = ask_reward_model_variant(receiver["reward_model_variant"])
     receiver["reward_model_snr_guard_enabled"] = 1 if ask_yes_no("Enable reward-model low-SNR guard", receiver["reward_model_snr_guard_enabled"] == 1) else 0
     receiver["reward_model_low_snr_threshold_db"] = ask_int("Reward-model low-SNR threshold dB", receiver["reward_model_low_snr_threshold_db"], -20, 80)
     receiver["reward_model_low_snr_max_mcs"] = ask_int("Reward-model maximum MCS below threshold", receiver["reward_model_low_snr_max_mcs"], 0, 7)
     receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver live-policy recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
-    receiver["mcs_policy_model"] = ask_int("Live policy model (1=bandit link_v3c, 0=DQN Q-network)", receiver["mcs_policy_model"], 0, 1)
+    receiver["mcs_policy_model"] = ask_int("Live policy model (1=bandit link_v5, 0=DQN Q-network)", receiver["mcs_policy_model"], 0, 1)
     receiver["dqn_recommendation_every_n_packets"] = ask_int("Live policy recommendation every N packets", receiver["dqn_recommendation_every_n_packets"], 1, 1000000)
     receiver["dqn_warmup_packets"] = ask_int("Live policy warmup packets", receiver["dqn_warmup_packets"], 0, 1000000)
     receiver["dqn_control_interval_ms"] = ask_int("Live policy control interval ms", receiver["dqn_control_interval_ms"], 1, 1000000)
@@ -1177,7 +1445,7 @@ def edit_receiver_dqn(profile: dict) -> None:
     while True:
         print("\nEdit receiver live-policy recommendations")
         print(f"1. dqn_mcs_recommendation_enabled: {receiver['dqn_mcs_recommendation_enabled']}")
-        print(f"2. mcs_policy_model: {receiver['mcs_policy_model']} (1=bandit link_v3c, 0=DQN Q-network)")
+        print(f"2. mcs_policy_model: {receiver['mcs_policy_model']} (1=bandit link_v5, 0=DQN Q-network)")
         print(f"3. dqn_recommendation_every_n_packets: {receiver['dqn_recommendation_every_n_packets']}")
         print(f"4. dqn_warmup_packets: {receiver['dqn_warmup_packets']}")
         print(f"5. dqn_control_interval_ms: {receiver['dqn_control_interval_ms']}")
@@ -1189,7 +1457,7 @@ def edit_receiver_dqn(profile: dict) -> None:
         if choice == "1":
             receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver live-policy recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
         elif choice == "2":
-            receiver["mcs_policy_model"] = ask_int("Live policy model (1=bandit link_v3c, 0=DQN Q-network)", receiver["mcs_policy_model"], 0, 1)
+            receiver["mcs_policy_model"] = ask_int("Live policy model (1=bandit link_v5, 0=DQN Q-network)", receiver["mcs_policy_model"], 0, 1)
         elif choice == "3":
             receiver["dqn_recommendation_every_n_packets"] = ask_int("Live policy recommendation every N packets", receiver["dqn_recommendation_every_n_packets"], 1, 1000000)
         elif choice == "4":
@@ -1219,12 +1487,13 @@ def edit_receiver(profile: dict) -> None:
         print(f"3. force_gain: {receiver['force_gain']}")
         print(f"4. gain_control: {receiver['gain_control']}")
         print(f"5. custom_mcs_recommendation_enabled: {receiver['custom_mcs_recommendation_enabled']}")
-        print(f"6. reward_model_variant: {receiver['reward_model_variant']} "
+        print(f"6. mcs_recommendation_use_model: {receiver['mcs_recommendation_use_model']} ")
+        print(f"7. reward_model_variant: {receiver['reward_model_variant']} "
               f"({reward_model_variant_label(receiver['reward_model_variant'])})")
-        print(f"7. dqn_mcs_recommendation_enabled: {receiver['dqn_mcs_recommendation_enabled']}")
-        print(f"8. mcs_policy_model: {receiver['mcs_policy_model']} (1=bandit, 0=DQN)")
-        print("9. Edit live-policy receiver fields")
-        print("10. Edit all receiver fields")
+        print(f"8. dqn_mcs_recommendation_enabled: {receiver['dqn_mcs_recommendation_enabled']}")
+        print(f"9. mcs_policy_model: {receiver['mcs_policy_model']} (1=bandit, 0=DQN)")
+        print("10. Edit live-policy receiver fields")
+        print("11. Edit all receiver fields")
         print("0. Back")
         choice = input("Select receiver field: ").strip()
 
@@ -1237,17 +1506,19 @@ def edit_receiver(profile: dict) -> None:
         elif choice == "4":
             receiver["gain_control"] = 1 if ask_yes_no("Enable gain control", receiver["gain_control"] == 1) else 0
         elif choice == "5":
-            receiver["custom_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable reward-model recommendations", receiver["custom_mcs_recommendation_enabled"] == 1) else 0
+            receiver["custom_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable custom-path recommendations", receiver["custom_mcs_recommendation_enabled"] == 1) else 0
         elif choice == "6":
-            receiver["reward_model_variant"] = ask_reward_model_variant(receiver["reward_model_variant"])
+            receiver["mcs_recommendation_use_model"] = 1 if ask_yes_no("Use learned reward model (No selects RSSI thresholds)", receiver["mcs_recommendation_use_model"] == 1) else 0
         elif choice == "7":
-            receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver live-policy recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
+            receiver["reward_model_variant"] = ask_reward_model_variant(receiver["reward_model_variant"])
         elif choice == "8":
-            receiver["mcs_policy_model"] = ask_int("Live policy model (1=bandit link_v3c, 0=DQN Q-network)", receiver["mcs_policy_model"], 0, 1)
+            receiver["dqn_mcs_recommendation_enabled"] = 1 if ask_yes_no("Enable receiver live-policy recommendations", receiver["dqn_mcs_recommendation_enabled"] == 1) else 0
         elif choice == "9":
+            receiver["mcs_policy_model"] = ask_int("Live policy model (1=bandit link_v5, 0=DQN Q-network)", receiver["mcs_policy_model"], 0, 1)
+        elif choice == "10":
             edit_receiver_dqn(profile)
             continue
-        elif choice == "10":
+        elif choice == "11":
             edit_receiver_full(profile)
         elif choice == "0":
             return
@@ -1293,6 +1564,8 @@ def edit_local(local: dict) -> None:
         print(f"3. baud: {local['baud']}")
         print(f"4. export_script: {local['export_script']}")
         print(f"5. build_dir: {local['build_dir']}")
+        print(f"6. post_flash_command (run automatically after a successful flash on this host, "
+              f"blank = disabled): {local.get('post_flash_command') or '(disabled)'}")
         print("0. Back")
         choice = input("Select local field: ").strip()
 
@@ -1318,6 +1591,15 @@ def edit_local(local: dict) -> None:
             value = input(f"Build directory [{local['build_dir']}]: ").strip()
             if value:
                 local["build_dir"] = value
+                save_local(local)
+        elif choice == "6":
+            current = local.get("post_flash_command") or "(disabled)"
+            value = input(
+                f"Post-flash command [{current}] "
+                f"(e.g. /home/gje1671/Desktop/run_and_send.sh; type 'off' to disable): "
+            ).strip()
+            if value:
+                local["post_flash_command"] = "" if value.lower() in ("off", "none", "disable", "disabled") else value
                 save_local(local)
         elif choice == "0":
             return
@@ -1386,21 +1668,21 @@ def run_menu() -> int:
         elif choice == "8":
             run_build_sender(local)
         elif choice == "9":
-            run_build_receiver(local)
+            run_build_receiver(local, profile)
         elif choice == "10":
             run_flash_sender(local)
         elif choice == "11":
-            run_flash_receiver(local)
+            run_flash_receiver(local, profile)
         elif choice == "12":
             if apply_and_save(profile):
                 run_flash_sender(local)
         elif choice == "13":
             if apply_and_save(profile):
-                run_flash_receiver(local)
+                run_flash_receiver(local, profile)
         elif choice == "14":
             if apply_and_save(profile):
                 run_flash_sender(local)
-                run_flash_receiver(local)
+                run_flash_receiver(local, profile)
         elif choice == "0":
             return 0
         else:

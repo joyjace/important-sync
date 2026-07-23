@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +18,9 @@ from train_dqn import (
     state_feature_names,
     validate_dataset_feature_contract,
 )
+
+
+FAIR_DQN_REQUIRED_CSI_INPUT_SCALAR_COUNT = 114
 
 
 def to_numpy(value) -> np.ndarray:
@@ -35,7 +40,9 @@ def format_float_array(name: str, array: np.ndarray, per_line: int = 8) -> str:
 
 
 def load_export_values(model_path: Path) -> dict:
-    checkpoint = torch.load(model_path, map_location="cpu")
+    checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise ValueError("DQN checkpoint must be a mapping")
 
     state_dim = int(checkpoint["state_dim"])
     action_dim = int(checkpoint["action_dim"])
@@ -47,6 +54,14 @@ def load_export_values(model_path: Path) -> dict:
     state_schema = checkpoint.get("state_schema", "legacy_v1")
     include_state_mcs = bool(
         checkpoint.get("include_state_mcs", state_dim in {136, 140, 143, 262})
+    )
+    checkpoint_schema = checkpoint.get("checkpoint_schema")
+    is_fair_checkpoint = checkpoint_schema == "receiver_fair_double_dqn/v1"
+    training_exact_fresh_only = (
+        checkpoint.get("provenance", {})
+        .get("train_transitions", {})
+        .get("contract")
+        == "contextual_no_transition_gamma_zero/v1"
     )
 
     if action_dim != 8:
@@ -68,12 +83,40 @@ def load_export_values(model_path: Path) -> dict:
             f"{state_schema} include_state_mcs={include_state_mcs} "
             f"(expected {expected_state_dim})"
         )
+    expected_feature_names = state_feature_names(state_schema, include_state_mcs)
+    stored_feature_names = checkpoint.get("state_feature_names")
+    if stored_feature_names is not None and list(stored_feature_names) != expected_feature_names:
+        raise ValueError("Checkpoint state_feature_names are out of order or invalid")
     contract_metadata = feature_contract_metadata(state_schema)
     for key, expected in contract_metadata.items():
         if checkpoint.get(key) != expected:
             raise ValueError(
                 f"Checkpoint {key}={checkpoint.get(key)!r} does not match expected {expected!r}"
             )
+
+    if is_fair_checkpoint:
+        if state_schema != "link_v5" or state_dim != 132 or include_state_mcs:
+            raise ValueError(
+                "Fair comparison checkpoints must use receiver-only link_v5 with 132 inputs"
+            )
+        if stored_feature_names is None:
+            raise ValueError("Fair checkpoint is missing state_feature_names")
+        if checkpoint.get("reward_column") != "reward":
+            raise ValueError("Fair checkpoint must predict the logged reward column")
+        gamma = float(checkpoint.get("gamma", float("nan")))
+        expected_transition = (
+            "contextual_no_transition_gamma_zero/v1"
+            if gamma == 0.0
+            else "same_source_seq_plus_one_and_next_state_seq_equals_current_seq/v1"
+        )
+        if checkpoint.get("transition_contract") != expected_transition:
+            raise ValueError(
+                "Fair checkpoint transition contract contradicts its gamma/objective"
+            )
+        if gamma == 0.0 and checkpoint.get("objective_contract") != (
+            "immediate_logged_packet_utility_gamma_zero/v1"
+        ):
+            raise ValueError("Gamma-zero checkpoint has the wrong objective contract")
 
     model_state = checkpoint["q_net_state"]
     values = {
@@ -82,6 +125,19 @@ def load_export_values(model_path: Path) -> dict:
         "hidden_dim": hidden_dim,
         "state_schema": state_schema,
         "include_state_mcs": include_state_mcs,
+        "checkpoint_schema": str(checkpoint_schema or "legacy_unspecified"),
+        "transition_contract": str(
+            checkpoint.get("transition_contract", "legacy_unspecified")
+        ),
+        "checkpoint_sha256": hashlib.sha256(model_path.read_bytes()).hexdigest(),
+        "is_fair_checkpoint": is_fair_checkpoint,
+        "training_exact_fresh_only": training_exact_fresh_only,
+        "required_csi_input_scalar_count": (
+            FAIR_DQN_REQUIRED_CSI_INPUT_SCALAR_COUNT
+            if is_fair_checkpoint or state_schema == "link_v7c"
+            else 0
+        ),
+        "requires_valid_first_word": is_fair_checkpoint or state_schema == "link_v7c",
         "state_mean": to_numpy(checkpoint["state_mean"]).astype(np.float32),
         "state_std": to_numpy(checkpoint["state_std"]).astype(np.float32),
         "w1": to_numpy(model_state["net.0.weight"]).astype(np.float32),
@@ -93,12 +149,6 @@ def load_export_values(model_path: Path) -> dict:
         "checkpoint": checkpoint,
         "contract_metadata": contract_metadata,
     }
-    values["state_std"] = np.where(
-        np.abs(values["state_std"]) < 1e-6,
-        1.0,
-        values["state_std"],
-    ).astype(np.float32)
-
     expected_shapes = {
         "state_mean": (state_dim,),
         "state_std": (state_dim,),
@@ -114,6 +164,13 @@ def load_export_values(model_path: Path) -> dict:
             raise ValueError(
                 f"Unexpected {name} shape {values[name].shape}; expected {expected_shape}"
             )
+        if not np.all(np.isfinite(values[name])):
+            raise ValueError(f"Checkpoint {name} contains non-finite values")
+    if np.any(values["state_std"] < 1e-6):
+        raise ValueError(
+            "Checkpoint state_std values must be finite and at least 1e-6; "
+            "the exporter will not silently repair normalization"
+        )
 
     return values
 
@@ -128,6 +185,8 @@ def numpy_forward(states: np.ndarray, values: dict) -> np.ndarray:
 def verify_dataset(dataset_path: Path, values: dict, rows: int) -> None:
     validate_dataset_feature_contract(dataset_path, values["state_schema"])
     frame = pd.read_csv(dataset_path, nrows=rows)
+    if frame.empty:
+        raise ValueError("Export verification dataset contains no rows")
     states = np.asarray(
         [
             build_state_vector(
@@ -140,6 +199,13 @@ def verify_dataset(dataset_path: Path, values: dict, rows: int) -> None:
         ],
         dtype=np.float32,
     )
+    if states.shape != (len(frame), values["state_dim"]):
+        raise ValueError(
+            f"Verification states have shape {states.shape}; expected "
+            f"{(len(frame), values['state_dim'])}"
+        )
+    if not np.all(np.isfinite(states)):
+        raise ValueError("Export verification states contain non-finite values")
 
     checkpoint = values["checkpoint"]
     # Instantiate directly to avoid relying on serialized module objects.
@@ -158,6 +224,8 @@ def verify_dataset(dataset_path: Path, values: dict, rows: int) -> None:
     with torch.no_grad():
         torch_q = network(torch.from_numpy(normalized).float()).cpu().numpy()
     numpy_q = numpy_forward(states, values)
+    if not np.all(np.isfinite(torch_q)) or not np.all(np.isfinite(numpy_q)):
+        raise ValueError("Export verification produced non-finite Q values")
 
     max_abs_error = float(np.max(np.abs(torch_q - numpy_q)))
     action_matches = int(
@@ -169,7 +237,7 @@ def verify_dataset(dataset_path: Path, values: dict, rows: int) -> None:
             f"max_abs_error={max_abs_error:.8g}"
         )
     print(
-        f"  Verification: {action_matches}/{len(states)} actions matched, "
+        f"  PyTorch/NumPy verification: {action_matches}/{len(states)} actions matched, "
         f"max_abs_error={max_abs_error:.8g}"
     )
 
@@ -184,6 +252,12 @@ def write_header(output_path: Path, values: dict) -> None:
         f"#define DQN_MODEL_STATE_DIM {values['state_dim']}",
         f"#define DQN_MODEL_ACTION_DIM {values['action_dim']}",
         f"#define DQN_MODEL_HIDDEN_DIM {values['hidden_dim']}",
+        f'#define DQN_MODEL_CHECKPOINT_SHA256 "{values["checkpoint_sha256"]}"',
+        f'#define DQN_MODEL_CHECKPOINT_SCHEMA "{values["checkpoint_schema"]}"',
+        f'#define DQN_MODEL_TRANSITION_CONTRACT "{values["transition_contract"]}"',
+        f"#define DQN_MODEL_TRAINING_EXACT_FRESH_ONLY {1 if values['training_exact_fresh_only'] else 0}",
+        f"#define DQN_MODEL_REQUIRED_CSI_INPUT_SCALAR_COUNT {values['required_csi_input_scalar_count']}",
+        f"#define DQN_MODEL_REQUIRES_VALID_FIRST_WORD {1 if values['requires_valid_first_word'] else 0}",
         "#define DQN_MODEL_CONTEXT_IS_STATE_AGE_PACKETS 1",
         f"#define DQN_MODEL_INCLUDES_STATE_MCS {1 if values['include_state_mcs'] else 0}",
         f"#define DQN_MODEL_STATE_SCHEMA_LINK_V2 {1 if values['state_schema'] == 'link_v2' else 0}",
@@ -217,7 +291,12 @@ def write_header(output_path: Path, values: dict) -> None:
         f"#endif /* {guard} */",
     ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text("\n".join(sections) + "\n", encoding="utf-8")
+    temporary = output_path.with_name(f".{output_path.name}.tmp.{os.getpid()}")
+    try:
+        temporary.write_text("\n".join(sections) + "\n", encoding="utf-8")
+        temporary.replace(output_path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -235,6 +314,14 @@ def main() -> int:
         default=512,
         help="Rows used by --verify-dataset",
     )
+    parser.add_argument(
+        "--allow-exact-fresh-only-export",
+        action="store_true",
+        help=(
+            "Explicitly acknowledge that an exact-fresh-only checkpoint has no "
+            "qualified stale/loss behavior"
+        ),
+    )
     args = parser.parse_args()
 
     if args.verify_rows <= 0:
@@ -244,6 +331,19 @@ def main() -> int:
     print(f"  Model: {args.model}")
     print(f"  Output: {args.output}")
     values = load_export_values(args.model)
+    if values["is_fair_checkpoint"] and args.verify_dataset is None:
+        raise ValueError(
+            "Fair comparison checkpoints require --verify-dataset before export"
+        )
+    if (
+        values["training_exact_fresh_only"]
+        and not args.allow_exact_fresh_only_export
+    ):
+        raise ValueError(
+            "This checkpoint was trained only on exact-fresh states. Export is "
+            "blocked unless --allow-exact-fresh-only-export explicitly accepts "
+            "that stale/loss firmware behavior is unqualified."
+        )
     if args.verify_dataset is not None:
         verify_dataset(args.verify_dataset, values, args.verify_rows)
     write_header(args.output, values)

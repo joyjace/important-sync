@@ -38,6 +38,7 @@
     "force_gain": 1,
     "gain_control": 1,
     "custom_mcs_recommendation_enabled": 1,
+    "mcs_recommendation_use_model": 1,
     "reward_model_variant": 0,
     "reward_model_snr_guard_enabled": 1,
     "reward_model_low_snr_threshold_db": 15,

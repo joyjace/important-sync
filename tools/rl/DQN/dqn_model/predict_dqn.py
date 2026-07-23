@@ -1,253 +1,496 @@
 #!/usr/bin/env python3
-"""
-Use trained DQN model to predict best MCS for each packet in dataset.
+"""Batch DQN/Q-network predictions with auditable v3.3 row identity."""
 
-Usage:
-    python predict_dqn.py --model dqn_mcs_model.pth \\
-                          --dataset rl_dqn_dataset.csv \\
-                          --output dqn_mcs_recommendations.csv \\
-                          --device cpu
-"""
+from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
-from pathlib import Path
-
-# Import DQN classes from train_dqn
-import sys
-sys.path.insert(0, str(Path(__file__).parent))
-from train_dqn import DQNAgent, build_state_vector, validate_dataset_feature_contract
 
 
-def mcs_to_symbol(mcs_idx):
-    """Convert MCS index to WiFi rate symbol."""
-    symbols = [
-        "WIFI_PHY_RATE_MCS0_LGI",
-        "WIFI_PHY_RATE_MCS1_LGI",
-        "WIFI_PHY_RATE_MCS2_LGI",
-        "WIFI_PHY_RATE_MCS3_LGI",
-        "WIFI_PHY_RATE_MCS4_LGI",
-        "WIFI_PHY_RATE_MCS5_LGI",
-        "WIFI_PHY_RATE_MCS6_LGI",
-        "WIFI_PHY_RATE_MCS7_LGI",
-    ]
-    return symbols[int(mcs_idx)] if 0 <= mcs_idx < 8 else "UNKNOWN"
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from train_dqn import (  # noqa: E402
+    QNetwork,
+    build_state_vector,
+    feature_contract_metadata,
+    state_feature_names,
+    validate_dataset_feature_contract,
+)
 
 
-def predict_mcs(model_path, dataset_csv, output_csv, device="cpu"):
-    """
-    Load trained DQN model and predict best MCS for each packet.
-    
-    Args:
-        model_path: Path to saved DQN model checkpoint
-        dataset_csv: Path to DQN dataset
-        output_csv: Path to save recommendations
-        device: 'cpu' or 'cuda'
-    """
-    print(f"[DQN Prediction]")
-    print(f"  Loading model from: {model_path}")
-    
-    # Load model
+DEFAULT_PASSTHROUGH_COLUMNS = (
+    "v33_row_id",
+    "source_file",
+    "source_scenario",
+    "meta_angle_deg",
+    "meta_capture_group",
+    "meta_repeat_idx",
+)
+
+
+def mcs_to_symbol(mcs_idx: int) -> str:
+    """Convert an MCS index to its ESP-IDF rate symbol."""
+
+    symbols = [f"WIFI_PHY_RATE_MCS{index}_LGI" for index in range(8)]
+    return symbols[int(mcs_idx)] if 0 <= int(mcs_idx) < 8 else "UNKNOWN"
+
+
+def sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def atomic_write_dataframe(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
     try:
-        agent = DQNAgent.load_model(model_path, device=device)
-        print(f"  Model loaded successfully")
-    except Exception as e:
-        print(f"  ERROR loading model: {e}")
-        return
-    
-    # Load dataset
-    print(f"  Loading dataset from: {dataset_csv}")
-    validate_dataset_feature_contract(dataset_csv, agent.state_schema)
-    df = pd.read_csv(dataset_csv)
-    print(f"  Dataset rows: {len(df)}")
-    dataset_is_causal = "state_age_packets" in df.columns
-    model_is_causal = agent.state_context_feature == "state_age_packets"
-    if dataset_is_causal != model_is_causal:
-        model_kind = "causal" if model_is_causal else "legacy same-packet"
-        dataset_kind = "causal" if dataset_is_causal else "legacy same-packet"
-        raise ValueError(
-            f"Model expects a {model_kind} dataset, but received a {dataset_kind} dataset"
+        frame.to_csv(temporary, index=False)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def atomic_write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        temporary.write_text(
+            json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
         )
-    if dataset_is_causal and (
-        df["state_age_packets"].isna().any()
-        or (df["state_age_packets"] < 1).any()
-    ):
-        raise ValueError("Invalid causal state_age_packets values in prediction dataset")
-    dataset_has_state_mcs = "state_mcs_index" in df.columns
-    if agent.include_state_mcs and not dataset_has_state_mcs:
-        raise ValueError(
-            "Model was trained with source-MCS conditioning, but the dataset "
-            "does not contain state_mcs_index"
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def ordered_identity_sha256(frame: pd.DataFrame) -> str:
+    """Fingerprint the ordered population used by the policy evaluator."""
+
+    columns = ["dataset_row_index"] + [
+        column for column in DEFAULT_PASSTHROUGH_COLUMNS if column in frame.columns
+    ]
+    digest = hashlib.sha256()
+    digest.update(json.dumps(columns, separators=(",", ":")).encode("utf-8"))
+    digest.update(b"\n")
+    for values in frame[columns].itertuples(index=False, name=None):
+        digest.update(
+            json.dumps(
+                [None if pd.isna(value) else value for value in values],
+                default=str,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
         )
-    
-    # Predict for each row
-    print(f"  Running predictions...")
-    predictions = []
-    
-    with torch.no_grad():
-        for idx, row in df.iterrows():
-            state = agent.normalize_states(
-                build_state_vector(
-                    row,
-                    agent.state_context_feature,
-                    agent.include_state_mcs,
-                    agent.state_schema,
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+class DqnPredictionModel:
+    """Strict, inference-only view of a serialized Q-network."""
+
+    def __init__(self, checkpoint: dict[str, object], device: str = "cpu"):
+        if device == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA was requested but is not available")
+        self.device = device
+        self.checkpoint_schema = checkpoint.get("checkpoint_schema")
+        self.state_dim = int(checkpoint["state_dim"])
+        self.action_dim = int(checkpoint["action_dim"])
+        self.hidden_dim = int(checkpoint.get("hidden_dim", 128))
+        self.hidden_layers = int(checkpoint.get("hidden_layers", 2))
+        self.dropout = float(checkpoint.get("dropout", 0.0))
+        self.layer_norm = bool(checkpoint.get("layer_norm", False))
+        self.state_schema = str(checkpoint.get("state_schema", "legacy_v1"))
+        self.state_context_feature = str(
+            checkpoint.get("state_context_feature", "sig_len")
+        )
+        self.include_state_mcs = bool(
+            checkpoint.get(
+                "include_state_mcs", self.state_dim in {136, 140, 143, 262}
+            )
+        )
+        self.objective_contract = str(
+            checkpoint.get("objective_contract", "discounted_return")
+        )
+
+        if self.action_dim != 8:
+            raise ValueError(f"Expected eight MCS actions, got {self.action_dim}")
+        expected_names = state_feature_names(
+            self.state_schema, self.include_state_mcs
+        )
+        if self.state_dim != len(expected_names):
+            raise ValueError(
+                f"Checkpoint state_dim={self.state_dim} does not match "
+                f"{self.state_schema} ({len(expected_names)})"
+            )
+        stored_names = checkpoint.get("state_feature_names")
+        if stored_names is not None and list(stored_names) != expected_names:
+            raise ValueError("Checkpoint state_feature_names are out of order or invalid")
+        for key, expected in feature_contract_metadata(self.state_schema).items():
+            if checkpoint.get(key) != expected:
+                raise ValueError(
+                    f"Checkpoint {key}={checkpoint.get(key)!r} does not match {expected!r}"
                 )
+
+        self.state_mean = np.asarray(checkpoint.get("state_mean"), dtype=np.float32)
+        self.state_std = np.asarray(checkpoint.get("state_std"), dtype=np.float32)
+        if self.state_mean.shape != (self.state_dim,) or self.state_std.shape != (
+            self.state_dim,
+        ):
+            raise ValueError("Checkpoint must contain complete state normalization")
+        if not np.all(np.isfinite(self.state_mean)) or not np.all(
+            np.isfinite(self.state_std)
+        ):
+            raise ValueError("Checkpoint normalization contains non-finite values")
+        if np.any(self.state_std <= 0.0):
+            raise ValueError("Checkpoint state standard deviations must be positive")
+
+        self.network = QNetwork(
+            state_dim=self.state_dim,
+            action_dim=self.action_dim,
+            hidden_dim=self.hidden_dim,
+            hidden_layers=self.hidden_layers,
+            dropout=self.dropout,
+            layer_norm=self.layer_norm,
+        ).to(device)
+        self.network.load_state_dict(checkpoint["q_net_state"])
+        self.network.eval()
+        for name, parameter in self.network.state_dict().items():
+            if not torch.isfinite(parameter).all():
+                raise ValueError(f"Checkpoint tensor {name} contains non-finite values")
+
+    @classmethod
+    def load(cls, path: str | Path, device: str = "cpu") -> "DqnPredictionModel":
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(checkpoint, dict):
+            raise ValueError("DQN checkpoint must be a mapping")
+        return cls(checkpoint, device=device)
+
+    def score_states(self, states: np.ndarray, batch_size: int = 4096) -> np.ndarray:
+        if batch_size < 1:
+            raise ValueError("Prediction batch size must be positive")
+        states = np.asarray(states, dtype=np.float32)
+        if states.shape != (len(states), self.state_dim):
+            raise ValueError(
+                f"Expected an Nx{self.state_dim} state matrix, got {states.shape}"
             )
-            state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(device)
-            q_values = agent.q_net(state_tensor).cpu().numpy()[0]
-            
-            # Best action and Q-value
-            best_action = np.argmax(q_values)
-            best_q_value = float(q_values[best_action])
-            
-            # Top 3 alternatives
-            top3_indices = np.argsort(q_values)[-3:][::-1]
-            top3_mcs = [int(idx) for idx in top3_indices]
-            top3_q_values = [float(q_values[idx]) for idx in top3_indices]
-            
-            predictions.append({
-                "seq": int(row["seq"]),
-                "actual_mcs": int(row["mcs_index"]),
-                "predicted_mcs": int(best_action),
-                "predicted_q_value": best_q_value,
-                **{f"q_mcs{i}": float(q_values[i]) for i in range(len(q_values))},
-                "top3_mcs": top3_mcs,
-                "top3_q_values": top3_q_values,
-                "actual_reward": float(row["reward"]),
-                "service_ms": float(row["service_ms"]),
-                "rssi": float(row.get("rssi", 0) or 0),
-                "snr": float(row.get("snr", 0) or 0),
-                "delivered": int(row["delivered"]),
-                "state_mcs_index": int(row.get("state_mcs_index", -1)),
-                "state_age_packets": int(row.get("state_age_packets", 0)),
-                "state_missing_packets": int(row.get("state_missing_packets", 0)),
-                "state_is_stale": int(row.get("state_is_stale", 0)),
-            })
-            
-            if (idx + 1) % 1000 == 0:
-                print(f"    Predicted {idx + 1}/{len(df)} packets...")
-    
-    # Save predictions
-    pred_df = pd.DataFrame(predictions)
-    Path(output_csv).expanduser().parent.mkdir(parents=True, exist_ok=True)
-    pred_df.to_csv(output_csv, index=False)
-    print(f"  Predictions saved to: {output_csv}")
-    
-    # Statistics
-    correct_preds = (pred_df["predicted_mcs"] == pred_df["actual_mcs"]).sum()
-    accuracy = correct_preds / len(pred_df)
-    
-    print(f"  ✅ Prediction complete:")
-    print(f"    Total predictions: {len(pred_df)}")
-    print(f"    Matches actual MCS: {correct_preds} ({accuracy*100:.2f}%)")
-    print(f"    Mean predicted Q-value: {pred_df['predicted_q_value'].mean():.4f}")
-    print(f"    Mean actual reward: {pred_df['actual_reward'].mean():.4f}")
-    print("    Note: actual_reward is for the logged actual_mcs, not a counterfactual reward for predicted_mcs")
+        if not np.all(np.isfinite(states)):
+            raise ValueError("Prediction state matrix contains non-finite values")
 
-    # Empirical baseline from the logged data. For delay reward, higher reward means lower service_ms.
-    print(f"  Empirical logged baseline by actual MCS:")
-    empirical = pred_df.groupby("actual_mcs").agg(
-        n=("actual_mcs", "size"),
-        mean_reward=("actual_reward", "mean"),
-        mean_service=("service_ms", "mean"),
-        median_service=("service_ms", "median"),
-    ).sort_index()
-    for mcs_idx, row in empirical.iterrows():
-        print(
-            f"    MCS{int(mcs_idx)}: n={int(row['n'])}, "
-            f"mean_reward={row['mean_reward']:.4f}, "
-            f"mean_service={row['mean_service']:.4f} ms, "
-            f"median_service={row['median_service']:.4f} ms"
-        )
-    empirical_best_mean = int(empirical["mean_reward"].idxmax())
-    empirical_best_median = int(empirical["median_service"].idxmin())
-    print(f"    Best by mean reward: MCS{empirical_best_mean}")
-    print(f"    Best by median service: MCS{empirical_best_median}")
+        scores = np.empty((len(states), self.action_dim), dtype=np.float32)
+        with torch.no_grad():
+            for start in range(0, len(states), batch_size):
+                stop = min(start + batch_size, len(states))
+                normalized = (
+                    (states[start:stop] - self.state_mean) / self.state_std
+                ).astype(np.float32)
+                batch = torch.from_numpy(normalized).to(self.device)
+                scores[start:stop] = self.network(batch).cpu().numpy()
+        if not np.all(np.isfinite(scores)):
+            raise FloatingPointError("DQN inference produced non-finite Q values")
+        return scores
 
-    print(f"  Mean learned Q-value by action:")
-    q_cols = [f"q_mcs{i}" for i in range(8) if f"q_mcs{i}" in pred_df.columns]
-    mean_q_by_action = pred_df[q_cols].mean()
-    for col, mean_q in mean_q_by_action.items():
-        print(f"    {col.replace('q_mcs', 'MCS')}: {mean_q:.4f}")
-    learned_best_mean_q = int(mean_q_by_action.idxmax().replace("q_mcs", ""))
-    if learned_best_mean_q != empirical_best_mean:
-        print(
-            f"    WARNING: learned best mean-Q action MCS{learned_best_mean_q} "
-            f"differs from empirical best mean-reward action MCS{empirical_best_mean}"
+
+def filter_dataset(
+    frame: pd.DataFrame,
+    *,
+    delivered_only: bool,
+    observed_only: bool,
+    fresh_state_only: bool,
+) -> pd.DataFrame:
+    work = frame.copy()
+    work["_source_row_index"] = np.arange(len(work), dtype=np.int64)
+    if delivered_only:
+        if "delivered" not in work.columns:
+            raise ValueError("--delivered-only requires a delivered column")
+        work = work[pd.to_numeric(work["delivered"], errors="coerce") == 1]
+    if observed_only:
+        synthetic = pd.to_numeric(
+            work.get("synthetic_stale", pd.Series(0, index=work.index)),
+            errors="coerce",
+        ).fillna(0)
+        augmented = pd.to_numeric(
+            work.get("model_augmented", pd.Series(0, index=work.index)),
+            errors="coerce",
+        ).fillna(0)
+        work = work[(synthetic == 0) & (augmented == 0)]
+    if fresh_state_only:
+        if "state_age_packets" not in work.columns:
+            raise ValueError("--fresh-state-only requires state_age_packets")
+        ages = pd.to_numeric(work["state_age_packets"], errors="coerce")
+        work = work[ages == 1]
+    work = work.reset_index(drop=True)
+    if work.empty:
+        raise ValueError("No rows remain after prediction filters")
+    return work
+
+
+def build_states(frame: pd.DataFrame, model: DqnPredictionModel) -> np.ndarray:
+    dataset_is_causal = "state_age_packets" in frame.columns
+    model_is_causal = model.state_context_feature == "state_age_packets"
+    if dataset_is_causal != model_is_causal:
+        raise ValueError("Model and dataset causal-state contracts do not match")
+    if model.include_state_mcs and "state_mcs_index" not in frame.columns:
+        raise ValueError("Checkpoint requires state_mcs_index, but the dataset omits it")
+    if "iq_raw" not in frame.columns and model.state_schema != "link_v7c":
+        raise ValueError("Prediction dataset is missing iq_raw")
+
+    required_numeric = {
+        "rssi",
+        "snr",
+        "fft_gain",
+        "agc_gain",
+        "channel",
+        "sig_len",
+    }
+    if model.state_context_feature == "state_age_packets":
+        required_numeric.add("state_age_packets")
+    if model.state_schema != "legacy_v1":
+        required_numeric.update(
+            {
+                "state_age_packets",
+                "state_packet_gap",
+                "state_missing_packets",
+                "state_is_stale",
+            }
         )
-    
-    # Top MCS selections
-    print(f"  Top MCS selections by frequency:")
-    mcs_counts = pred_df["predicted_mcs"].value_counts().sort_index()
-    for mcs_idx, count in mcs_counts.items():
-        pct = count / len(pred_df) * 100
-        symbol = mcs_to_symbol(mcs_idx)
-        print(f"    MCS{mcs_idx} ({symbol}): {count} ({pct:.1f}%)")
-    if len(mcs_counts):
-        most_common_action = int(mcs_counts.idxmax())
-        if most_common_action != empirical_best_mean:
-            print(
-                f"    WARNING: most common recommendation MCS{most_common_action} "
-                f"differs from empirical best mean-reward action MCS{empirical_best_mean}"
+    if model.state_schema != "link_v7c":
+        required_numeric.update(
+            {"iq_mean", "iq_std", "iq_p10", "iq_p50", "iq_p90"}
+        )
+    if model.state_schema in {"link_v3", "link_v4"}:
+        required_numeric.update(
+            {
+                "state_prev_delivered",
+                "state_consecutive_losses",
+                "state_recent_loss_rate_8",
+            }
+        )
+    if model.state_schema == "link_v6":
+        required_numeric.update(
+            {"phase_mean", "phase_std", "phase_p10", "phase_p50", "phase_p90"}
+        )
+    if model.state_schema == "link_v7c":
+        required_numeric.update(
+            {"iq_phase_valid_fraction", "iq_phase_coherence"}
+        )
+    if model.include_state_mcs:
+        required_numeric.add("state_mcs_index")
+
+    missing = sorted(required_numeric - set(frame.columns))
+    if missing:
+        raise ValueError(
+            "Prediction dataset is missing model input columns: " + ", ".join(missing)
+        )
+    for column in sorted(required_numeric):
+        values = pd.to_numeric(frame[column], errors="coerce").to_numpy(
+            dtype=np.float64
+        )
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Prediction input column {column} is non-numeric or non-finite")
+
+    if model.state_schema != "link_v7c":
+        for index, value in enumerate(frame["iq_raw"]):
+            try:
+                if isinstance(value, str):
+                    raw = value.strip("[]").replace("\n", " ").replace(",", " ")
+                    parsed = np.fromstring(raw, sep=" ", dtype=np.float32)
+                else:
+                    parsed = np.asarray(value, dtype=np.float32).reshape(-1)
+            except Exception as exc:
+                raise ValueError(f"Prediction row {index} has invalid iq_raw") from exc
+            if parsed.size < 1 or parsed.size > 117 or not np.all(np.isfinite(parsed)):
+                raise ValueError(
+                    f"Prediction row {index} has invalid iq_raw length or values"
+                )
+
+    states = np.empty((len(frame), model.state_dim), dtype=np.float32)
+    for index, row in enumerate(frame.itertuples(index=False)):
+        state = build_state_vector(
+            row,
+            model.state_context_feature,
+            model.include_state_mcs,
+            model.state_schema,
+        )
+        if state.shape != (model.state_dim,):
+            raise ValueError(
+                f"Row {index} produced state shape {state.shape}; "
+                f"expected {(model.state_dim,)}"
             )
-
-    if dataset_is_causal:
-        print("  Recommendation distribution by CSI freshness:")
-        freshness_groups = (
-            ("fresh age=1", pred_df["state_age_packets"] == 1),
-            ("stale age>1", pred_df["state_age_packets"] > 1),
-        )
-        for label, mask in freshness_groups:
-            subset = pred_df.loc[mask]
-            print(f"    {label}: {len(subset)} rows")
-            if subset.empty:
-                continue
-            counts = subset["predicted_mcs"].value_counts().sort_index()
-            rendered = "  ".join(
-                f"MCS{int(mcs)}={int(count)} ({count / len(subset) * 100:.1f}%)"
-                for mcs, count in counts.items()
-            )
-            print(f"      {rendered}")
-    
-    # Recommendation validity
-    print(f"  Recommendation validity:")
-    q_val_std = pred_df["predicted_q_value"].std()
-    q_val_mean = pred_df["predicted_q_value"].mean()
-    print(f"    Mean Q-value: {q_val_mean:.4f}")
-    print(f"    Std Q-value: {q_val_std:.4f}")
-    if q_val_std > 0:
-        print(f"    Q-values have variance (good: model is differentiating)")
-    else:
-        print(f"    WARNING: Q-values have no variance (model may not be trained properly)")
+        states[index] = state
+    if not np.all(np.isfinite(states)):
+        raise ValueError("Prediction state matrix contains non-finite values")
+    return states
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Predict MCS using trained DQN")
-    parser.add_argument(
-        "--model", default="dqn_mcs_model.pth",
-        help="Path to trained DQN model"
+def _numeric_series(
+    frame: pd.DataFrame, column: str, default: float
+) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series(np.full(len(frame), default), index=frame.index)
+    return pd.to_numeric(frame[column], errors="coerce")
+
+
+def predict_mcs(
+    model_path: str | Path,
+    dataset_csv: str | Path,
+    output_csv: str | Path,
+    device: str = "cpu",
+    batch_size: int = 4096,
+    delivered_only: bool = False,
+    observed_only: bool = False,
+    fresh_state_only: bool = False,
+    metadata_out: str | Path | None = None,
+) -> dict[str, object]:
+    model_path = Path(model_path).resolve()
+    dataset_csv = Path(dataset_csv).resolve()
+    output_csv = Path(output_csv).resolve()
+
+    print("[DQN/Q-network prediction]")
+    print(f"  Model: {model_path}")
+    model = DqnPredictionModel.load(model_path, device=device)
+    validate_dataset_feature_contract(dataset_csv, model.state_schema)
+    source_rows = pd.read_csv(dataset_csv)
+    frame = filter_dataset(
+        source_rows,
+        delivered_only=delivered_only,
+        observed_only=observed_only,
+        fresh_state_only=fresh_state_only,
     )
-    parser.add_argument(
-        "--dataset", default="rl_dqn_dataset.csv",
-        help="Path to DQN dataset"
+    print(f"  Rows: {len(frame)} / {len(source_rows)}")
+
+    states = build_states(frame, model)
+    scores = model.score_states(states, batch_size=batch_size)
+    best_actions = np.argmax(scores, axis=1).astype(np.int64)
+    best_values = scores[np.arange(len(scores)), best_actions]
+    ranking = np.argsort(scores, axis=1)[:, ::-1]
+
+    predictions = pd.DataFrame(
+        {
+            "dataset_row_index": frame["_source_row_index"].to_numpy(dtype=np.int64),
+            "seq": _numeric_series(frame, "seq", -1).to_numpy(),
+            "actual_mcs": _numeric_series(frame, "mcs_index", -1).to_numpy(),
+            "predicted_mcs": best_actions,
+            "predicted_q_value": best_values,
+            "predicted_value": best_values,
+            "predicted_target_column": (
+                "reward"
+                if model.objective_contract.startswith("immediate_logged_packet_utility")
+                else "discounted_return"
+            ),
+            "predicted_objective": "maximize",
+            "actual_reward": _numeric_series(frame, "reward", np.nan).to_numpy(),
+            "service_ms": _numeric_series(frame, "service_ms", np.nan).to_numpy(),
+            "rssi": _numeric_series(frame, "rssi", np.nan).to_numpy(),
+            "snr": _numeric_series(frame, "snr", np.nan).to_numpy(),
+            "delivered": _numeric_series(frame, "delivered", -1).to_numpy(),
+            "state_mcs_index": _numeric_series(
+                frame, "state_mcs_index", -1
+            ).to_numpy(),
+            "state_age_packets": _numeric_series(
+                frame, "state_age_packets", 0
+            ).to_numpy(),
+            "state_missing_packets": _numeric_series(
+                frame, "state_missing_packets", 0
+            ).to_numpy(),
+            "state_is_stale": _numeric_series(
+                frame, "state_is_stale", 0
+            ).to_numpy(),
+        }
     )
-    parser.add_argument(
-        "--output", default="dqn_mcs_recommendations.csv",
-        help="Path to save recommendations"
+    for action in range(model.action_dim):
+        predictions[f"q_mcs{action}"] = scores[:, action]
+    predictions["top3_mcs"] = [
+        [int(action) for action in values]
+        for values in ranking[:, :3]
+    ]
+    predictions["top3_q_values"] = [
+        [float(scores[index, action]) for action in values]
+        for index, values in enumerate(ranking[:, :3])
+    ]
+    for column in DEFAULT_PASSTHROUGH_COLUMNS:
+        if column in frame.columns:
+            predictions[column] = frame[column].to_numpy()
+
+    identity_sha = ordered_identity_sha256(predictions)
+    atomic_write_dataframe(output_csv, predictions)
+    metadata = {
+        "schema": "dqn_prediction/v1",
+        "model": {"path": str(model_path), "sha256": sha256_file(model_path)},
+        "dataset": {
+            "path": str(dataset_csv),
+            "sha256": sha256_file(dataset_csv),
+            "source_rows": int(len(source_rows)),
+            "evaluated_rows": int(len(frame)),
+        },
+        "output": {"path": str(output_csv), "sha256": sha256_file(output_csv)},
+        "checkpoint_schema": model.checkpoint_schema,
+        "state_schema": model.state_schema,
+        "objective_contract": model.objective_contract,
+        "ordered_identity_sha256": identity_sha,
+        "passthrough_columns": [
+            column for column in DEFAULT_PASSTHROUGH_COLUMNS if column in frame.columns
+        ],
+        "filters": {
+            "delivered_only": bool(delivered_only),
+            "observed_only": bool(observed_only),
+            "fresh_state_only": bool(fresh_state_only),
+        },
+        "batch_size": int(batch_size),
+    }
+    metadata_path = (
+        Path(metadata_out).resolve()
+        if metadata_out is not None
+        else output_csv.with_suffix(output_csv.suffix + ".prediction.json")
     )
-    parser.add_argument(
-        "--device", default="cpu", choices=["cpu", "cuda"],
-        help="Device to use"
+    atomic_write_json(metadata_path, metadata)
+
+    counts = predictions["predicted_mcs"].value_counts().sort_index()
+    rendered = ", ".join(
+        f"MCS{int(action)}={int(count)}" for action, count in counts.items()
     )
-    
+    print(f"  Predictions: {output_csv}")
+    print(f"  Metadata: {metadata_path}")
+    print(f"  Selection counts: {rendered}")
+    return metadata
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", required=True, help="DQN checkpoint")
+    parser.add_argument("--dataset", required=True, help="Prepared dataset CSV")
+    parser.add_argument("--output", required=True, help="Prediction CSV")
+    parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--delivered-only", action="store_true")
+    parser.add_argument("--observed-only", action="store_true")
+    parser.add_argument("--fresh-state-only", action="store_true")
+    parser.add_argument("--metadata-out", default=None)
     args = parser.parse_args()
-    
     predict_mcs(
         args.model,
         args.dataset,
         args.output,
         device=args.device,
+        batch_size=args.batch_size,
+        delivered_only=args.delivered_only,
+        observed_only=args.observed_only,
+        fresh_state_only=args.fresh_state_only,
+        metadata_out=args.metadata_out,
     )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

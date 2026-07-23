@@ -1,0 +1,55 @@
+{
+  "authorization": {
+    "candidate_selection": {
+      "path": "tools/rl/DQN/experiments/v3_3_expanded_matched_bandit_v1/candidate_selection.json",
+      "sha256": "9d2216343d3e5f3650d18fd1bea989d4d5d16db95f381643b7d09465a6b02816"
+    },
+    "comparison_summary": {
+      "path": "tools/rl/DQN/experiments/v3_3_expanded_matched_bandit_v1/qualification_v1/comparison_summary.json",
+      "sha256": "ef4e9db40d4d10427cbca4000c199ab786f2947bb7a04b869c06433c26734020"
+    },
+    "grid_complete": {
+      "path": "tools/rl/DQN/experiments/v3_3_expanded_matched_bandit_v1/grid_complete.json",
+      "sha256": "7ea2b403390ae330fbe7e17611cdf1e35ffcb9cd5819a5f1187712efbf949970"
+    },
+    "model_sha256": "4f6d4021a47f85f19742673e675ab4952607f76c45875abbfaae0e5375ce2886",
+    "preselected_dqn_seed": 11,
+    "qualification_complete": {
+      "path": "tools/rl/DQN/experiments/v3_3_expanded_matched_bandit_v1/qualification_v1/qualification_complete.json",
+      "sha256": "16572894e5d1ba2d2a122c322a7e9cccc209936346b335647baa368a07995094"
+    },
+    "qualification_completed_utc": "2026-07-22T13:26:59.909187+00:00",
+    "qualification_manifest": {
+      "path": "tools/rl/DQN/experiments/v3_3_expanded_matched_bandit_v1/qualification_v1/qualification_manifest.json",
+      "plan_sha256": "e939fee9576b6369cfbc51cca5a7eb3b9f9361e4bd2e7544a6cc4c37654499b1",
+      "sha256": "5198deadde39f9837b95179984e435637e1e50f39b5111094966851aa7b135aa"
+    },
+    "selected_candidate_comparison": {
+      "path": "tools/rl/DQN/experiments/v3_3_expanded_matched_bandit_v1/qualification_v1/selected_candidate_comparison.json",
+      "sha256": "e44a196a20ef843e79f587a8cf6d073cf807f41bc70858673d40515b320d34ab"
+    },
+    "selected_seed": 11,
+    "training_manifest": {
+      "path": "tools/rl/DQN/experiments/v3_3_expanded_matched_bandit_v1/manifest.json",
+      "sha256": "c1ceb3218fca344fb88527456991e2acce571c72595c2de24ddec928ce8966b2"
+    },
+    "verification_dataset": {
+      "path": "tools/rl/DQN/datasets/v3_3_expanded_matched_v1/holdout/validation_phase_run2_plus_broad9_disjoint_exact_fresh_link_v7c_ht20_v1_utility.csv",
+      "sha256": "e9b424b75d31082e14ee817bda110d8e080142ea01138d8c6579bd1201b38859"
+    }
+  },
+  "checkpoint": {
+    "objective_contract": "delivery_log_service_train_global_q95_utility/v1",
+    "path": "tools/rl/DQN/experiments/v3_3_expanded_matched_bandit_v1/models/seed_11/bandit_model.pth",
+    "schema": "receiver_fair_bandit_two_head/v1",
+    "sha256": "4f6d4021a47f85f19742673e675ab4952607f76c45875abbfaae0e5375ce2886"
+  },
+  "exact_fresh_only_export_acknowledged": true,
+  "header": {
+    "normalized_text_sha256": "6bc793b157dcd7274cbf789818f7c538acf5579ad10233a07a64a8d65613332b",
+    "path": "csi_recv/main/generated_bandit_model.h",
+    "sha256": "6bc793b157dcd7274cbf789818f7c538acf5579ad10233a07a64a8d65613332b"
+  },
+  "schema": "bandit_firmware_deployment/v1",
+  "verification_rows": 512
+}

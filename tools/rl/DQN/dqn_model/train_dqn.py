@@ -738,11 +738,17 @@ def build_state_vector(
             raise ValueError(f"link_v7c {column} contains a non-finite value")
         return np.asarray(array, dtype=np.float32)
 
-    # Extract IQ raw amplitudes (117 values; 57 for the compact link_v3c layout)
-    iq_raw = get_value(row, "iq_raw_parsed", None)
-    if iq_raw is None:
-        iq_raw = get_value(row, "iq_raw", np.zeros(amplitude_count))
-    iq_raw = parse_vector(iq_raw, amplitude_count)
+    # link_v7c carries its complete, contract-bound CSI representation in the
+    # dedicated columns below. Avoid parsing the large legacy iq_raw JSON field
+    # when it cannot contribute to the state (material for multi-GB datasets).
+    if state_schema == LINK_V7C_STATE_SCHEMA:
+        iq_raw = np.empty(0, dtype=np.float32)
+    else:
+        # Extract IQ raw amplitudes (117 values; 57 for link_v3c).
+        iq_raw = get_value(row, "iq_raw_parsed", None)
+        if iq_raw is None:
+            iq_raw = get_value(row, "iq_raw", np.zeros(amplitude_count))
+        iq_raw = parse_vector(iq_raw, amplitude_count)
 
     iq_phase_detrended = np.zeros(117, dtype=np.float32)
     if state_schema == "link_v6":
@@ -892,12 +898,16 @@ def order_temporal_dataframe(df):
         ordered["_episode_key"] = ordered["source_scenario"].astype(str)
     else:
         ordered["_episode_key"] = "single_run"
-    ordered["_seq_sort"] = pd.to_numeric(ordered.get("seq", 0), errors="coerce").fillna(0)
+    ordered["_seq_sort"] = pd.to_numeric(
+        ordered.get("seq", pd.Series(0, index=ordered.index)), errors="coerce"
+    ).fillna(0)
     ordered["_state_age_sort"] = pd.to_numeric(
-        ordered.get("state_age_packets", 0), errors="coerce"
+        ordered.get("state_age_packets", pd.Series(0, index=ordered.index)),
+        errors="coerce",
     ).fillna(0)
     ordered["_synthetic_sort"] = pd.to_numeric(
-        ordered.get("synthetic_stale", 0), errors="coerce"
+        ordered.get("synthetic_stale", pd.Series(0, index=ordered.index)),
+        errors="coerce",
     ).fillna(0)
     ordered = ordered.sort_values(
         ["_episode_key", "_synthetic_sort", "_seq_sort", "_state_age_sort"],
@@ -906,14 +916,23 @@ def order_temporal_dataframe(df):
     return ordered
 
 
-def build_temporal_next_indices(frame):
+def build_temporal_next_indices(frame, require_causal_one_step=True):
     """
     Return next-state indices and done flags for logged temporal transitions.
 
-    Observed rows transition to the next observed row in the same source run.
-    Legacy synthetic stale rows remain terminal. Model-augmented rows may carry
-    explicit transition IDs so stale age/action trajectories participate in
-    gamma-discounted training without relying on CSV row adjacency.
+    Observed rows transition only to a proven one-packet successor in the same
+    source run.  When sequence metadata is available, the successor must have
+    ``next.seq == current.seq + 1``.  For causal datasets it must additionally
+    have ``next.state_seq == current.seq`` so the next state is known to contain
+    the observation produced after the current action.  This matters for capped
+    or subsampled datasets: merely taking the next retained row would turn an
+    arbitrary multi-packet gap into a one-step Bellman transition.
+
+    Set ``require_causal_one_step=False`` only to reproduce legacy experiments
+    that linked every pair of retained rows. Legacy synthetic stale rows remain
+    terminal. Model-augmented rows may carry explicit transition IDs so stale
+    age/action trajectories participate in gamma-discounted training without
+    relying on CSV row adjacency.
     """
     n = len(frame)
     next_indices = np.arange(n, dtype=np.int64)
@@ -947,12 +966,35 @@ def build_temporal_next_indices(frame):
         "position": observed_positions,
         "episode": episode_keys.iloc[observed_positions].to_numpy(),
     })
+    sequence_values = None
+    state_sequence_values = None
+    if "seq" in frame.columns:
+        sequence_values = pd.to_numeric(frame["seq"], errors="coerce").to_numpy()
+    if "state_seq" in frame.columns:
+        state_sequence_values = pd.to_numeric(
+            frame["state_seq"], errors="coerce"
+        ).to_numpy()
+
     for _episode, group in observed.groupby("episode", sort=False):
         positions = group["position"].to_numpy(dtype=np.int64)
         if len(positions) < 2:
             continue
-        next_indices[positions[:-1]] = positions[1:]
-        dones[positions[:-1]] = 0.0
+        current_positions = positions[:-1]
+        successor_positions = positions[1:]
+        linked = np.ones(len(current_positions), dtype=bool)
+        if require_causal_one_step and sequence_values is not None:
+            current_sequences = sequence_values[current_positions]
+            successor_sequences = sequence_values[successor_positions]
+            linked &= np.isfinite(current_sequences)
+            linked &= np.isfinite(successor_sequences)
+            linked &= successor_sequences == current_sequences + 1
+            if state_sequence_values is not None:
+                successor_state_sequences = state_sequence_values[successor_positions]
+                linked &= np.isfinite(successor_state_sequences)
+                linked &= successor_state_sequences == current_sequences
+        linked_current = current_positions[linked]
+        next_indices[linked_current] = successor_positions[linked]
+        dones[linked_current] = 0.0
 
     modeled_positions = np.flatnonzero(model_augmented.to_numpy() == 1)
     if len(modeled_positions):

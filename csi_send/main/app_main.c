@@ -1189,11 +1189,14 @@ static bool remote_mcs_try_apply_for_next_seq(uint32_t next_seq)
         return false;
     }
 
-#if CONFIG_LIVE_MCS_ALGO == 1 && CONFIG_DQN_REMOTE_MAX_SEQ_GAP > 0
-    if ((next_seq - reco.seq) > CONFIG_DQN_REMOTE_MAX_SEQ_GAP) {
-        return false;
-    }
-#endif
+    /* No max-seq-gap check here: CUSTOM_POLICY recommends only every
+     * CONFIG_MCS_RECOMMENDATION_EVERY_N_PACKETS (20) packets and is bounded
+     * by CONFIG_REMOTE_MCS_MAX_AGE_MS (300ms, ~60 packets at 200 pkt/s)
+     * above. CONFIG_DQN_REMOTE_MAX_SEQ_GAP=50 is tuned for the RECEIVER_POLICY
+     * path, which recommends every packet -- reusing it here rejected most
+     * up-moves whenever the link was fast enough that >50 packets elapsed
+     * during one recommendation round trip, pinning the rate near
+     * CONFIG_CUSTOM_POLICY_DEFAULT_MCS regardless of channel conditions. */
 
     /* Consume each recommendation exactly once. Reapplying the same high-rate
      * recommendation would otherwise undo an ACK-failure stepdown until its

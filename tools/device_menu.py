@@ -483,6 +483,12 @@ MODES = {
         "sender": {
             "live_mcs_selection_enabled": 0,
             "rate_switch_mode": 2,
+            # Every other preset pins this explicitly; without it, switching
+            # here from a mode that left ack_timing_mode=1 (async pipeline)
+            # would silently carry that over -- changing how service_us is
+            # even measured, not just MCS selection -- since this flag isn't
+            # gated behind live_mcs_selection_enabled in firmware.
+            "ack_timing_mode": 2,
         },
         "receiver": {
             "custom_mcs_recommendation_enabled": 0,
